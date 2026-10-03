@@ -15,7 +15,7 @@ def topology():
     net.addLink(ap1, sta1)
 
     net.build()
-    ap1.start()
+    #ap1.start()
 
     CLI(net)
 
