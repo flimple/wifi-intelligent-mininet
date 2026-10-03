@@ -15,6 +15,7 @@ def topology():
 
     net.build()
 
+    net.plotGraph(max_x=300, max_y=300)
     CLI(net)
 
     net.stop()
