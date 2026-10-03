@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+
 from mn_wifi.net import Mininet_wifi
 from mn_wifi.cli import CLI
 
