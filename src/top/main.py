@@ -16,6 +16,20 @@ from mn_wifi.cli import CLI
 # =====================================================================
 #                 EDIT THE SIMULATION HERE
 # =====================================================================
+
+# 'type': 'local'  -> start a controller on this machine
+#                     (uses 'controller' or 'ovs-testcontroller', whichever exists)
+#         'remote' -> connect to POX / Ryu / ONOS already running at ip:port
+# Set CONTROLLER = None to run without a controller (APs act as plain switches).
+CONTROLLER = {
+    'type': 'local',
+    'name': 'c0',
+    'ip': '127.0.0.1',      # used for 'remote'
+    'port': 6653,           # used for 'remote' (POX default is 6633)
+    'protocols': None,      # e.g. 'OpenFlow13' for ryu.app.simple_switch_13
+    'position': '500,850',  # where to draw it on the graph (x,y)
+}
+
 ACCESS_POINTS = [
     {
         'name': 'ap1',
@@ -68,7 +82,12 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 # Standard-library modules taken from what is already loaded, so the
 # import block above stays unchanged.
 def _lib(name):
-    return sys.modules.get(name) or __import__(name)
+    return sys.modules.get(name) or _lib_import(name)
+
+
+def _lib_import(name):
+    __import__(name)
+    return sys.modules[name]
 
 
 # ==================== GRAPH FIX (newer matplotlib) ====================
@@ -150,14 +169,107 @@ def redraw_node(node, pump=True):
         pump_graph()
 
 
+# ==================== CONTROLLER ON THE GRAPH =========================
+# Mininet-WiFi only plots stations / APs, so the controller and its
+# OpenFlow links to the APs are drawn here on the same axes.
+#   green dashed line = AP connected to controller
+#   red dashed line   = AP NOT connected
+
+CTRL_GRAPH = {'artists': None, 'lines': {}, 'pos': None}
+
+
+def ap_connected(ap):
+    "True/False: is this AP's OpenFlow channel to the controller up?"
+    out = ap.cmd("for c in $(ovs-vsctl --bare get bridge %s controller "
+                 "| tr -d '[],'); do ovs-vsctl --bare get controller $c "
+                 "is_connected; done" % ap.name)
+    return 'true' in out
+
+
+def _ctrl_pos():
+    if CTRL_GRAPH['pos'] is None:
+        x, y = (CONTROLLER.get('position') or '500,850').split(',')[:2]
+        CTRL_GRAPH['pos'] = [float(x), float(y)]
+    return CTRL_GRAPH['pos']
+
+
+def draw_controller(net, check_status=True):
+    "Draw / update the controller box and its links to every AP."
+    plot_mod = sys.modules.get('mn_wifi.plot')
+    if (not net.controllers or _plt() is None or plot_mod is None
+            or plot_mod.Plot2D.ax is None):
+        return
+    ax = plot_mod.Plot2D.ax
+    c0 = net.controllers[0]
+    cx, cy = _ctrl_pos()
+    try:
+        if CTRL_GRAPH['artists'] is None:
+            marker, = ax.plot([cx], [cy], marker='s', markersize=16,
+                              color='purple', linestyle='none', zorder=5)
+            label = ax.annotate(c0.name, xy=(cx, cy), xytext=(0, 14),
+                                textcoords='offset points', ha='center',
+                                fontweight='bold', color='purple')
+            CTRL_GRAPH['artists'] = (marker, label)
+        marker, label = CTRL_GRAPH['artists']
+        marker.set_data([cx], [cy])
+        label.xy = (cx, cy)
+
+        for ap in net.aps:
+            ax_, ay = float(ap.position[0]), float(ap.position[1])
+            line = CTRL_GRAPH['lines'].get(ap.name)
+            if line is None:
+                line, = ax.plot([cx, ax_], [cy, ay], linestyle='--',
+                                linewidth=1.5, color='gray', zorder=1)
+                CTRL_GRAPH['lines'][ap.name] = line
+            line.set_data([cx, ax_], [cy, ay])
+            if check_status:
+                line.set_color('green' if ap_connected(ap) else 'red')
+    except Exception as e:
+        info("*** graph: could not draw controller (%s)\n" % e)
+
+
 # ==================== BUILD HELPERS ===================================
+
+def build_controller(net):
+    "Add the controller described in CONTROLLER (or nothing if None)."
+    if not CONTROLLER:
+        info("    (none - APs run standalone)\n")
+        return None
+
+    node_mod = _lib('mininet.node')
+    which = _lib('shutil').which
+    kind = CONTROLLER.get('type', 'local')
+    name = CONTROLLER.get('name', 'c0')
+
+    if kind == 'local':
+        if which('controller'):
+            info("    + %s  local reference controller\n" % name)
+            return net.addController(name, controller=node_mod.Controller)
+        if which('ovs-testcontroller'):
+            info("    + %s  local ovs-testcontroller\n" % name)
+            return net.addController(name, controller=node_mod.OVSController)
+        info("    ! no local controller installed "
+             "(sudo apt install openvswitch-testcontroller)\n"
+             "      -> falling back to remote controller\n")
+
+    ip = CONTROLLER.get('ip', '127.0.0.1')
+    port = CONTROLLER.get('port', 6653)
+    info("    + %s  remote controller %s:%s "
+         "(make sure POX/Ryu is already running)\n" % (name, ip, port))
+    return net.addController(name, controller=node_mod.RemoteController,
+                             ip=ip, port=port)
+
 
 def build_aps(net):
     aps = {}
     for cfg in ACCESS_POINTS:
         params = dict(cfg)
         name = params.pop('name')
-        params.setdefault('failMode', 'standalone')   # no controller
+        # secure = AP only forwards what the controller tells it to,
+        # standalone = AP behaves like a normal learning switch
+        params.setdefault('failMode', 'secure' if CONTROLLER else 'standalone')
+        if CONTROLLER and CONTROLLER.get('protocols'):
+            params.setdefault('protocols', CONTROLLER['protocols'])
         aps[name] = net.addAccessPoint(name, **params)
         info("    + %s  ssid=%s ch=%s pos=%s\n"
              % (name, cfg['ssid'], cfg['channel'], cfg['position']))
@@ -308,6 +420,12 @@ class LiveCLI(CLI):
             return list(self.mn.stations)
         return [n for n in (self._node(x) for x in names) if n is not None]
 
+    def _aps(self, line):
+        names = line.split()
+        if not names:
+            return list(self.mn.aps)
+        return [n for n in (self._node(x) for x in names) if n is not None]
+
     def _reassociate(self):
         "Re-evaluate every station's link (after a move / range change)."
         for sta in self.mn.stations:
@@ -315,6 +433,28 @@ class LiveCLI(CLI):
                 sta.configLinks()
             except Exception:
                 pass
+
+    # ---------- controller ----------
+    def do_controller(self, line):
+        "Show whether each AP is connected to the controller.  Usage: controller [ap ...]"
+        if not self.mn.controllers:
+            info("*** no controller configured (CONTROLLER = None)\n")
+            return
+        for c in self.mn.controllers:
+            info("*** %s  %s:%s\n" % (c.name, c.IP(), c.port))
+        for ap in self._aps(line):
+            target = ap.cmd('ovs-vsctl get-controller %s' % ap.name).strip()
+            info("    %-5s %-22s connected=%s\n"
+                 % (ap.name, target, 'yes' if ap_connected(ap) else 'NO'))
+        draw_controller(self.mn)
+
+    def do_flows(self, line):
+        "Show the OpenFlow rules installed on APs.  Usage: flows [ap ...]"
+        proto = CONTROLLER.get('protocols') if CONTROLLER else None
+        opt = '-O %s ' % proto if proto else ''
+        for ap in self._aps(line):
+            info("*** %s\n" % ap.name)
+            info(ap.cmd('ovs-ofctl %sdump-flows %s' % (opt, ap.name)))
 
     # ---------- live edit ----------
     def do_range(self, line):
@@ -353,6 +493,11 @@ class LiveCLI(CLI):
             return
         node = self._node(args[0])
         if node is None:
+            return
+        if node in self.mn.controllers:          # only moves the drawing
+            CTRL_GRAPH['pos'] = [float(args[1]), float(args[2])]
+            draw_controller(self.mn, check_status=False)
+            pump_graph()
             return
         z = args[3] if len(args) == 4 else '0'
         node.position = [float(args[1]), float(args[2]), float(z)]
@@ -473,6 +618,8 @@ class LiveCLI(CLI):
         pump_graph()
 
     def postcmd(self, stop, line):
+        if not stop:
+            draw_controller(self.mn)    # follow moved APs, refresh link colour
         pump_graph()
         return stop
 
@@ -482,6 +629,11 @@ def print_help():
          "    move    <node> <x> <y> [z]       move a station or AP\n"
          "    range   <node> <meters>          change range\n"
          "    txpower <node> <dBm>             change tx power\n"
+         "*** Controller commands:\n"
+         "    controller [ap ...]              is each AP connected to the controller?\n"
+         "                                     (graph: green line = connected, red = not)\n"
+         "    move c0 <x> <y>                  move the controller on the graph\n"
+         "    flows      [ap ...]              OpenFlow rules installed on APs\n"
          "*** Data commands:\n"
          "    rssi    [sta ...]                RSSI / distance / AP now\n"
          "    watch   <sec> [interval] [sta]   print RSSI repeatedly\n"
@@ -495,6 +647,9 @@ def print_help():
 def custom_topology():
     patch_graph()
     net = Mininet_wifi(accessPoint=OVSKernelAP)
+
+    info("*** Adding controller\n")
+    c0 = build_controller(net)
 
     info("*** Adding access points\n")
     aps = build_aps(net)
@@ -518,12 +673,18 @@ def custom_topology():
 
     info("*** Starting network\n")
     net.build()
+    if c0 is not None:
+        info("*** Starting controller %s\n" % c0.name)
+        c0.start()
     for ap in aps.values():
-        ap.start([])          # empty list = no controller
+        ap.start([c0] if c0 is not None else [])   # [] = no controller
 
     patch_graph()             # in case mn_wifi.plot loaded during build
     for node in list(aps.values()) + list(stas.values()):
         redraw_node(node, pump=False)
+    if c0 is not None:
+        _lib('time').sleep(2)       # give APs a moment to connect
+        draw_controller(net)
     pump_graph()
 
     print_help()
