@@ -6,6 +6,8 @@ from mn_wifi.cli import CLI
 def topology():
     net = Mininet_wifi()
 
+    c0 = net.addController('c0')
+
     ap1 = net.addAccessPoint("ap1", ssid="wifi_name", mode="g", channel="1", position="100,100,0", range=150)
     sta1 = net.addStation("sta1", ip="10.0.0.1/8", position="200,200,0")
 
@@ -15,6 +17,9 @@ def topology():
     
     net.plotGraph(max_x=300, max_y=300)
     net.build()
+
+    c0.start()
+    ap1.start([c0])
 
     CLI(net)
 
