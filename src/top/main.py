@@ -13,9 +13,8 @@ def topology():
 
     net.addLink(ap1, sta1)
 
-    
-    net.plotGraph(max_x=300, max_y=300)
     net.build()
+    net.plotGraph(max_x=300, max_y=300)
     
     CLI(net)
 
