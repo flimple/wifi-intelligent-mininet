@@ -60,7 +60,14 @@ Bridge with custom_edit.py
   load_layout(dict) does the same from data already in memory
   ({'walls': [...], 'pictures': [...]}), used by scripts the editor exports.
 
-  WifiGUI(net, theme=None)   theme 'light' / 'dark' (None = last used)
+  WifiGUI(net, theme=None, exit_on_close=True)
+      theme          'light' / 'dark' (None = last used)
+      exit_on_close  closing the window (or typing exit in its CLI
+                     terminal) sends "exit" to the Mininet CLI of your
+                     script, so the rest of it (gui.stop(), net.stop())
+                     runs and everything closes
+  gui.wait()         blocks until the window is closed (for scripts that
+                     do not use the Mininet CLI)
 
 Mouse & keys
   drag empty space ......... rotate          right-drag ....... pan
@@ -85,6 +92,8 @@ import multiprocessing as mp
 import os
 import queue
 import signal
+import stat
+import sys
 import threading
 import time
 
@@ -567,6 +576,75 @@ def _read_netdev(path):
     return out
 
 
+# ------------------------------------------------- closing the Mininet CLI
+EXIT_WORDS = ('exit', 'quit', 'EOF')
+
+
+def _main_cli(thread):
+    """The Mininet CLI object the given thread is running, or None."""
+    f = sys._current_frames().get(thread.ident)
+    while f is not None:
+        obj = f.f_locals.get('self')
+        if obj is not None and hasattr(obj, 'onecmd') and \
+                hasattr(obj, 'mn') and f.f_code.co_name in (
+                    'cmdloop', 'run', '__init__', 'onecmd'):
+            return obj
+        f = f.f_back
+    return None
+
+
+def _in_wait(thread):
+    f = sys._current_frames().get(thread.ident)
+    while f is not None:
+        if f.f_code.co_name == 'wait' and \
+                isinstance(f.f_locals.get('self'), WifiGUI):
+            return True
+        f = f.f_back
+    return False
+
+
+def _left(thread, cli, timeout):
+    """Wait until the thread is out of that CLI."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if not thread.is_alive() or _main_cli(thread) is not cli:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _type_into_stdin(text):
+    """Type text into this process' standard input: a terminal (TIOCSTI,
+    allowed for root) or a pipe (used by launcher.py)."""
+    try:
+        if os.isatty(0):
+            import fcntl
+            import termios
+            for ch in text.encode():
+                fcntl.ioctl(0, termios.TIOCSTI, bytes([ch]))
+            return True
+        if stat.S_ISFIFO(os.fstat(0).st_mode):
+            fd = os.open('/proc/self/fd/0', os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                os.write(fd, text.encode())
+            finally:
+                os.close(fd)
+            return True
+    except Exception as e:
+        print('*** custom_gui: could not type into the CLI (%s)' % e,
+              flush=True)
+    return False
+
+
+def _interrupt(thread):
+    """Ctrl+C for that thread (interrupts a blocking read too)."""
+    try:
+        signal.pthread_kill(thread.ident, signal.SIGINT)
+    except Exception:
+        pass
+
+
+
 class TrafficMeter(object):
     """Packet / byte rates on every link, from the interface counters of
     each node's network namespace (/proc/<pid>/net/dev). No shell command
@@ -661,8 +739,12 @@ class WifiGUI(object):
     """Interactive window showing the Mininet-WiFi network."""
 
     def __init__(self, net, refresh=0.3, size=(1100, 780),
-                 title='Mininet-WiFi 3D View', allow_move=True, theme=None):
+                 title='Mininet-WiFi 3D View', allow_move=True, theme=None,
+                 exit_on_close=True):
         self.net = net
+        self.exit_on_close = exit_on_close
+        self._exiting = False
+        self.closed = threading.Event()      # set when the window is gone
         self.refresh = refresh
         self.allow_move = allow_move
         self.cfg = {'size': size, 'title': title, 'allow_move': allow_move,
@@ -945,9 +1027,11 @@ class WifiGUI(object):
             def flush(self):
                 pass
         cmd = line.strip()
-        if cmd in ('exit', 'quit', 'EOF'):
-            send('(use the terminal you started Mininet from to exit)\n')
+        if cmd in EXIT_WORDS:
+            send('closing the simulation...\n')
             out.put({'type': 'cli_done'})
+            out.put(None)
+            self.exit_cli('exit typed in the viewer CLI')
             return
         lg = None
         h = Handler()
@@ -983,6 +1067,9 @@ class WifiGUI(object):
         if kind == 'save_view':
             return self._save_view(msg[1])
         if kind == 'cli':
+            if msg[1].strip() in EXIT_WORDS:     # even while a command runs
+                self._to_win.put(None)
+                return self.exit_cli('exit typed in the viewer CLI')
             if self._cli_thread is None:
                 self._cli_thread = threading.Thread(target=self._cli_worker,
                                                     daemon=True)
@@ -1017,8 +1104,11 @@ class WifiGUI(object):
             except Exception:
                 pass
             # 2) send fresh data if something changed
-            if not self._proc.is_alive():
-                return                         # window was closed
+            if not self._proc.is_alive():      # window was closed
+                self.closed.set()
+                if self.exit_on_close and not self._stop.is_set():
+                    self.exit_cli('the viewer window was closed')
+                return
             try:
                 data = self._data()
                 if data != last:
@@ -1027,6 +1117,50 @@ class WifiGUI(object):
             except Exception:
                 pass
             self._stop.wait(self.refresh)
+
+    # ------------------------------------------------------ shutdown ----
+    def wait(self, timeout=None):
+        """Block until the window is closed (returns True when it is)."""
+        return self.closed.wait(timeout)
+
+    def exit_cli(self, reason='closing'):
+        """Make the Mininet CLI running in the main thread exit, as if
+        "exit" had been typed in it: your script then goes on with
+        gui.stop() / net.stop() and everything closes."""
+        if self._exiting:
+            return
+        self._exiting = True
+        threading.Thread(target=self._exit_worker, args=(reason,),
+                         daemon=True).start()
+
+    def _exit_worker(self, reason):
+        main = threading.main_thread()
+        if not main.is_alive():
+            return
+        cli = _main_cli(main)
+        for _ in range(10):                    # the CLI may be starting
+            if cli is not None or _in_wait(main):
+                break
+            time.sleep(0.2)
+            cli = _main_cli(main)
+        if cli is None:
+            if _in_wait(main):
+                return                         # gui.wait() returns by itself
+            print('\n*** custom_gui: %s - no Mininet CLI running, sending '
+                  'Ctrl+C to your script' % reason, flush=True)
+            return _interrupt(main)
+        print('\n*** custom_gui: %s - sending "exit" to the Mininet CLI'
+              % reason, flush=True)
+        if _type_into_stdin('exit\n') and _left(main, cli, 3.0):
+            return
+        try:                                   # plan B: Ctrl+C + no new loop
+            cli.cmdloop = lambda *a, **k: None
+        except Exception:
+            pass
+        _interrupt(main)
+        if not _left(main, cli, 3.0):
+            print('*** custom_gui: the CLI did not exit, type "exit" in it',
+                  flush=True)
 
     def stop(self):
         self._stop.set()
@@ -2006,7 +2140,7 @@ class _Window(object):
             while True:
                 item = self.inq.get_nowait()
                 if item is None:
-                    self.root.destroy()
+                    self.on_close()            # keeps the window settings
                     return
                 if isinstance(item, dict) and item.get('type') == 'layout':
                     self.layout = item
@@ -3554,7 +3688,8 @@ class _CliWindow(object):
         self.append('Mininet-WiFi CLI inside the viewer. Commands run in your '
                     'Mininet process\n(same as the CLI: nodes, net, pingall, '
                     'sta1 ping -c 3 sta2, iperf, py ...).\nUse it while the '
-                    'real CLI is waiting at its prompt.\n\n', 'info')
+                    'real CLI is waiting at its prompt.\n"exit" closes the '
+                    'viewer and the simulation.\n\n', 'info')
         self.ent.focus_set()
 
     def append(self, text, tag=None):
@@ -3563,7 +3698,8 @@ class _CliWindow(object):
 
     def send(self, e=None):
         line = self.v.get()
-        if not line.strip() or self.busy:
+        if not line.strip() or (self.busy and
+                                line.strip() not in EXIT_WORDS):
             return
         self.hist.append(line)
         self.hpos = len(self.hist)
