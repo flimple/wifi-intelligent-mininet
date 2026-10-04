@@ -5,7 +5,6 @@ from mn_wifi.cli import CLI
 
 def topology():
     net = Mininet_wifi()
-    net.setPropagationModel(model='LogDistance', exponent=3)
 
     ap1 = net.addAccessPoint("ap1", ssid="wifiname", mode="g", channel="1", position="100,100,0", range=300, failmode="standalone")
     sta1 = net.addStation("sta1", ip="10.0.0.1/8", position="200,200,0", range=100)
