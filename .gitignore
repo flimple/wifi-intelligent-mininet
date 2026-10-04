@@ -1,3 +1,5 @@
 src/top/libs/mininet-wifi
 src/top/libs/__pycache__/
 src/top/data/*
+src/top/libs/profile/*
+src/top/libs/data/*

@@ -9,6 +9,19 @@ parameter, and save a file that Mininet-WiFi can run.
     sudo apt install python3-tk        (if Tkinter is missing)
 
 What you get
+  - Start page (no file given): blank network, open, recent files (also
+    File > Recent files), recovery copy. Auto-save (Home tab): saves the
+    open file every couple of minutes, or a recovery copy when untitled
+  - profile/editor.ini next to this file keeps your options (toggles,
+    theme, window, ribbon, recent files...); the topology file keeps the
+    camera ('view': last position + a saved view, View > Save view), which
+    custom_gui.py reads too
+  - Device presets (data/presets/<type>/*.json next to this file): save a
+    device's configuration (Inspector > Save config as preset), choose it
+    when placing a new device, apply it to one or all devices of a type,
+    copy a configuration from the devices list
+  - Duplicate any selection (Ctrl+D): devices, walls, pictures
+  - Show / hide the links (View tab)
   - Word-like ribbon: Home / Insert / Walls / Picture / View tabs with
     captioned groups; collapse it (button on the right, double-click a
     tab, Ctrl+F1). Dark mode (View tab), shared with custom_gui.py
@@ -114,6 +127,7 @@ Mouse & keys
 import ast
 import copy
 import datetime
+import time
 import ipaddress
 import json
 import keyword
@@ -847,6 +861,7 @@ def doc_to_normalized(doc):
                          [('effective_loss', round(wall_db(w), 3))])
                     for w in doc.get('walls', [])]
     out['editor'] = {'pictures': [dict(pc) for pc in doc.get('pictures', [])]}
+    out['view'] = doc.get('view') or {}      # camera: 'last' / 'saved'
     return out
 
 
@@ -906,7 +921,8 @@ def normalized_to_doc(d):
         links.append({'kind': t, 'a': a, 'b': b, 'p': p})
     return {'net': net, 'nodes': nodes, 'links': links,
             'pictures': _pics_in((d.get('editor') or {}).get('pictures')),
-            'walls': _walls_in(d.get('walls'))}
+            'walls': _walls_in(d.get('walls')),
+            'view': d.get('view') or {}}
 
 
 def _pics_in(lst):
@@ -956,6 +972,7 @@ def doc_to_custom(doc):
                              'params': params,
                              'extra': dict(l['p'].get('extra') or {})})
     out['pictures'] = [dict(pc) for pc in doc.get('pictures', [])]
+    out['view'] = doc.get('view') or {}
     out['walls'] = [{'name': w['name'], 'material': w['material'],
                      'loss_db': w['loss'], 'color': w['color'],
                      'thickness_multiplier': w.get('thick_mult', 0.0),
@@ -1021,6 +1038,7 @@ def custom_to_doc(d):
                 p['extra'][k] = v
         links.append({'kind': t, 'a': l['from'], 'b': l['to'], 'p': p})
     return {'net': net, 'nodes': nodes, 'links': links,
+            'view': d.get('view') or {},
             'pictures': _pics_in(d.get('pictures')),
             'walls': _walls_in([dict(w.get('footprint') or {}, name=w.get('name'),
                                      material=w.get('material'),
@@ -1464,6 +1482,159 @@ def apply_theme(root, name):
     style_ttk(root)
 
 
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+class Properties(object):
+    """profile/<app>.ini next to the program: options that are not part of a
+    topology file (theme, toggles, window size, recent files...)."""
+
+    def __init__(self, app):
+        import configparser
+        self.path = os.path.join(APP_DIR, 'profile', '%s.ini' % app)
+        self.cp = configparser.ConfigParser(interpolation=None)
+        try:
+            self.cp.read(self.path)
+        except Exception:
+            pass
+
+    def get(self, sec, key, default=None):
+        try:
+            v = self.cp.get(sec, key)
+        except Exception:
+            return default
+        try:
+            if isinstance(default, bool):
+                return v.strip().lower() in ('1', 'true', 'yes', 'on')
+            if isinstance(default, int):
+                return int(float(v))
+            if isinstance(default, float):
+                return float(v)
+        except ValueError:
+            return default
+        return v
+
+    def set(self, sec, key, value):
+        if not self.cp.has_section(sec):
+            self.cp.add_section(sec)
+        self.cp.set(sec, key, str(value))
+
+    def items(self, sec):
+        try:
+            return self.cp.items(sec)
+        except Exception:
+            return []
+
+    def clear(self, sec):
+        if self.cp.has_section(sec):
+            self.cp.remove_section(sec)
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + '.tmp'
+            with open(tmp, 'w') as fh:
+                self.cp.write(fh)
+            os.replace(tmp, self.path)
+        except Exception:
+            pass
+
+    def bind(self, sec, pairs):
+        """Load tk variables from the file, and save them on every change."""
+        for key, var in pairs:
+            cur = var.get()
+            var.set(self.get(sec, key, cur))
+
+            def store(*a, k=key, v=var):
+                try:
+                    self.set(sec, k, v.get())
+                    self.save()
+                except Exception:
+                    pass
+            var.trace_add('write', store)
+
+
+def camera_state(win):
+    """Camera as plain data, independent of the window size."""
+    w, h = win.size()
+    s = max(win.scale, 1e-9)
+    return {'yaw': round(win.yaw, 5), 'pitch': round(win.pitch, 5),
+            'target': [round(float(v), 3) for v in win.target],
+            'span': round(min(w, h) / s, 4),
+            'pan': [round(win.pan[0] / s, 4), round(win.pan[1] / s, 4)]}
+
+
+def apply_camera(win, cam):
+    try:
+        w, h = win.size()
+        win.scale = min(w, h) / max(float(cam.get('span') or 100), 1e-6)
+        win.yaw = float(cam.get('yaw', win.yaw))
+        win.pitch = float(cam.get('pitch', win.pitch))
+        t = cam.get('target') or win.target
+        win.target = (float(t[0]), float(t[1]), float(t[2]))
+        p = cam.get('pan') or [0, 0]
+        win.pan = [float(p[0]) * win.scale, float(p[1]) * win.scale]
+        win.user_view = True
+        return True
+    except (TypeError, ValueError, IndexError, AttributeError):
+        return False
+
+
+PRESET_SKIP = ('ip', 'mac', 'dpid')        # identity, never copied
+
+
+def preset_dir(kind):
+    return os.path.join(APP_DIR, 'data', 'presets', kind)
+
+
+def list_presets(kind):
+    try:
+        return sorted(f[:-5] for f in os.listdir(preset_dir(kind))
+                      if f.endswith('.json'))
+    except OSError:
+        return []
+
+
+def load_preset(kind, name):
+    with open(os.path.join(preset_dir(kind), name + '.json')) as fh:
+        return json.load(fh).get('params') or {}
+
+
+def save_preset(kind, name, params):
+    os.makedirs(preset_dir(kind), exist_ok=True)
+    safe = re.sub(r'[^\w.-]+', '_', name).strip('_') or 'preset'
+    with open(os.path.join(preset_dir(kind), safe + '.json'), 'w') as fh:
+        json.dump({'kind': kind, 'name': safe, 'params': params,
+                   'created': datetime.datetime.now().isoformat(
+                       timespec='seconds')}, fh, indent=2)
+    return safe
+
+
+def delete_preset(kind, name):
+    try:
+        os.remove(os.path.join(preset_dir(kind), name + '.json'))
+    except OSError:
+        pass
+
+
+def node_config(n):
+    """The reusable part of a device's configuration (no name, IP, MAC,
+    DPID; the SSID only if it is not the default <name>-ssid)."""
+    p = copy.deepcopy(n['p'])
+    for k in PRESET_SKIP:
+        p.pop(k, None)
+    if p.get('ssid') == n['name'] + '-ssid':
+        p.pop('ssid', None)
+    return p
+
+
+def apply_config(n, params):
+    keys = set(f['key'] for f in SCHEMA[n['kind']])
+    for k, v in params.items():
+        if k in keys and k not in PRESET_SKIP:
+            n['p'][k] = copy.deepcopy(v)
+
+
 class _FlowBar(object):
     """A frame whose child groups flow left-to-right and wrap to new rows."""
 
@@ -1841,7 +2012,8 @@ wmediumd SNR mode; not wmediumd interference mode).
 
 Keys
   Del delete    Esc select tool    I inspector    L link tool
-  W wall tool (drag a zone)   Ctrl+D duplicate wall   D devices list
+  W wall tool (drag a zone)   Ctrl+D duplicate (device / wall / picture)
+  D devices list
   Ctrl+F1 collapse / expand the ribbon
   Shift+click walls: multi-select   Ctrl+G group   Ctrl+Shift+G ungroup
   Ctrl+L lock / unlock the selection (device, wall, picture);
@@ -2008,8 +2180,9 @@ class Editor(object):
         self.scale, self.pan = 1.0, [0.0, 0.0]
         self.target = (50.0, 50.0, 0.0)
 
+        self.props = Properties('editor')
         root = self.root = tk.Tk()
-        root.geometry('1300x840')
+        root.geometry(self.props.get('window', 'geometry', '1300x840'))
         root.minsize(640, 480)
         root.configure(bg=C['bar'])
         style_ttk(root)
@@ -2021,13 +2194,35 @@ class Editor(object):
         self.v_outline = tk.BooleanVar(value=False)
         self.v_walls = tk.BooleanVar(value=True)
         self.wall_mode_label = tk.StringVar(value=WALL_MODES[1][1])
-        self.v_dark = tk.BooleanVar(value=load_prefs().get('theme') == 'dark')
+        self.v_dark = tk.BooleanVar(
+            value=self.props.get('ui', 'theme', 'light') == 'dark')
+        self.v_links = tk.BooleanVar(value=True)
+        self.v_autosave = tk.BooleanVar(value=True)
+        self.autosave_min = max(self.props.get('autosave', 'minutes', 2.0),
+                                0.25)
+        self.view_saved, self._view_last = None, None
+        self.spawn_choice = {}                   # kind -> preset name
+        self.v_ask_spawn = tk.BooleanVar(value=True)
         self.tree = None                         # devices list panel
-        self.wall_ask = True                     # wall dialog after drawing
+        self.wall_ask = self.props.get('ui', 'wall_ask', True)
         self.last_wall = default_wall()
         self.link_kind = tk.StringVar(value='wired')
 
+        self.props.bind('ui', [
+            ('ranges', self.v_ranges), ('outline', self.v_outline),
+            ('sphere', self.v_sphere), ('labels', self.v_labels),
+            ('clients', self.v_clients), ('walls', self.v_walls),
+            ('links', self.v_links), ('snap', self.v_snap),
+            ('wall_mode', self.wall_mode_label),
+            ('link_kind', self.link_kind),
+            ('ask_preset_on_spawn', self.v_ask_spawn)])
+        self.props.bind('autosave', [('enabled', self.v_autosave)])
         self.build_toolbar()
+        tab = self.props.get('window', 'ribbon_tab', 'Home')
+        if tab in self.ribbon.tabs:
+            self.ribbon.select(tab)
+        if self.props.get('window', 'ribbon_collapsed', False):
+            self.ribbon.toggle()
         self.status = tk.Label(root, anchor='nw', justify='left', padx=10,
                                pady=4, bg=C['bar'], fg=C['text'], height=5,
                                font=('TkDefaultFont', 9))  # fixed height:
@@ -2057,7 +2252,7 @@ class Editor(object):
                         ('<Control-o>', self.open), ('<Control-n>', self.new),
                         ('<Control-e>', self.export_py),
                         ('<Control-z>', self.undo), ('<Control-y>', self.redo),
-                        ('<Control-d>', self.duplicate_wall),
+                        ('<Control-d>', self.duplicate_selection),
                         ('<Control-g>', self.group_walls),
                         ('<Control-G>', self.ungroup_walls),
                         ('<Control-l>', self.toggle_lock),
@@ -2071,8 +2266,11 @@ class Editor(object):
             apply_theme(root, 'dark')
         if path:
             self.open_path(path)
+        else:
+            root.after(250, self.show_start)
         self.update_title()
-        root.after(80, self.fit)
+        root.after(80, self.fit if not path else (lambda: None))
+        root.after(int(self.autosave_min * 60000), self.autosave_tick)
 
     # --------------------------------------------------------- toolbar ----
     def _btn(self, parent, text, cmd, accent=False, side='left', width=None):
@@ -2162,6 +2360,14 @@ class Editor(object):
                                  'Ctrl+E')):
             fm.add_command(label=label, command=cmd, accelerator=acc)
         fm.add_separator()
+        fm.add_command(label='Start page / recent files...',
+                       command=self.show_start)
+        self.recent_menu = self._menu(fm)
+        fm.add_cascade(label='Recent files', menu=self.recent_menu)
+        fm.configure(postcommand=self.fill_recent_menu)
+        fm.add_checkbutton(label='Auto-save (every %g min)' % self.autosave_min,
+                           variable=self.v_autosave)
+        fm.add_separator()
         fm.add_command(label='Quit', command=self.on_close)
         m.add_cascade(label='File', menu=fm)
         em = self._menu(m)
@@ -2172,8 +2378,9 @@ class Editor(object):
                        accelerator='I')
         em.add_command(label='Devices & connections list',
                        command=self.open_tree, accelerator='D')
-        em.add_command(label='Duplicate wall', command=self.duplicate_wall,
-                       accelerator='Ctrl+D')
+        em.add_command(label='Duplicate selection',
+                       command=self.duplicate_selection, accelerator='Ctrl+D')
+        em.add_command(label='Device presets...', command=self.manage_presets)
         em.add_command(label='Group selected walls', command=self.group_walls,
                        accelerator='Ctrl+G')
         em.add_command(label='Ungroup walls', command=self.ungroup_walls,
@@ -2202,6 +2409,9 @@ class Editor(object):
         vm.add_command(label='Top view', command=self.view_top,
                        accelerator='T')
         vm.add_command(label='Fit', command=self.fit, accelerator='F')
+        vm.add_command(label='Save view (in the topology)',
+                       command=self.save_view)
+        vm.add_command(label='Restore saved view', command=self.restore_view)
         vm.add_separator()
         for label, var in self.toggles:
             vm.add_checkbutton(label=label, variable=var,
@@ -2230,6 +2440,17 @@ class Editor(object):
             parent=self.root))
         m.add_cascade(label='Help', menu=hm)
         self.root.config(menu=m)
+
+    def fill_recent_menu(self):
+        m = self.recent_menu
+        m.delete(0, 'end')
+        files = self.recent_files()
+        if not files:
+            m.add_command(label='(none yet)', state='disabled')
+        for f in files:
+            m.add_command(label='%s   -   %s' % (os.path.basename(f),
+                                                os.path.dirname(f)),
+                          command=lambda f=f: self.open_recent(f))
 
     def pick_link(self, kind):
         self.link_kind.set(kind)
@@ -2261,7 +2482,8 @@ class Editor(object):
     def toggle_theme(self):
         name = 'dark' if self.v_dark.get() else 'light'
         apply_theme(self.root, name)
-        save_prefs(theme=name)
+        self.props.set('ui', 'theme', name)
+        self.props.save()
         self.set_tool(self.tool)
         if self.tree and self.tree.alive:
             self.tree.refresh()
@@ -2276,6 +2498,7 @@ class Editor(object):
                         ('Ranges: outline only', self.v_outline),
                         ('Sphere', self.v_sphere),
                         ('Labels', self.v_labels),
+                        ('Links', self.v_links),
                         ('AP clients', self.v_clients),
                         ('Walls', self.v_walls),
                         ('Snap %g m' % self.SNAP, self.v_snap))
@@ -2307,15 +2530,18 @@ class Editor(object):
         r1, r2 = rows(g)
         self._btn(r1, 'New', self.new, width=5)
         self._btn(r1, 'Open', self.open, width=5)
+        self._btn(r1, 'Recent', self.show_start, width=6)
         self._btn(r1, 'Save', self.save, width=5)
         self._btn(r2, 'Save as', self.save_as, width=8)
         self._btn(r2, 'Export .py', self.export_py, width=8)
+        check(r2, 'Auto-save', self.v_autosave)
         g = rb.group(home, 'EDIT')
         r1, r2 = rows(g)
         self._btn(r1, 'Inspector', self.open_inspector, accent=True, width=8)
-        self._btn(r1, 'Delete', self.delete_selection, width=6)
+        self._btn(r1, 'Duplicate', self.duplicate_selection, width=8)
         self._btn(r2, 'Undo', self.undo, width=8)
-        self._btn(r2, 'Redo', self.redo, width=6)
+        self._btn(r2, 'Redo', self.redo, width=8)
+        self._btn(r2, 'Delete', self.delete_selection, width=6)
         g = rb.group(home, 'SELECT')
         self._tool(g, 'select', 'Select')
         col = tk.Frame(g, bg=C['bar'])
@@ -2374,6 +2600,10 @@ class Editor(object):
         self.link_kind.trace_add('write', lambda *a: self.link_help.config(
             text=LINK_HELP[self.link_kind.get()]))
         self.link_help.config(text=LINK_HELP['wired'])
+        g = rb.group(ins, 'DEVICE PRESETS')
+        r1, r2 = rows(g)
+        check(r1, 'Ask on spawn', self.v_ask_spawn)
+        self._btn(r2, 'Manage presets', self.manage_presets, width=13)
         g = rb.group(ins, 'BUILD')
         self._tool(g, 'wall', 'Wall')
         self._tool(g, 'picture', 'Picture', command=self.insert_picture)
@@ -2427,13 +2657,16 @@ class Editor(object):
         r1, r2 = rows(g)
         self._btn(r1, '3D', self.view_3d, width=4)
         self._btn(r1, 'Top', self.view_top, width=4)
-        self._btn(r2, 'Fit', self.fit, width=4)
+        self._btn(r1, 'Fit', self.fit, width=4)
+        self._btn(r2, 'Save view', self.save_view, width=9)
+        self._btn(r2, 'Saved view', self.restore_view, width=9)
         g = rb.group(vt, 'SHOW')
         r1, r2 = rows(g)
         self.cb_ranges = check(r1, 'Ranges', self.v_ranges)
         self.cb_outline = check(r1, 'outline only', self.v_outline)
         check(r1, 'Sphere', self.v_sphere)
         check(r2, 'Labels', self.v_labels)
+        check(r2, 'Links', self.v_links)
         check(r2, 'AP clients', self.v_clients)
         check(r2, 'Snap %g m' % self.SNAP, self.v_snap)
         g = rb.group(vt, 'THEME')
@@ -2637,6 +2870,20 @@ class Editor(object):
                                     lid))
             m.add_cascade(label='Remove link', menu=sub)
         m.add_separator()
+        same = [o for o in others if o['kind'] == n['kind']]
+        if same:
+            sub = self.tk.Menu(m, tearoff=0)
+            for o in same:
+                sub.add_command(label=o['name'], command=lambda o=o:
+                                self.copy_config(n, [o]))
+            sub.add_separator()
+            sub.add_command(label='All other %ss' % KIND_LABEL[n['kind']],
+                            command=lambda: self.copy_config(n, same))
+            m.add_cascade(label='Copy configuration to', menu=sub)
+        m.add_command(label='Save configuration as preset...',
+                      command=lambda: self.save_node_preset(n))
+        m.add_command(label='Duplicate', command=lambda: self.duplicate_node(
+            n))
         m.add_command(label='Unlock' if n.get('locked') else 'Lock',
                       command=lambda: (self.select(('node', nid)),
                                        self.toggle_lock()))
@@ -2722,6 +2969,9 @@ class Editor(object):
         if w is not None:
             self.msg = '!  Cannot place a device inside %s.' % w['name']
             return self.redraw()
+        preset = self.spawn_preset(kind)
+        if preset is None:                       # dialog cancelled
+            return self.redraw()
         self.push_undo()
         name = self.unique_name(kind)
         nid = self.next_id
@@ -2730,7 +2980,14 @@ class Editor(object):
         self.nodes[nid] = {'id': nid, 'kind': kind, 'name': name,
                            'xyz': [round(x, 2), round(y, 2), 0.0],
                            'p': default_params(kind, name, ip)}
-        self.msg = 'Added %s %s.' % (KIND_LABEL[kind], name)
+        if preset:
+            try:
+                apply_config(self.nodes[nid], load_preset(kind, preset))
+            except Exception as e:
+                self.msg = '!  Preset %s could not be read (%s).' % (preset, e)
+        self.msg = 'Added %s %s%s.' % (KIND_LABEL[kind], name,
+                                       ' with preset %s' % preset if preset
+                                       else '')
         self.select(('node', nid), quiet=True)
         self.changed()
 
@@ -3069,6 +3326,132 @@ class Editor(object):
                                          'z', 'thick_mult', 'ref_thickness'))
         self.last_wall.update(keep)
         self.add_wall(w)
+
+    # --------------------------------------------- presets / duplicate ----
+    def spawn_preset(self, kind):
+        """'' = default config, a preset name, or None = cancelled."""
+        names = list_presets(kind)
+        if not names:
+            return ''
+        if kind in self.spawn_choice:
+            return self.spawn_choice[kind]
+        if not self.v_ask_spawn.get():
+            return ''
+        d = SpawnDialog(self, kind, names)
+        if d.result is not None and d.remember:
+            self.spawn_choice[kind] = d.result
+        return d.result
+
+    def save_node_preset(self, n=None):
+        from tkinter import simpledialog
+        n = n or self.sel_node()
+        if n is None:
+            self.msg = 'Select a device to save its configuration.'
+            return self.redraw()
+        name = simpledialog.askstring(
+            'Save configuration', 'Preset name for this %s configuration:'
+            % KIND_LABEL[n['kind']], initialvalue='%s-%s' % (
+                n['kind'], n['p'].get('ssid') or n['name']),
+            parent=self.inspector.top if self.inspector else self.root)
+        if not name:
+            return
+        safe = save_preset(n['kind'], name, node_config(n))
+        self.msg = ('Saved preset %s (%s) in data/presets/%s/. New %ss can '
+                    'use it.' % (safe, KIND_LABEL[n['kind']], n['kind'],
+                                 KIND_LABEL[n['kind']]))
+        if self.inspector:
+            self.inspector.config_changed(False)
+        self.redraw()
+
+    def apply_preset(self, kind, preset, targets):
+        try:
+            params = load_preset(kind, preset)
+        except Exception as e:
+            self.msg = '!  Could not read preset %s (%s).' % (preset, e)
+            return self.redraw()
+        self.push_undo()
+        for n in targets:
+            apply_config(n, params)
+        self.msg = 'Preset %s applied to %s.' % (
+            preset, ', '.join(n['name'] for n in targets))
+        self.changed()
+
+    def copy_config(self, src, targets):
+        if not targets:
+            return
+        self.push_undo()
+        cfg = node_config(src)
+        for n in targets:
+            apply_config(n, cfg)
+        self.msg = 'Configuration of %s copied to %s.' % (
+            src['name'], ', '.join(n['name'] for n in targets))
+        self.changed()
+
+    def manage_presets(self):
+        PresetManager(self)
+
+    def duplicate_selection(self):
+        """Ctrl+D: duplicate the selected device, wall or picture."""
+        n, pic = self.sel_node(), self.sel_pic()
+        if n is not None:
+            return self.duplicate_node(n)
+        if pic is not None:
+            return self.duplicate_pic(pic)
+        if self.sel_wall():
+            return self.duplicate_wall()
+        self.msg = 'Select a device, wall or picture to duplicate it.'
+        self.redraw()
+
+    def duplicate_node(self, n):
+        x, y, z = n['xyz']
+        others = [o['xyz'] for o in self.nodes.values()]
+        spot = None
+        for r in (5, 10, 15, 20, 30):
+            for dx, dy in ((r, 0), (0, -r), (-r, 0), (0, r), (r, r),
+                           (-r, -r), (r, -r), (-r, r)):
+                q = [round(x + dx, 2), round(y + dy, 2), z]
+                if not self.point_in_wall(q) and all(
+                        math.dist(q, o) > 1.0 for o in others):
+                    spot = q
+                    break
+            if spot:
+                break
+        if spot is None:
+            self.msg = '!  No free spot next to %s.' % n['name']
+            return self.redraw()
+        self.push_undo()
+        name = self.unique_name(n['kind'])
+        nid = self.next_id
+        self.next_id += 1
+        p = copy.deepcopy(n['p'])
+        if p.get('ssid') == n['name'] + '-ssid':
+            p['ssid'] = name + '-ssid'
+        if 'mac' in p:
+            p['mac'] = ''
+        if 'dpid' in p:
+            p['dpid'] = ''
+        if p.get('ip'):
+            p['ip'] = self.next_ip()
+        self.nodes[nid] = {'id': nid, 'kind': n['kind'], 'name': name,
+                           'xyz': spot, 'p': p, 'locked': False}
+        self.msg = 'Duplicated %s as %s (same configuration, new name / IP; '\
+            'links are not copied).' % (n['name'], name)
+        self.select(('node', nid), quiet=True)
+        self.changed()
+
+    def duplicate_pic(self, pic):
+        new = copy.deepcopy(dict((k, pic[k]) for k in PIC_KEYS if k in pic))
+        new['x'] = round(pic['x'] + float(pic['width']) * 0.1, 2)
+        new['y'] = round(pic['y'] - float(pic['width']) * 0.1, 2)
+        new['locked'] = False
+        self.push_undo()
+        pid = self.next_id
+        self.next_id += 1
+        new['id'] = pid
+        self.pics[pid] = new
+        self.msg = 'Picture duplicated.'
+        self.select(('pic', pid), quiet=True)
+        self.changed()
 
     def duplicate_wall(self):
         w = self.sel_wall()
@@ -4089,7 +4472,9 @@ class Editor(object):
 
         # control links (automatic)
         labels = self.v_labels.get()
-        ctrls = [n for n in self.nodes.values() if n['kind'] == 'ctrl']
+        show_links = self.v_links.get()
+        ctrls = [n for n in self.nodes.values() if n['kind'] == 'ctrl'] \
+            if show_links else []
         for n in self.nodes.values():
             if n['kind'] in ('ap', 'switch') and \
                     n['p'].get('failMode') != 'standalone':
@@ -4105,7 +4490,7 @@ class Editor(object):
 
         # user links
         self.link_hits = []
-        for lid, l in self.links.items():
+        for lid, l in (self.links.items() if show_links else ()):
             if l['a'] not in pos or l['b'] not in pos:
                 continue
             x1, y1, _ = self.project(*pos[l['a']])
@@ -4155,7 +4540,7 @@ class Editor(object):
             self.link_hits.append((lid, x1, y1, x2, y2))
 
         # automatic associations (no explicit link, inside an AP range)
-        if self.v_clients.get():
+        if self.v_clients.get() and show_links:
             for aid, lst in assoc.items():
                 for i, how in lst:
                     if how == 'auto':
@@ -4826,8 +5211,14 @@ class Editor(object):
                 for _, pc in sorted(self.pics.items())]
         walls = [dict((k, w[k]) for k in WALL_KEYS)
                  for _, w in sorted(self.walls.items())]
+        view = {'last': dict(camera_state(self), by='editor',
+                             time=datetime.datetime.now().isoformat(
+                                 timespec='seconds'))}
+        if self.view_saved:
+            view['saved'] = self.view_saved
         return {'net': copy.deepcopy(self.netp), 'nodes': nodes,
-                'links': links, 'pictures': pics, 'walls': walls}
+                'links': links, 'pictures': pics, 'walls': walls,
+                'view': view}
 
     def from_doc(self, doc):
         self.nodes, self.links, self.next_id = {}, {}, 1
@@ -4869,6 +5260,9 @@ class Editor(object):
             self.walls[wid] = ww
         self.sel = None
         self.undo_stack, self.redo_stack, self._undo_key = [], [], None
+        view = doc.get('view') or {}
+        self.view_saved = view.get('saved')
+        self._view_last = view.get('last')
 
     def confirm_discard(self):
         """True when it's OK to throw away the current network."""
@@ -4911,12 +5305,18 @@ class Editor(object):
             return
         self.from_doc(doc)
         self.path, self.fmt = path, fmt
+        self.add_recent(path)
         self.msg = 'Opened %s (%s).' % (os.path.basename(path), fmt)
         self.user_view = False
         self.changed()
         self.dirty = False
         self.update_title()
-        self.fit()
+        self.root.update_idletasks()
+        if self._view_last and apply_camera(self, self._view_last):
+            self.msg += '  Camera restored from the file.'
+            self.redraw()
+        else:
+            self.fit()
 
     def save(self):
         if not self.path:
@@ -4965,9 +5365,92 @@ class Editor(object):
             return False
         self.dirty = False
         self.msg = 'Saved %s (%s).' % (path, fmt)
+        self.add_recent(path)
         self.update_title()
         self.redraw()
         return True
+
+    # ------------------------------------------- recent files / start ----
+    def recent_files(self):
+        out = []
+        for k, v in sorted(self.props.items('recent'),
+                           key=lambda kv: int(kv[0][4:] or 0)
+                           if kv[0].startswith('file') else 99):
+            if v and v not in out:
+                out.append(v)
+        return out
+
+    def add_recent(self, path):
+        path = os.path.abspath(path)
+        if path.startswith(os.path.join(APP_DIR, 'profile')):
+            return                               # not the recovery copy
+        files = [path] + [f for f in self.recent_files() if f != path]
+        self.props.clear('recent')
+        for i, f in enumerate(files[:15]):
+            self.props.set('recent', 'file%d' % i, f)
+        self.props.save()
+
+    def forget_recent(self, path):
+        files = [f for f in self.recent_files() if f != path]
+        self.props.clear('recent')
+        for i, f in enumerate(files):
+            self.props.set('recent', 'file%d' % i, f)
+        self.props.save()
+
+    def recovery_path(self):
+        return os.path.join(APP_DIR, 'profile', 'autosave', 'untitled.json')
+
+    def show_start(self):
+        StartPage(self)
+
+    def open_recent(self, path):
+        if not os.path.isfile(path):
+            self.mb.showerror('Open', '%s no longer exists.' % path,
+                              parent=self.root)
+            self.forget_recent(path)
+            return False
+        if not self.confirm_discard():
+            return False
+        self.open_path(path)
+        return True
+
+    def autosave_tick(self):
+        try:
+            if self.v_autosave.get() and self.dirty:
+                if self.path and self.fmt in ('normalized', 'custom'):
+                    if self.write(self.path, self.fmt):
+                        self.msg = 'Auto-saved %s at %s.' % (
+                            os.path.basename(self.path),
+                            time.strftime('%H:%M'))
+                else:                            # never saved: recovery copy
+                    rp = self.recovery_path()
+                    os.makedirs(os.path.dirname(rp), exist_ok=True)
+                    write_doc(self.to_doc(), rp, 'normalized')
+                    self.msg = ('Auto-saved a recovery copy at %s (File > '
+                                'Start page to reopen it).' %
+                                time.strftime('%H:%M'))
+                self.redraw()
+        except Exception as e:
+            self.msg = '!  Auto-save failed: %s' % e
+        self.root.after(int(self.autosave_min * 60000), self.autosave_tick)
+
+    # ----------------------------------------------------- camera view ----
+    def save_view(self):
+        self.view_saved = dict(camera_state(self), by='editor',
+                               time=datetime.datetime.now().isoformat(
+                                   timespec='seconds'))
+        self.dirty = True
+        self.update_title()
+        self.msg = ('View saved in the topology (written on the next save). '
+                    'custom_gui.py can restore it too.')
+        self.redraw()
+
+    def restore_view(self):
+        if self.view_saved and apply_camera(self, self.view_saved):
+            self.msg = 'Saved view restored.'
+        else:
+            self.msg = 'No saved view in this topology yet (View > Save view).'
+        self.redraw()
 
     def ask_format(self):
         tk = self.tk
@@ -5019,7 +5502,19 @@ class Editor(object):
         self.root.wait_window(top)
         return res['v']
 
+    def save_window_props(self):
+        try:
+            self.props.set('window', 'geometry', self.root.geometry())
+            self.props.set('window', 'ribbon_tab', self.ribbon.current)
+            self.props.set('window', 'ribbon_collapsed',
+                           self.ribbon.collapsed)
+            self.props.set('ui', 'wall_ask', self.wall_ask)
+            self.props.save()
+        except Exception:
+            pass
+
     def on_close(self):
+        self.save_window_props()
         if not self.dirty and self.path:
             self.root.destroy()
             return
@@ -5031,6 +5526,323 @@ class Editor(object):
 
     def run(self):
         self.root.mainloop()
+
+
+class SpawnDialog(object):
+    """Choose the configuration of a new device: default or a preset."""
+
+    def __init__(self, ed, kind, names):
+        tk = ed.tk
+        self.result, self.remember = None, False
+        top = self.top = tk.Toplevel(ed.root)
+        top.title('New %s' % KIND_LABEL[kind])
+        top.configure(bg=C['bg'])
+        top.transient(ed.root)
+        top.resizable(False, False)
+        head = tk.Frame(top, bg=C['bar'], padx=12, pady=8)
+        head.pack(fill='x')
+        ic = tk.Canvas(head, width=34, height=30, bg=C['bar'],
+                       highlightthickness=0)
+        draw_icon(ic, kind, *icon_center(kind, 34, 30), ow=C['outline'])
+        ic.pack(side='left')
+        tk.Label(head, text='Configuration of the new %s' % KIND_LABEL[kind],
+                 bg=C['bar'], fg=C['text'], font=('TkDefaultFont', 11, 'bold')
+                 ).pack(side='left', padx=8)
+        body = tk.Frame(top, bg=C['bg'], padx=14, pady=10)
+        body.pack(fill='both')
+        self.lb = tk.Listbox(body, height=min(10, len(names) + 1), width=52,
+                             bg=C['btn'], fg=C['text'], relief='flat',
+                             selectbackground=C['ap'],
+                             selectforeground='white', highlightthickness=1,
+                             highlightbackground=C['grid_major'],
+                             activestyle='none', exportselection=False)
+        self.items = [''] + names
+        self.lb.insert('end', 'Default configuration')
+        for nm in names:
+            try:
+                p = load_preset(kind, nm)
+                bits = ['%s=%s' % (k, fmt_num(p[k]) if isinstance(
+                    p[k], (int, float)) else p[k]) for k in
+                    ('ssid', 'mode', 'channel', 'range', 'txpower')
+                    if p.get(k) not in (None, '')]
+            except Exception:
+                bits = ['unreadable']
+            self.lb.insert('end', '%s    (%s)' % (nm, ', '.join(bits)))
+        self.lb.selection_set(0)
+        self.lb.pack(fill='both')
+        self.lb.bind('<Double-Button-1>', lambda e: self.ok())
+        self.v_rem = tk.BooleanVar(value=False)
+        tk.Checkbutton(body, text='Use this choice for the next %ss '
+                       '(until restart)' % KIND_LABEL[kind],
+                       variable=self.v_rem, bg=C['bg'], fg=C['text'],
+                       selectcolor=C['btn'], activebackground=C['bg'],
+                       highlightthickness=0).pack(anchor='w', pady=(8, 0))
+        tk.Label(body, text='Untick Insert > Ask on spawn to stop this '
+                 'window.', bg=C['bg'], fg=C['muted'],
+                 font=('TkDefaultFont', 8)).pack(anchor='w')
+        bf = tk.Frame(top, bg=C['bar'], padx=8, pady=8)
+        bf.pack(fill='x')
+        tk.Button(bf, text='Place', relief='flat', bg=C['ap'], fg='white',
+                  padx=14, command=self.ok).pack(side='right', padx=4)
+        tk.Button(bf, text='Cancel', relief='flat', bg=C['btn'],
+                  fg=C['text'], padx=10, command=top.destroy).pack(
+            side='right', padx=4)
+        top.bind('<Return>', lambda e: self.ok())
+        top.bind('<Escape>', lambda e: top.destroy())
+        try:
+            top.wait_visibility()
+            top.grab_set()
+        except Exception:
+            pass
+        self.lb.focus_set()
+        ed.root.wait_window(top)
+
+    def ok(self):
+        sel = self.lb.curselection()
+        self.result = self.items[sel[0] if sel else 0]
+        self.remember = self.v_rem.get()
+        self.top.destroy()
+
+
+class PresetManager(object):
+    """List / delete / apply the saved device configurations."""
+
+    def __init__(self, ed):
+        tk = ed.tk
+        self.ed = ed
+        top = self.top = tk.Toplevel(ed.root)
+        top.title('Device presets')
+        top.configure(bg=C['bg'])
+        top.geometry('560x420')
+        tk.Label(top, text='Saved configurations  (%s)' % os.path.join(
+            APP_DIR, 'data', 'presets'), bg=C['bar'], fg=C['text'],
+            anchor='w', padx=10, pady=6).pack(fill='x')
+        self.lb = tk.Listbox(top, bg=C['btn'], fg=C['text'], relief='flat',
+                             selectbackground=C['ap'], selectforeground='white',
+                             highlightthickness=0, activestyle='none',
+                             font=('TkFixedFont', 9))
+        self.lb.pack(fill='both', expand=True, padx=10, pady=6)
+        bf = tk.Frame(top, bg=C['bar'], padx=6, pady=6)
+        bf.pack(fill='x')
+        for text, cmd in (('Apply to selected device', self.apply_sel),
+                          ('Apply to all of its type', self.apply_all),
+                          ('Delete', self.delete)):
+            tk.Button(bf, text=text, relief='flat', bg=C['btn'],
+                      fg=C['text'], padx=8, command=cmd).pack(side='left',
+                                                              padx=3)
+        tk.Button(bf, text='Close', relief='flat', bg=C['ap'], fg='white',
+                  padx=10, command=top.destroy).pack(side='right', padx=3)
+        self.fill()
+
+    def fill(self):
+        self.items = []
+        self.lb.delete(0, 'end')
+        for kind in KINDS:
+            for nm in list_presets(kind):
+                self.items.append((kind, nm))
+                self.lb.insert('end', '%-13s %s' % (KIND_LABEL[kind], nm))
+        if not self.items:
+            self.lb.insert('end', 'No presets yet. Select a device, then '
+                           'Inspector > Save config as preset.')
+
+    def current(self):
+        sel = self.lb.curselection()
+        if not sel or sel[0] >= len(self.items):
+            return None
+        return self.items[sel[0]]
+
+    def apply_sel(self):
+        it, n = self.current(), self.ed.sel_node()
+        if it and n is not None and n['kind'] == it[0]:
+            self.ed.apply_preset(it[0], it[1], [n])
+        elif it:
+            self.ed.mb.showinfo('Presets', 'Select a %s on the canvas first.'
+                                % KIND_LABEL[it[0]], parent=self.top)
+
+    def apply_all(self):
+        it = self.current()
+        if it:
+            self.ed.apply_preset(it[0], it[1], [
+                n for n in self.ed.nodes.values() if n['kind'] == it[0]])
+
+    def delete(self):
+        it = self.current()
+        if it and self.ed.mb.askyesno('Presets', 'Delete preset %s?' % it[1],
+                                      parent=self.top):
+            delete_preset(*it)
+            self.fill()
+
+
+class StartPage(object):
+    """Word-like start screen: blank network, open, recent files and the
+    auto-saved recovery copy."""
+
+    def __init__(self, ed):
+        tk = ed.tk
+        self.ed = ed
+        top = self.top = tk.Toplevel(ed.root)
+        top.title('Start - MiniEdit-WiFi')
+        top.configure(bg=C['bg'])
+        top.transient(ed.root)
+        ed.root.update_idletasks()
+        x = ed.root.winfo_rootx() + max((ed.root.winfo_width() - 780) // 2, 0)
+        y = ed.root.winfo_rooty() + 60
+        top.geometry('780x520+%d+%d' % (x, y))
+        top.bind('<Escape>', lambda e: top.destroy())
+        left = tk.Frame(top, bg=C['bar'], padx=18, pady=18, width=220)
+        left.pack(side='left', fill='y')
+        left.pack_propagate(False)
+        logo = tk.Canvas(left, width=60, height=48, bg=C['bar'],
+                         highlightthickness=0)
+        logo.pack(anchor='w')
+        draw_icon(logo, 'ap', 22, 30, ow=C['outline'], s=1.4)
+        draw_icon(logo, 'sta', 48, 34, ow=C['outline'], s=0.9)
+        tk.Label(left, text='MiniEdit-WiFi', bg=C['bar'], fg=C['text'],
+                 font=('TkDefaultFont', 14, 'bold')).pack(anchor='w',
+                                                         pady=(6, 0))
+        tk.Label(left, text='topology editor', bg=C['bar'], fg=C['muted']
+                 ).pack(anchor='w', pady=(0, 18))
+        for text, cmd, acc in (('Blank network', top.destroy, True),
+                               ('Open...', self.open_other, False)):
+            tk.Button(left, text=text, command=cmd, relief='flat', anchor='w',
+                      bg=C['ap'] if acc else C['btn'],
+                      fg='white' if acc else C['text'], padx=10, pady=4
+                      ).pack(fill='x', pady=3)
+        rp = ed.recovery_path()
+        if os.path.isfile(rp):
+            tk.Button(left, text='Recover unsaved network', relief='flat',
+                      anchor='w', bg=C['btn'], fg=C['warn'], padx=10, pady=4,
+                      command=self.open_recovery).pack(fill='x', pady=3)
+            tk.Label(left, text='auto-saved %s' % time.strftime(
+                '%d %b %H:%M', time.localtime(os.path.getmtime(rp))),
+                bg=C['bar'], fg=C['muted'], font=('TkDefaultFont', 8)
+            ).pack(anchor='w')
+        tk.Label(left, text='Tip: File > Start page shows this again at '
+                 'any time.', justify='left', bg=C['bar'], fg=C['muted'],
+                 wraplength=170, font=('TkDefaultFont', 8)).pack(
+            side='bottom', anchor='w')
+        right = tk.Frame(top, bg=C['bg'], padx=16, pady=14)
+        right.pack(side='left', fill='both', expand=True)
+        tk.Label(right, text='Recent', bg=C['bg'], fg=C['text'],
+                 font=('TkDefaultFont', 12, 'bold')).pack(anchor='w')
+        tk.Label(right, text='click: open    right-click: remove from the '
+                 'list', bg=C['bg'], fg=C['muted'],
+                 font=('TkDefaultFont', 8)).pack(anchor='w', pady=(0, 6))
+        wrap = tk.Frame(right, bg=C['bg'])
+        wrap.pack(fill='both', expand=True)
+        self.cv = tk.Canvas(wrap, bg=C['bg'], highlightthickness=0)
+        sb = tk.Scrollbar(wrap, orient='vertical', command=self.cv.yview)
+        self.cv.configure(yscrollcommand=sb.set)
+        sb.pack(side='right', fill='y')
+        self.cv.pack(side='left', fill='both', expand=True)
+        self.cv.bind('<Button-1>', self.on_click)
+        self.cv.bind('<Button-3>', self.on_menu)
+        self.cv.bind('<Motion>', self.on_motion)
+        self.hover = None
+        self.draw()
+
+    @staticmethod
+    def describe(path):
+        """(exists, modified text, contents text)"""
+        if not os.path.isfile(path):
+            return False, '', 'file not found'
+        mt = time.strftime('%d %b %Y  %H:%M',
+                           time.localtime(os.path.getmtime(path)))
+        try:
+            with open(path) as fh:
+                d = json.load(fh)
+            if d.get('schema') == 'custom':
+                counts = {}
+                for dev in d.get('devices') or []:
+                    counts[dev.get('kind')] = counts.get(dev.get('kind'), 0) + 1
+                parts = ['%d %s' % (v, k) for k, v in sorted(counts.items())]
+            else:
+                parts = ['%d %s' % (len(d.get(k) or []), k) for k in
+                         ('accessPoints', 'stations', 'cars', 'hosts',
+                          'switches', 'controllers') if d.get(k)]
+            if d.get('walls'):
+                parts.append('%d walls' % len(d['walls']))
+            return True, mt, ', '.join(parts) or 'empty network'
+        except Exception:
+            return True, mt, 'not a topology file?'
+
+    def draw(self):
+        cv = self.cv
+        cv.delete('all')
+        self.rows = self.ed.recent_files()
+        if not self.rows:
+            cv.create_text(10, 20, anchor='w', fill=C['muted'],
+                           text='No recent files yet. Files you open or save '
+                                'appear here.')
+        for i, f in enumerate(self.rows):
+            y = i * 54
+            ok, mt, what = self.describe(f)
+            if i == self.hover:
+                cv.create_rectangle(0, y + 2, 2000, y + 52, fill=C['halo'],
+                                    outline='')
+            cv.create_rectangle(8, y + 10, 30, y + 40, fill=C['btn'],
+                                outline=C['ap'] if ok else C['axis'])
+            cv.create_line(12, y + 20, 26, y + 20, fill=C['axis'])
+            cv.create_line(12, y + 26, 26, y + 26, fill=C['axis'])
+            cv.create_line(12, y + 32, 22, y + 32, fill=C['axis'])
+            cv.create_text(42, y + 14, anchor='w', text=os.path.basename(f),
+                           fill=C['text'] if ok else C['muted'],
+                           font=('TkDefaultFont', 10, 'bold'))
+            cv.create_text(42, y + 30, anchor='w', text=os.path.dirname(f),
+                           fill=C['muted'], font=('TkDefaultFont', 8))
+            cv.create_text(42, y + 44, anchor='w', text=what,
+                           fill=C['muted'] if ok else C['warn'],
+                           font=('TkDefaultFont', 8))
+            cv.create_text(max(cv.winfo_width(), 480) - 8, y + 14,
+                           anchor='e', text=mt, fill=C['muted'],
+                           font=('TkDefaultFont', 8))
+        cv.configure(scrollregion=(0, 0, 520, max(len(self.rows) * 54, 10)))
+
+    def row_at(self, y):
+        i = int(self.cv.canvasy(y) // 54)
+        return i if 0 <= i < len(self.rows) else None
+
+    def on_motion(self, e):
+        i = self.row_at(e.y)
+        if i != self.hover:
+            self.hover = i
+            self.draw()
+
+    def on_click(self, e):
+        i = self.row_at(e.y)
+        if i is not None and self.ed.open_recent(self.rows[i]):
+            self.top.destroy()
+        elif i is not None:
+            self.draw()
+
+    def on_menu(self, e):
+        i = self.row_at(e.y)
+        if i is None:
+            return
+        m = self.ed._menu(self.top)
+        f = self.rows[i]
+        m.add_command(label='Open', command=lambda: (
+            self.ed.open_recent(f) and self.top.destroy()))
+        m.add_command(label='Remove from the list', command=lambda: (
+            self.ed.forget_recent(f), self.draw()))
+        m.tk_popup(e.x_root, e.y_root)
+
+    def open_other(self):
+        before = self.ed.path
+        self.ed.open()
+        if self.ed.path and self.ed.path != before:
+            self.top.destroy()
+
+    def open_recovery(self):
+        if not self.ed.confirm_discard():
+            return
+        self.ed.open_path(self.ed.recovery_path())
+        self.ed.path = None                      # save asks where to put it
+        self.ed.dirty = True
+        self.ed.msg = 'Recovered the auto-saved network: save it with Save as.'
+        self.ed.update_title()
+        self.ed.redraw()
+        self.top.destroy()
 
 
 class WallDialog(object):
@@ -5207,6 +6019,8 @@ class WallDialog(object):
             self.err.config(text='!  %s' % e)
             return
         self.ed.wall_ask = self.v_ask.get()
+        self.ed.props.set('ui', 'wall_ask', self.ed.wall_ask)
+        self.ed.props.save()
         self.result = w
         self.top.destroy()
 
@@ -5256,6 +6070,16 @@ class Inspector(object):
         self.b_del.pack(side='left', padx=3)
         tk.Button(foot, text='Close', relief='flat', bg=C['ap'], fg='white',
                   padx=12, command=self.close).pack(side='right', padx=3)
+        self.foot2 = tk.Frame(top, bg=C['bar'], padx=6, pady=0)
+        self.b_preset = tk.Button(self.foot2, text='Save config as preset',
+                                  relief='flat', bg=C['btn'], fg=C['text'],
+                                  padx=8, command=lambda: ed.save_node_preset())
+        self.b_preset.pack(side='left', padx=3, pady=(0, 4))
+        self.b_apply = tk.Button(self.foot2, text='Apply preset...',
+                                 relief='flat', bg=C['btn'], fg=C['text'],
+                                 padx=8, command=self.preset_menu)
+        self.b_apply.pack(side='left', padx=3, pady=(0, 4))
+        self._changed = False
 
         wrap = tk.Frame(top, bg=C['bg'])
         wrap.pack(fill='both', expand=True)
@@ -5324,6 +6148,43 @@ class Inspector(object):
             return self.ed.walls.get(oid)
         return None
 
+    def config_changed(self, on=True):
+        """Highlight 'Save config as preset' after the device was edited."""
+        self._changed = on
+        try:
+            self.b_preset.config(
+                text='Save config as preset  *' if on else
+                'Save config as preset', bg=C['ap'] if on else C['btn'],
+                fg='white' if on else C['text'])
+        except Exception:
+            pass
+
+    def preset_menu(self):
+        n = self.obj() if self.target[0] == 'node' else None
+        if n is None:
+            return
+        ed = self.ed
+        m = ed._menu(self.top)
+        names = list_presets(n['kind'])
+        if not names:
+            m.add_command(label='No %s presets yet: use "Save config as '
+                          'preset"' % KIND_LABEL[n['kind']], state='disabled')
+        same = [o for o in ed.nodes.values() if o['kind'] == n['kind']]
+        for name in names:
+            sub = ed._menu(m)
+            sub.add_command(label='Apply to %s' % n['name'],
+                            command=lambda nm=name: ed.apply_preset(
+                                n['kind'], nm, [n]))
+            sub.add_command(label='Apply to all %ss (%d)' % (
+                KIND_LABEL[n['kind']], len(same)),
+                command=lambda nm=name: ed.apply_preset(n['kind'], nm, same))
+            m.add_cascade(label=name, menu=sub)
+        m.add_separator()
+        m.add_command(label='Manage presets...', command=ed.manage_presets)
+        x = self.b_apply.winfo_rootx()
+        y = self.b_apply.winfo_rooty() - 10
+        m.tk_popup(x, y)
+
     def dyn_row(self, fn):
         """A read-only text block refreshed with every change."""
         lb = self.tk.Label(self.body, bg=C['bg'], fg=C['text'], anchor='w',
@@ -5340,6 +6201,11 @@ class Inspector(object):
         self.body.columnconfigure(1, weight=1)
         self.target = self.current()
         kind, oid = self.target
+        self.config_changed(False)
+        if kind == 'node':
+            self.foot2.pack(side='bottom', fill='x', before=self.cv.master)
+        else:
+            self.foot2.pack_forget()
         if kind == 'walls':
             self.section('general')
             self.dyn_row(lambda: self.walls_info())
@@ -5964,6 +6830,9 @@ class Inspector(object):
                 self.ed.redraw()
                 return
         self.ed.push_undo((self.target, key))
+        if self.target[0] == 'node' and key not in ('__x', '__y', '__z',
+                                                     '__name', '__locked'):
+            self.config_changed(True)
         self.set_model(key, val)
         if rec['scale'] is not None:
             self.loading = True

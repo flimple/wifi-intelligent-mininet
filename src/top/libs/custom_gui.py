@@ -26,6 +26,14 @@ What you get
     the connections that cross each wall
   - Devices list in a git-graph style: go to a device, see its details,
     change the AP of a station, open its terminal (xterm)
+  - Live config (Tools tab / devices list): change range, tx power,
+    antenna, channel, mode, IP, position and tc (bandwidth, delay, jitter,
+    loss) of a running device, for testing - nothing is saved
+  - CLI terminal (Tools tab, C): a Mininet CLI inside the viewer; commands
+    run in the Mininet process and their output is shown in the window
+  - Show / hide the links (Show tab); options are kept in
+    profile/gui.ini next to this file; the camera starts where the editor
+    left it (topology 'view'), View > Save view writes it back to the file
 
 Bridge with custom_edit.py
   The editor saves a JSON file (normalized or custom format). Devices are
@@ -61,7 +69,8 @@ Mouse & keys
   drag an unlocked wall / picture .......... move it
   keys: T = top view, 3 = 3D view, F = fit, A = animation on/off,
         S = sphere on/off, W = walls on/off, P = pictures on/off,
-        K = packets on/off, D = devices list, Ctrl+F1 = ribbon
+        K = packets on/off, D = devices list, C = CLI terminal,
+        Ctrl+F1 = ribbon
 
 Terminals and "change AP" (devices list) run in your Mininet process:
 use them while the CLI is waiting at its prompt.
@@ -342,6 +351,7 @@ def read_layout(path):
     return {'walls': [_norm_wall(w) for w in walls],
             'pictures': [_norm_pic(p, base) for p in pics],
             'devices': devices, 'locked_devices': locked,
+            'view': d.get('view') or {},
             'source': os.path.abspath(path)}
 
 
@@ -661,6 +671,8 @@ class WifiGUI(object):
         self.fallback = {}           # positions from the editor's file
         self.layout = None           # walls + pictures
         self.meter = TrafficMeter(net)
+        self._cli, self._cli_thread = None, None
+        self._cli_q = queue.Queue()
         self._to_win = None
         self._from_win = None
         self._proc = None
@@ -712,6 +724,7 @@ class WifiGUI(object):
                 warnings.append('Picture not found: %s' % p['path'])
         self.layout = {'type': 'layout', 'walls': walls, 'pictures': pics,
                        'warnings': warnings,
+                       'view': layout.get('view') or {},
                        'locked_devices': list(layout.get('locked_devices')
                                               or []),
                        'source': layout.get('source', '')}
@@ -807,8 +820,174 @@ class WifiGUI(object):
         except Exception as e:
             self._notice('could not disconnect %s (%s)' % (sta, e))
 
+    # ----------------------------------------------- live configuration ----
+    def _live(self, name, changes):
+        """Change a running device (not saved anywhere)."""
+        node = self._node(name)
+        if node is None:
+            return self._notice('no device called %s' % name)
+        try:
+            wintf = list(node.wintfs.values())[0].name
+        except Exception:
+            wintf = None
+        done, failed = [], []
+        for k, v in changes.items():
+            try:
+                if k == 'position':
+                    self._apply_move(name, *[float(c) for c in v])
+                elif k == 'ip':
+                    ip, _, plen = str(v).partition('/')
+                    node.setIP(ip, prefixLen=int(plen or 8), intf=wintf) \
+                        if wintf else node.setIP(ip, prefixLen=int(plen or 8))
+                elif k in ('range', 'txpower', 'antennaGain',
+                           'antennaHeight', 'channel', 'mode'):
+                    fn = {'range': 'setRange', 'txpower': 'setTxPower',
+                          'antennaGain': 'setAntennaGain',
+                          'antennaHeight': 'setAntennaHeight',
+                          'channel': 'setChannel', 'mode': 'setMode'}[k]
+                    val = v if k == 'mode' else (
+                        int(float(v)) if k == 'channel' else float(v))
+                    getattr(node, fn)(val, intf=wintf)
+                else:
+                    raise ValueError('unknown setting')
+                done.append('%s=%s' % (k, v))
+            except Exception as e:
+                failed.append('%s (%s)' % (k, e))
+        self._notice('%s live: %s%s' % (
+            name, ', '.join(done) or 'nothing changed',
+            ('   FAILED: ' + '; '.join(failed)) if failed else ''))
+
+    def _live_tc(self, name, ifname, params):
+        """bw (Mbit/s), delay, jitter, loss (%) on one interface."""
+        node = self._node(name)
+        if node is None:
+            return
+        intf = getattr(node, 'nameToIntf', {}).get(ifname)
+        p = dict((k, v) for k, v in params.items() if v not in (None, ''))
+        for k in ('bw', 'loss'):                 # numbers for TCIntf
+            if k in p:
+                try:
+                    p[k] = float(p[k])
+                except ValueError:
+                    return self._notice('%s must be a number' % k)
+        try:
+            intf.config(**p)                     # TCIntf (wired links)
+            return self._notice('%s %s: %s' % (name, ifname, p))
+        except Exception:
+            pass
+        try:
+            netem = []
+            if p.get('delay'):
+                netem += ['delay', str(p['delay'])]
+                if p.get('jitter'):
+                    netem.append(str(p['jitter']))
+            if p.get('loss') is not None:
+                netem += ['loss', '%s%%' % p['loss']]
+            if p.get('bw'):
+                netem += ['rate', '%smbit' % p['bw']]
+            out = node.cmd('tc qdisc replace dev %s root netem %s' % (
+                ifname, ' '.join(netem) or 'delay 0ms'))
+            self._notice('%s %s (netem): %s %s' % (name, ifname,
+                                                   ' '.join(netem), out.strip()))
+        except Exception as e:
+            self._notice('traffic control on %s failed (%s)' % (ifname, e))
+
+    def _save_view(self, cam):
+        path = (self.layout or {}).get('source')
+        if not path:
+            return self._notice('no topology file loaded: the view can only '
+                                'be saved with load_json(...)')
+        try:
+            with open(path) as fh:
+                d = json.load(fh)
+            d.setdefault('view', {})['saved'] = dict(
+                cam, by='custom_gui', time=time.strftime('%Y-%m-%dT%H:%M:%S'))
+            tmp = path + '.tmp'
+            with open(tmp, 'w') as fh:
+                json.dump(d, fh, indent=2)
+            os.replace(tmp, path)
+            self.layout.setdefault('view', {})['saved'] = d['view']['saved']
+            self._notice('view saved in %s (the editor can restore it)' %
+                         os.path.basename(path))
+        except Exception as e:
+            self._notice('could not save the view (%s)' % e)
+
+    # ------------------------------------------------- CLI terminal ----
+    def _cli_worker(self):
+        while True:
+            line = self._cli_q.get()
+            if line is None:
+                return
+            self._cli_exec(line)
+
+    def _cli_exec(self, line):
+        """Run one Mininet CLI command and stream its output back."""
+        import contextlib
+        import logging
+        import tempfile
+        out = self._to_win
+
+        def send(text):
+            if text:
+                out.put({'type': 'cli_out', 'text': text})
+
+        class Handler(logging.Handler):
+            def emit(self, record):
+                try:
+                    send(record.getMessage())
+                except Exception:
+                    pass
+
+        class Writer(object):
+            def write(self, t):
+                send(t)
+
+            def flush(self):
+                pass
+        cmd = line.strip()
+        if cmd in ('exit', 'quit', 'EOF'):
+            send('(use the terminal you started Mininet from to exit)\n')
+            out.put({'type': 'cli_done'})
+            return
+        lg = None
+        h = Handler()
+        try:
+            from mininet.log import lg
+            if self._cli is None:
+                try:
+                    from mn_wifi.cli import CLI
+                except ImportError:
+                    from mininet.cli import CLI
+                fd, empty = tempfile.mkstemp(suffix='.cli')
+                os.close(fd)
+                try:
+                    self._cli = CLI(self.net, script=empty)   # batch: returns
+                finally:
+                    os.remove(empty)
+            lg.addHandler(h)
+            with contextlib.redirect_stdout(Writer()):
+                self._cli.onecmd(cmd)
+        except Exception as e:
+            send('error: %s\n' % e)
+        finally:
+            if lg is not None:
+                lg.removeHandler(h)
+            out.put({'type': 'cli_done'})
+
     def _handle(self, msg):
         kind = msg[0]
+        if kind == 'live':
+            return self._live(msg[1], msg[2])
+        if kind == 'live_tc':
+            return self._live_tc(msg[1], msg[2], msg[3])
+        if kind == 'save_view':
+            return self._save_view(msg[1])
+        if kind == 'cli':
+            if self._cli_thread is None:
+                self._cli_thread = threading.Thread(target=self._cli_worker,
+                                                    daemon=True)
+                self._cli_thread.start()
+            return self._cli_q.put(msg[1])
         if kind == 'move' and self.allow_move:
             self._apply_move(*msg[1:])
         elif kind == 'wall_move' and self.layout:
@@ -991,6 +1170,104 @@ def apply_theme(root, name):
             walk(ch)
     walk(root)
     style_ttk(root)
+
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+class Properties(object):
+    """profile/<app>.ini next to the program: options that are not part of a
+    topology file (theme, toggles, window size, recent files...)."""
+
+    def __init__(self, app):
+        import configparser
+        self.path = os.path.join(APP_DIR, 'profile', '%s.ini' % app)
+        self.cp = configparser.ConfigParser(interpolation=None)
+        try:
+            self.cp.read(self.path)
+        except Exception:
+            pass
+
+    def get(self, sec, key, default=None):
+        try:
+            v = self.cp.get(sec, key)
+        except Exception:
+            return default
+        try:
+            if isinstance(default, bool):
+                return v.strip().lower() in ('1', 'true', 'yes', 'on')
+            if isinstance(default, int):
+                return int(float(v))
+            if isinstance(default, float):
+                return float(v)
+        except ValueError:
+            return default
+        return v
+
+    def set(self, sec, key, value):
+        if not self.cp.has_section(sec):
+            self.cp.add_section(sec)
+        self.cp.set(sec, key, str(value))
+
+    def items(self, sec):
+        try:
+            return self.cp.items(sec)
+        except Exception:
+            return []
+
+    def clear(self, sec):
+        if self.cp.has_section(sec):
+            self.cp.remove_section(sec)
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + '.tmp'
+            with open(tmp, 'w') as fh:
+                self.cp.write(fh)
+            os.replace(tmp, self.path)
+        except Exception:
+            pass
+
+    def bind(self, sec, pairs):
+        """Load tk variables from the file, and save them on every change."""
+        for key, var in pairs:
+            cur = var.get()
+            var.set(self.get(sec, key, cur))
+
+            def store(*a, k=key, v=var):
+                try:
+                    self.set(sec, k, v.get())
+                    self.save()
+                except Exception:
+                    pass
+            var.trace_add('write', store)
+
+
+def camera_state(win):
+    """Camera as plain data, independent of the window size."""
+    w, h = win.size()
+    s = max(win.scale, 1e-9)
+    return {'yaw': round(win.yaw, 5), 'pitch': round(win.pitch, 5),
+            'target': [round(float(v), 3) for v in win.target],
+            'span': round(min(w, h) / s, 4),
+            'pan': [round(win.pan[0] / s, 4), round(win.pan[1] / s, 4)]}
+
+
+def apply_camera(win, cam):
+    try:
+        w, h = win.size()
+        win.scale = min(w, h) / max(float(cam.get('span') or 100), 1e-6)
+        win.yaw = float(cam.get('yaw', win.yaw))
+        win.pitch = float(cam.get('pitch', win.pitch))
+        t = cam.get('target') or win.target
+        win.target = (float(t[0]), float(t[1]), float(t[2]))
+        p = cam.get('pan') or [0, 0]
+        win.pan = [float(p[0]) * win.scale, float(p[1]) * win.scale]
+        win.user_view = True
+        return True
+    except (TypeError, ValueError, IndexError, AttributeError):
+        return False
 
 
 class _FlowBar(object):
@@ -1475,7 +1752,8 @@ class _Window(object):
         from tkinter import ttk
         self.tk, self.ttk = tk, ttk
         self.inq, self.outq, self.cfg = inq, outq, cfg
-        theme = cfg.get('theme') or load_prefs().get('theme') or 'light'
+        self.props = Properties('gui')
+        theme = cfg.get('theme') or self.props.get('ui', 'theme', 'light')
         if theme not in THEMES:
             theme = 'light'
         C.clear()
@@ -1518,12 +1796,34 @@ class _Window(object):
         self.v_pics, self.v_badges = V(value=True), V(value=True)
         self.v_pkts, self.v_rates = V(value=True), V(value=False)
         self.v_locks = V(value=False)
+        self.v_links = V(value=True)
+        self.cli_win, self.live_wins = None, {}
+        self.view_applied = False
         self.v_dark = V(value=theme == 'dark')
         self.wall_mode_label = tk.StringVar(value=WALL_MODES[1][1])
         self.pkt_speed = tk.StringVar(value=PKT_SPEEDS[0][0])
         self.pkt_mult = tk.StringVar(value='x1')
         self.tip_mode = tk.StringVar(value='basic')
+        self.props.bind('ui', [
+            ('ranges', self.v_ranges), ('outline', self.v_outline),
+            ('sphere', self.v_sphere), ('animation', self.v_anim),
+            ('labels', self.v_labels), ('walls', self.v_walls),
+            ('pictures', self.v_pics), ('badges', self.v_badges),
+            ('links', self.v_links), ('packets', self.v_pkts),
+            ('rates', self.v_rates), ('respect_locks', self.v_locks),
+            ('wall_mode', self.wall_mode_label),
+            ('packet_speed', self.pkt_speed), ('packet_mult', self.pkt_mult),
+            ('tooltips', self.tip_mode)])
+        geo = self.props.get('window', 'geometry', '')
+        if geo:
+            root.geometry(geo)
+        root.protocol('WM_DELETE_WINDOW', self.on_close)
         self.build_ribbon()
+        tab = self.props.get('window', 'ribbon_tab', 'View')
+        if tab in self.ribbon.tabs:
+            self.ribbon.select(tab)
+        if self.props.get('window', 'ribbon_collapsed', False):
+            self.ribbon.toggle()
 
         self.status = tk.Label(root, anchor='nw', justify='left', padx=10,
                                pady=4, bg=C['bar'], fg=C['text'], height=6,
@@ -1549,7 +1849,8 @@ class _Window(object):
         cv.bind('<Button-4>', lambda e: self.zoom(e, 1))
         cv.bind('<Button-5>', lambda e: self.zoom(e, -1))
         for key, fn in (('t', self.view_top), ('3', self.view_3d),
-                        ('f', self.fit), ('d', self.open_tree)):
+                        ('f', self.fit), ('d', self.open_tree),
+                        ('c', self.open_cli)):
             root.bind('<Key-%s>' % key, lambda e, f=fn: f())
         for key, var in (('s', self.v_sphere), ('a', self.v_anim),
                          ('w', self.v_walls), ('p', self.v_pics),
@@ -1609,6 +1910,8 @@ class _Window(object):
         self._btn(r1, '3D view', self.view_3d, width=8)
         self._btn(r1, 'Top view', self.view_top, width=8)
         self._btn(r2, 'Fit', self.fit, width=8)
+        self._btn(r2, 'Saved view', self.restore_view, width=8)
+        self._btn(r1, 'Save view', self.save_view, width=8)
         g = rb.group(vt, 'WALLS IN FRONT OF THE CAMERA')
         self.cb_mode = combo(g, self.wall_mode_label,
                              [l for _, l in WALL_MODES], 24)
@@ -1624,6 +1927,7 @@ class _Window(object):
         g = rb.group(st, 'SCENE')
         r1, r2 = rows(g)
         self._check(r1, 'Labels', self.v_labels)
+        self._check(r1, 'Links', self.v_links)
         self._check(r1, 'Walls', self.v_walls)
         self._check(r2, 'Pictures', self.v_pics)
         self._check(r2, 'Animation', self.v_anim)
@@ -1647,7 +1951,11 @@ class _Window(object):
 
         tt = rb.tab('Tools')
         g = rb.group(tt, 'DEVICES  (D)')
-        self._btn(g, 'Devices list', self.open_tree, width=12, accent=True)
+        r1, r2 = rows(g)
+        self._btn(r1, 'Devices list', self.open_tree, width=12, accent=True)
+        self._btn(r2, 'Live config...', self.live_for_selected, width=12)
+        g = rb.group(tt, 'MININET')
+        self._btn(g, 'CLI terminal', self.open_cli, width=12, accent=True)
         g = rb.group(tt, 'TOOLTIPS')
         for val, text in (('basic', 'Basic'), ('advanced', 'Advanced')):
             tk.Radiobutton(g, text=text, value=val, variable=self.tip_mode,
@@ -1672,7 +1980,8 @@ class _Window(object):
     def toggle_theme(self):
         name = 'dark' if self.v_dark.get() else 'light'
         apply_theme(self.root, name)
-        save_prefs(theme=name)
+        self.props.set('ui', 'theme', name)
+        self.props.save()
         if self.tree and self.tree.alive:
             self.tree.refresh()
         self.redraw()
@@ -1704,6 +2013,14 @@ class _Window(object):
                     self.pic_src, self.pic_tk = {}, {}
                     if not self.user_view:
                         self.fitted = False
+                elif isinstance(item, dict) and item.get('type') == 'cli_out':
+                    if self.cli_win:
+                        self.cli_win.append(item.get('text', ''))
+                    continue
+                elif isinstance(item, dict) and item.get('type') == 'cli_done':
+                    if self.cli_win:
+                        self.cli_win.done()
+                    continue
                 elif isinstance(item, dict) and item.get('type') == 'notice':
                     self.notice = (item.get('text', ''), time.time() + 8)
                 else:
@@ -1719,7 +2036,12 @@ class _Window(object):
         dt, self.last_frame = min(now - self.last_frame, 0.5), now
         self.update_packets(dt)
         if changed and not self.fitted and self.placed():
-            self.fit()
+            cam = (self.layout.get('view') or {}).get('last')
+            if not self.view_applied and cam and apply_camera(self, cam):
+                self.view_applied = True        # where the editor left it
+                self.redraw()
+            else:
+                self.fit()
             self.fitted = True
         if changed or self.v_anim.get() or self.drag or self.dots:
             self.redraw()
@@ -2247,7 +2569,8 @@ class _Window(object):
 
         # links
         labels = self.v_labels.get()
-        for link in self.data['links']:
+        show_links = self.v_links.get()
+        for link in (self.data['links'] if show_links else ()):
             a, b, kind = link[0], link[1], link[2]
             if a in pos and b in pos:
                 x1, y1, _ = self.project(*pos[a])
@@ -2271,7 +2594,8 @@ class _Window(object):
                                        text='OpenFlow', fill=C['control'],
                                        font=('TkDefaultFont', 8))
         for name, n in nodes.items():
-            if n['kind'] in CLIENT_KINDS and n['ap'] in pos and name in pos:
+            if n['kind'] in CLIENT_KINDS and n['ap'] in pos and name in pos \
+                    and show_links:
                 d = math.dist(pos[name][:3], pos[n['ap']][:3])
                 ok = d <= max(nodes[n['ap']]['range'], 1e-9)
                 wl, hit = wall_loss(self.walls(), pos[name], pos[n['ap']])
@@ -2973,7 +3297,9 @@ class _Window(object):
             m.add_command(label='Disconnect', command=lambda: self.request(
                 ('disassoc', name), 'disconnecting %s...' % name))
         m.add_separator()
-        m.add_command(label='Open terminal', command=lambda: self.request(
+        m.add_command(label='Live config (not saved)...',
+                      command=lambda: self.open_live(name))
+        m.add_command(label='Open terminal (xterm)', command=lambda: self.request(
             ('term', name), 'opening a terminal for %s...' % name))
 
     def request(self, msg, text):
@@ -3001,6 +3327,7 @@ class _Window(object):
         self._btn(bar, 'Go to', lambda: self.go_to(name))
         self._btn(bar, 'Terminal', lambda: self.request(
             ('term', name), 'opening a terminal for %s...' % name))
+        self._btn(bar, 'Live config', lambda: self.open_live(name))
         self._btn(bar, 'Close', top.destroy, side='right')
         self.details[name] = top
 
@@ -3017,8 +3344,245 @@ class _Window(object):
             top.after(500, refresh)
         refresh()
 
+    # ------------------------------------------------- camera / props ----
+    def save_view(self):
+        self.request(('save_view', camera_state(self)),
+                     'saving the view in the topology file...')
+
+    def restore_view(self):
+        cam = (self.layout.get('view') or {}).get('saved')
+        if cam and apply_camera(self, cam):
+            self.notice = ('saved view restored', time.time() + 4)
+        else:
+            self.notice = ('no saved view in the topology file yet',
+                           time.time() + 4)
+        self.redraw()
+
+    def on_close(self):
+        try:
+            self.props.set('window', 'geometry', self.root.geometry())
+            self.props.set('window', 'ribbon_tab', self.ribbon.current)
+            self.props.set('window', 'ribbon_collapsed', self.ribbon.collapsed)
+            self.props.save()
+        except Exception:
+            pass
+        self.root.destroy()
+
+    # --------------------------------------------- live config / CLI ----
+    def live_for_selected(self):
+        name = self.selected or self.hover
+        if not name:
+            self.notice = ('pick a device in the Devices list (or click its '
+                           'row) first', time.time() + 5)
+            return self.open_tree()
+        self.open_live(name)
+
+    def open_live(self, name):
+        w = self.live_wins.get(name)
+        if w is not None and w.top.winfo_exists():
+            return w.top.lift()
+        self.live_wins[name] = _LiveConfig(self, name)
+
+    def open_cli(self):
+        if self.cli_win is not None and self.cli_win.top.winfo_exists():
+            return self.cli_win.top.lift()
+        self.cli_win = _CliWindow(self)
+
     def run(self):
         self.root.mainloop()
+
+
+class _LiveConfig(object):
+    """Change a running device for testing - nothing is saved."""
+    WIRELESS = (('range', 'Range (m)'), ('txpower', 'Tx power (dBm)'),
+                ('antennaGain', 'Antenna gain (dBi)'),
+                ('antennaHeight', 'Antenna height (m)'),
+                ('channel', 'Channel'), ('mode', 'Mode (a b g n ac ax)'))
+
+    def __init__(self, win, name):
+        tk = win.tk
+        self.win, self.name = win, name
+        n = win.node(name) or {'kind': '?', 'info': {}}
+        info = n.get('info') or {}
+        w0 = (info.get('wintfs') or [{}])[0]
+        top = self.top = tk.Toplevel(win.root)
+        top.title('%s - live config' % name)
+        top.configure(bg=C['bg'])
+        head = tk.Frame(top, bg=C['bar'], padx=10, pady=8)
+        head.pack(fill='x')
+        ic = tk.Canvas(head, width=34, height=30, bg=C['bar'],
+                       highlightthickness=0)
+        draw_icon(ic, n['kind'], 17, 17 + (3 if n['kind'] == 'ap' else 0),
+                  ow=C['outline'])
+        ic.pack(side='left')
+        tk.Label(head, text='%s  -  live configuration' % name, bg=C['bar'],
+                 fg=C['text'], font=('TkDefaultFont', 11, 'bold')).pack(
+            side='left', padx=8)
+        tk.Label(top, text='Changes go to the running network only, for '
+                 'testing. Nothing is saved to any file.', bg=C['bg'],
+                 fg=C['warn'], font=('TkDefaultFont', 8)).pack(anchor='w',
+                                                              padx=10)
+        body = tk.Frame(top, bg=C['bg'], padx=12, pady=6)
+        body.pack(fill='both', expand=True)
+        self.vars, self.orig, r = {}, {}, 0
+
+        def section(t):
+            nonlocal r
+            tk.Label(body, text=t, bg=C['bg'], fg=C['muted'],
+                     font=('TkDefaultFont', 8, 'bold')).grid(
+                row=r, column=0, columnspan=2, sticky='w', pady=(8, 2))
+            r += 1
+
+        def field(key, label, value):
+            nonlocal r
+            tk.Label(body, text=label, bg=C['bg'], fg=C['text']).grid(
+                row=r, column=0, sticky='w', pady=2, padx=(0, 10))
+            v = tk.StringVar(value='' if value is None else _g(value)
+                             if isinstance(value, float) else str(value))
+            tk.Entry(body, textvariable=v, width=18, relief='flat',
+                     bg=C['btn'], fg=C['text'], insertbackground=C['text'],
+                     highlightthickness=1, highlightbackground=C['grid_major']
+                     ).grid(row=r, column=1, sticky='w')
+            self.vars[key], self.orig[key] = v, v.get()
+            r += 1
+        pos = win.positions().get(name)
+        section('POSITION')
+        field('position', 'x, y, z (m)', ', '.join(_g(c) for c in pos)
+              if pos else '')
+        if n['kind'] in ('ap', 'sta', 'car'):
+            section('RADIO  (%s)' % w0.get('name', 'wlan'))
+            for key, label in self.WIRELESS:
+                field(key, label, n.get('range') if key == 'range'
+                      else w0.get(key))
+        if n['kind'] in ('sta', 'car', 'host'):
+            section('ADDRESSING')
+            field('ip', 'IP / mask', w0.get('ip') or info.get('ip'))
+        ifnames = [e['name'] for e in (info.get('intfs') or [])] + \
+            [e['name'] for e in (info.get('wintfs') or [])]
+        self.v_if = tk.StringVar(value=ifnames[0] if ifnames else '')
+        if ifnames:
+            section('TRAFFIC CONTROL  (tc / netem)')
+            tk.Label(body, text='Interface', bg=C['bg'], fg=C['text']).grid(
+                row=r, column=0, sticky='w')
+            win.ttk.Combobox(body, textvariable=self.v_if, values=ifnames,
+                             state='readonly', width=16).grid(
+                row=r, column=1, sticky='w')
+            r += 1
+            for key, label in (('bw', 'Bandwidth (Mbit/s)'),
+                               ('delay', 'Delay (e.g. 20ms)'),
+                               ('jitter', 'Jitter (e.g. 5ms)'),
+                               ('loss', 'Loss (%)')):
+                field('tc_' + key, label, '')
+        bar = tk.Frame(top, bg=C['bar'], padx=6, pady=6)
+        bar.pack(fill='x', side='bottom')
+        win._btn(bar, 'Apply', self.apply, accent=True)
+        win._btn(bar, 'Close', top.destroy, side='right')
+
+    def apply(self):
+        ch, tc = {}, {}
+        for k, v in self.vars.items():
+            val = v.get().strip()
+            if val == self.orig[k] or val == '':
+                continue
+            if k == 'position':
+                try:
+                    ch[k] = [float(c) for c in val.replace(',', ' ').split()]
+                    if len(ch[k]) != 3:
+                        raise ValueError
+                    if self.win.in_wall(ch[k]):
+                        self.win.notice = ('that position is inside a wall',
+                                           time.time() + 4)
+                        ch.pop(k)
+                except ValueError:
+                    ch.pop(k, None)
+            elif k.startswith('tc_'):
+                tc[k[3:]] = val
+            else:
+                ch[k] = val
+        if ch:
+            self.win.request(('live', self.name, ch), 'applying %s to %s...'
+                             % (', '.join(ch), self.name))
+            if 'position' in ch:
+                self.win.local[self.name] = (tuple(ch['position']),
+                                             time.time() + 2.0)
+        if tc and self.v_if.get():
+            self.win.request(('live_tc', self.name, self.v_if.get(), tc),
+                             'traffic control on %s...' % self.v_if.get())
+        for k, v in self.vars.items():
+            self.orig[k] = v.get().strip()
+
+
+class _CliWindow(object):
+    """A Mininet CLI inside the GUI: commands run in the Mininet process,
+    their output is shown here."""
+
+    def __init__(self, win):
+        tk = win.tk
+        self.win, self.hist, self.hpos, self.busy = win, [], 0, False
+        top = self.top = tk.Toplevel(win.root)
+        top.title('Mininet-WiFi CLI')
+        top.configure(bg='#16171a')
+        top.geometry('760x460')
+        self.txt = tk.Text(top, bg='#16171a', fg='#d8d8d4', relief='flat',
+                           insertbackground='#d8d8d4', highlightthickness=0,
+                           font=('TkFixedFont', 10), padx=8, pady=6,
+                           wrap='char')
+        self.txt.tag_configure('cmd', foreground='#6fa0ff')
+        self.txt.tag_configure('info', foreground='#8a8c93')
+        bar = tk.Frame(top, bg='#22242a', padx=6, pady=6)
+        bar.pack(side='bottom', fill='x')
+        self.prompt = tk.Label(bar, text='mininet-wifi>', bg='#22242a',
+                               fg='#6fa0ff', font=('TkFixedFont', 10, 'bold'))
+        self.prompt.pack(side='left')
+        self.v = tk.StringVar()
+        self.ent = tk.Entry(bar, textvariable=self.v, bg='#16171a',
+                            fg='#d8d8d4', insertbackground='#d8d8d4',
+                            relief='flat', font=('TkFixedFont', 10),
+                            highlightthickness=0)
+        self.ent.pack(side='left', fill='x', expand=True, padx=6)
+        tk.Button(bar, text='Clear', relief='flat', bg='#2c2f36',
+                  fg='#d8d8d4', command=lambda: self.txt.delete('1.0', 'end')
+                  ).pack(side='right')
+        sb = tk.Scrollbar(top, command=self.txt.yview)
+        self.txt.configure(yscrollcommand=sb.set)
+        sb.pack(side='right', fill='y')
+        self.txt.pack(fill='both', expand=True)
+        self.ent.bind('<Return>', self.send)
+        self.ent.bind('<KP_Enter>', self.send)
+        self.ent.bind('<Up>', lambda e: self.recall(-1))
+        self.ent.bind('<Down>', lambda e: self.recall(1))
+        self.append('Mininet-WiFi CLI inside the viewer. Commands run in your '
+                    'Mininet process\n(same as the CLI: nodes, net, pingall, '
+                    'sta1 ping -c 3 sta2, iperf, py ...).\nUse it while the '
+                    'real CLI is waiting at its prompt.\n\n', 'info')
+        self.ent.focus_set()
+
+    def append(self, text, tag=None):
+        self.txt.insert('end', text, tag)
+        self.txt.see('end')
+
+    def send(self, e=None):
+        line = self.v.get()
+        if not line.strip() or self.busy:
+            return
+        self.hist.append(line)
+        self.hpos = len(self.hist)
+        self.v.set('')
+        self.append('mininet-wifi> %s\n' % line, 'cmd')
+        self.busy = True
+        self.prompt.config(text='running...  ')
+        self.win.send(('cli', line))
+
+    def done(self):
+        self.busy = False
+        self.prompt.config(text='mininet-wifi>')
+
+    def recall(self, d):
+        if not self.hist:
+            return
+        self.hpos = max(0, min(len(self.hist), self.hpos + d))
+        self.v.set(self.hist[self.hpos] if self.hpos < len(self.hist) else '')
+        self.ent.icursor('end')
 
 
 def _window_main(inq, outq, cfg):
