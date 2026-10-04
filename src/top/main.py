@@ -9,22 +9,28 @@ import os
 TOPOLOGY_FILE="data/topology.json"
 
 def default_topology_test(net : Mininet_wifi):
-    c0 = net.addController("Routeur0", position="0,0,30")
-    ap1 = net.addAccessPoint("AccessPoint1", ssid="Wifi_Name", mode="g", channel="1", position="10,10,0", range=60, failMode="secure")
-    ap2 = net.addAccessPoint("AccessPoint2", ssid="Wifi_Name2", mode="g", channel="6", position="25,10,0", range=15, failMode="secure")
-    ap3 = net.addAccessPoint("AccessPoint3", ssid="Wifi_Name3_5G", mode="a", channel="36", position="30,20,0", range=15, failMode="secure")
-    sta1 = net.addStation("Device1", ip="10.0.0.1/8", position="5,5,0", range=10)
-    sta2 = net.addStation("Device2", ip="10.0.0.2/8", position="20,20,0", range=10)
+    ap1 = net.addAccessPoint('ap1', ssid='lab', mode='g', channel='1',
+                             position='30,50,0', range=40)
+    ap2 = net.addAccessPoint('ap2', ssid='lab', mode='g', channel='6',
+                             position='90,50,0', range=40)
+    sta1 = net.addStation('sta1', ip='10.0.0.1/8', position='20,40,0')
+    sta2 = net.addStation('sta2', ip='10.0.0.2/8', position='40,60,0')
+    sta3 = net.addStation('sta3', ip='10.0.0.3/8', position='95,55,0')
+    h1 = net.addHost('h1', ip='10.0.0.10/8', position='120,50,0')
+    c0 = net.addController('c0')
 
-    net.configureNodes()
+    net.setPropagationModel(model='logDistance', exp=3)
+    configure = getattr(net, 'configureNodes', None) or net.configureWifiNodes
+    configure()
 
-    net.addLink(ap3, sta2)
+    net.addLink(ap1, ap2)      # wired backbone between the APs (dots!)
+    net.addLink(ap2, h1)       # a wired host behind ap2
 
     net.build()
     c0.start()
     ap1.start([c0])
     ap2.start([c0])
-    ap3.start([c0])
+
 
 def json_topology(net : Mininet_wifi, json_file):
     acpts, stas=[], []
@@ -39,7 +45,7 @@ def json_topology(net : Mininet_wifi, json_file):
             stas.append(net.addStation(sta["name"], range=params["range"], ip=params["ip"], position=params["position"]))
         for ap in aps:
             params = ap["params"]
-            ap_list = [net.addAccessPoint(ap["name"], ssid=params["ssid"], mode=params["mode"], channel=params["channel"], position=params["position"], range=params["range"], failMode="secured"if "failMode" not in params else params["failMode"]), data["start"][ap["name"]]]
+            ap_list = [net.addAccessPoint(ap["name"], ssid=params["ssid"], mode=params["mode"], channel=params["channel"], position=params["position"], range=params["range"], failMode=params.get("failMode") or "secure"), data["start"][ap["name"]]]
             acpts.append(ap_list)
         for ctrl in ctrls:
             params = ctrl["params"]

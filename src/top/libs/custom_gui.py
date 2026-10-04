@@ -1011,6 +1011,7 @@ class WifiGUI(object):
 
         def send(text):
             if text:
+                text = text.replace('\r\n', '\n').replace('\r', '')
                 out.put({'type': 'cli_out', 'text': text})
 
         class Handler(logging.Handler):
@@ -1032,6 +1033,14 @@ class WifiGUI(object):
             out.put({'type': 'cli_done'})
             out.put(None)
             self.exit_cli('exit typed in the viewer CLI')
+            return
+        if cmd == 'sh' or cmd.startswith('sh '):
+            # Mininet's "sh" writes straight to the terminal, where this
+            # window can't see it: run it here and stream the output
+            try:
+                self._cli_shell(cmd[2:].strip(), send)
+            finally:
+                out.put({'type': 'cli_done'})
             return
         lg = None
         h = Handler()
@@ -1057,6 +1066,31 @@ class WifiGUI(object):
             if lg is not None:
                 lg.removeHandler(h)
             out.put({'type': 'cli_done'})
+
+    @staticmethod
+    def _cli_shell(command, send, timeout=120):
+        """'sh <command>' in the main namespace, output shown in the GUI."""
+        import subprocess
+        if not command:
+            return send('usage: sh <shell command>\n')
+        try:
+            p = subprocess.Popen(command, shell=True, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT)
+        except OSError as e:
+            return send('error: %s\n' % e)
+        timer = threading.Timer(timeout, p.kill)
+        timer.start()
+        try:
+            for raw in iter(p.stdout.readline, b''):
+                send(raw.decode('utf-8', 'replace'))
+            code = p.wait()
+        finally:
+            timer.cancel()
+        if code < 0:
+            send('(stopped after %d s)\n' % timeout)
+        elif code:
+            send('(exit code %d)\n' % code)
 
     def _handle(self, msg):
         kind = msg[0]
@@ -3693,6 +3727,7 @@ class _CliWindow(object):
         self.ent.focus_set()
 
     def append(self, text, tag=None):
+        text = text.replace('\r\n', '\n').replace('\r', '')
         self.txt.insert('end', text, tag)
         self.txt.see('end')
 
