@@ -7,7 +7,7 @@ def topology():
     net = Mininet_wifi()
     c0 = net.addController("Routeur0", position="50,50,30")
     ap1 = net.addAccessPoint("AccessPoint1", ssid="Wifi_Name", mode="g", channel="1", position="100,100,0", range=300, failMode="secure")
-    ap2 = net.addAccessPoint("AccessPoint2", ssid="Wifi_Name", mode="a", channel="6", position="200,100,0", range=150, failMode="secure")
+    ap2 = net.addAccessPoint("AccessPoint2", ssid="Wifi_Name2", mode="g", channel="6", position="200,100,0", range=150, failMode="secure")
     sta1 = net.addStation("sta1", ip="10.0.0.1/8", position="200,200,0", range=100)
 
     net.configureNodes()
