@@ -5,15 +5,16 @@ from libs.custom_gui import WifiGUI
 
 def topology():
     net = Mininet_wifi()
-
-    ap1 = net.addAccessPoint("ap-1", ssid="Wifi_Name", mode="g", channel="1", position="100,100,0", range=300, failMode="standalone")
+    c0 = net.addController("c0", position="50,50,30")
+    ap1 = net.addAccessPoint("ap-1", ssid="Wifi_Name", mode="g", channel="1", position="100,100,0", range=300, failMode="secure")
     sta1 = net.addStation("vcp_1", ip="10.0.0.1/8", position="200,200,0", range=100)
 
     net.configureNodes()
     net.addLink(sta1, ap1)
 
     net.build()
-    ap1.start([])
+    c0.start()
+    ap1.start([c0])
 
     gui = WifiGUI(net)
     gui.start()
