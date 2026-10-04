@@ -6,7 +6,7 @@ from libs.custom_gui import WifiGUI
 def topology():
     net = Mininet_wifi()
     c0 = net.addController("c0", position="50,50,30")
-    ap1 = net.addAccessPoint("AccessPoint", ssid="Wifi_Name", mode="g", channel="1", position="100,100,0", range=300, failMode="secure")
+    ap1 = net.addAccessPoint("accesspoint", ssid="Wifi_Name", mode="g", channel="1", position="100,100,0", range=300, failMode="secure")
     sta1 = net.addStation("sta1", ip="10.0.0.1/8", position="200,200,0", range=100)
 
     net.configureNodes()
