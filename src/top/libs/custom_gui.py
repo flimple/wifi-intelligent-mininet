@@ -1,40 +1,58 @@
 #!/usr/bin/env python3
 """
-wifi_gui.py - a small live viewer for Mininet-WiFi (no matplotlib needed)
+wifi_gui.py  -  interactive 3D viewer for Mininet-WiFi  (version 2)
 
-Why use it instead of net.plotGraph()?
-  - It uses Tkinter, which comes with Python, instead of matplotlib, so it
-    avoids the "x must be a sequence" bug that hides nodes in plotGraph.
-  - It runs in its own process, so the window keeps refreshing while
-    the Mininet CLI is waiting for your commands.
-  - Circles stay round (same scale on x and y), and it auto-zooms to your nodes.
-  - Nodes without a position are listed at the bottom instead of
-    silently disappearing.
+No matplotlib. Pure Tkinter (comes with Python: sudo apt install python3-tk).
+
+What you get
+  - 3D view you can rotate, pan and zoom, plus a flat top view
+  - Drag any node with the mouse to move it, and Mininet-WiFi moves it too
+    (hold Shift while dragging to change its height)
+  - Range circle for every wireless node: access points AND stations
+  - Wireless connections drawn as animated radio waves; APs send out
+    expanding "signal" ripples
+  - Controller shown with a dashed control link to the APs it manages,
+    wired links shown as solid cables
+  - Hover a node to see its details; the bar at the bottom lists who is
+    connected to whom and warns about nodes without a position
+
+Mouse & keys
+  drag empty space ......... rotate          right-drag ....... pan
+  mouse wheel .............. zoom            double-click ..... fit to screen
+  drag a node .............. move it         Shift + drag ..... change height
+  keys: T = top view, 3 = 3D view, F = fit, A = animation on/off
 
 How it works with Mininet-WiFi
-  1. You build your network as usual (addStation, addAccessPoint, ...).
-  2. After net.build(), you create WifiGUI(net) and call .start().
-  3. WifiGUI starts a separate window process. A background thread in your
-     script reads every node's position, range and association twice per
-     second and sends it to the window, which redraws it.
-  4. You use CLI(net) like normal. If you move a node in the CLI, e.g.
-         mininet-wifi> py sta1.setPosition('250,100,0')
-     the window updates by itself.
-  5. Call gui.stop() before net.stop().
+  Your script                                Window process
+  -----------                                --------------
+  net.build()                                (Tkinter only)
+  gui = WifiGUI(net); gui.start()  ------>  opens the window
+  background thread, every 0.3 s:
+      reads positions, ranges,
+      associations, links      ---- data --->  redraws the scene
+  applies moves  <--- "move sta1 to x,y,z" ---  you drag a node
+      (node.setPosition(...))
+  CLI(net)   <- you keep typing commands as usual
+  gui.stop(); net.stop()
+
+  The window lives in its own process, so it never freezes while the CLI
+  waits for input, and a crash in the GUI can't take your network down.
 
 Usage
     from wifi_gui import WifiGUI
     ...
     net.build()
-    ap1.start([])
-    gui = WifiGUI(net)          # or WifiGUI(net, max_x=300, max_y=300)
+    ap1.start([])                 # or ap1.start([c0]) with a controller
+    gui = WifiGUI(net)
     gui.start()
     CLI(net)
     gui.stop()
     net.stop()
 
-Do NOT also call net.plotGraph(): use one viewer or the other.
-Run with:  sudo -E python3 your_script.py   (-E lets root open the window)
+  Run with:  sudo -E python3 your_script.py     (-E lets root open a window)
+  Don't also call net.plotGraph(): use one viewer or the other.
+  Controllers have no position in Mininet. The viewer places them
+  automatically, or you can give one: net.addController('c0', position='150,300,0')
 """
 
 import math
@@ -42,32 +60,42 @@ import multiprocessing as mp
 import queue
 import signal
 import threading
+import time
 
 
-# --------------------------------------------------------------------------
-# Part 1: reading the network (runs inside your Mininet script)
-# --------------------------------------------------------------------------
+# ==========================================================================
+# Part 1 - reading the network (runs inside your Mininet script)
+# ==========================================================================
 
-def _xy(node):
-    """Return (x, y) of a node, or None if it has no position."""
+WIRELESS_LINK_WORDS = ('wifi', 'wireless', 'wmediumd', 'assoc', 'adhoc',
+                       'mesh', 'its', 'direct', 'mode')
+
+
+def _xyz(node, overrides):
+    """(x, y, z) of a node, or None if it has no position."""
+    if node.name in overrides:
+        return overrides[node.name]
+    pos = None
     try:
-        x, y, _ = node.getxyz()
-        return float(x), float(y)
+        pos = node.getxyz()
     except Exception:
-        pass
-    pos = getattr(node, 'position', None) or node.params.get('position')
+        pos = getattr(node, 'position', None) or \
+              getattr(node, 'params', {}).get('position')
     if pos is None:
         return None
     if isinstance(pos, str):
         pos = pos.split(',')
     try:
-        return float(pos[0]), float(pos[1])
-    except (ValueError, IndexError, TypeError):
+        vals = [float(v) for v in pos]
+    except (TypeError, ValueError):
         return None
+    while len(vals) < 3:
+        vals.append(0.0)
+    return tuple(vals[:3])
 
 
 def _range(node):
-    """Biggest wireless range of the node (0 if none)."""
+    """Biggest wireless range of a node (0 for wired-only nodes)."""
     ranges = []
     for intf in getattr(node, 'wintfs', {}).values():
         try:
@@ -78,10 +106,10 @@ def _range(node):
 
 
 def _associated_ap(node):
-    """Name of the AP this station is connected to, or None."""
+    """Name of the AP a station is connected to, or None."""
     for intf in getattr(node, 'wintfs', {}).values():
         ap_intf = getattr(intf, 'associatedTo', None)
-        # associatedTo can also be a string like 'adhoc' or 'mesh': ignore those
+        # it can also be a word like 'adhoc' or 'mesh': ignore those
         if ap_intf is not None and not isinstance(ap_intf, str):
             ap_node = getattr(ap_intf, 'node', None)
             if ap_node is not None:
@@ -89,329 +117,733 @@ def _associated_ap(node):
     return None
 
 
-def snapshot(net):
-    """Collect everything the window needs to draw, as plain data."""
+def snapshot(net, overrides=None):
+    """Everything the window needs, as plain data (dicts/lists/tuples)."""
+    overrides = overrides or {}
     groups = [('ap', 'aps'), ('sta', 'stations'), ('sta', 'cars'),
-              ('host', 'hosts')]
-    nodes, seen = [], set()
+              ('switch', 'switches'), ('host', 'hosts'),
+              ('ctrl', 'controllers')]
+    nodes, by_name = [], {}
     for kind, attr in groups:
-        for node in getattr(net, attr, []) or []:
-            if node.name in seen:
+        for node in getattr(net, attr, None) or []:
+            if node.name in by_name:
                 continue
-            seen.add(node.name)
-            nodes.append({
-                'name': node.name,
-                'kind': kind,
-                'xy': _xy(node),
-                'range': _range(node),
-                'ap': _associated_ap(node) if kind == 'sta' else None,
-            })
-    return nodes
+            item = {'name': node.name, 'kind': kind,
+                    'xyz': _xyz(node, overrides),
+                    'range': _range(node),
+                    'ap': _associated_ap(node) if kind == 'sta' else None}
+            by_name[node.name] = node
+            nodes.append(item)
+
+    links = []
+    # wired links (cables between APs, switches, hosts)
+    for link in getattr(net, 'links', None) or []:
+        try:
+            n1, n2 = link.intf1.node, link.intf2.node
+            names = (str(link.intf1.name) + str(link.intf2.name)).lower()
+        except AttributeError:
+            continue
+        cls = type(link).__name__.lower()
+        if any(w in cls for w in WIRELESS_LINK_WORDS) or 'wlan' in names:
+            continue
+        if n1.name in by_name and n2.name in by_name:
+            links.append((n1.name, n2.name, 'wired'))
+
+    # control links: controller -> every AP/switch that isn't standalone
+    ctrls = [n['name'] for n in nodes if n['kind'] == 'ctrl']
+    for n in nodes:
+        if n['kind'] in ('ap', 'switch') and ctrls:
+            node = by_name[n['name']]
+            fail = str(getattr(node, 'failMode', '') or
+                       node.params.get('failMode', '')).lower()
+            if fail != 'standalone':
+                for c in ctrls:
+                    links.append((c, n['name'], 'control'))
+    return {'nodes': nodes, 'links': links}
 
 
 class WifiGUI(object):
-    """Live window that shows APs, stations, their ranges and connections."""
+    """Interactive window showing the Mininet-WiFi network."""
 
-    def __init__(self, net, min_x=None, min_y=None, max_x=None, max_y=None,
-                 refresh=0.5, size=640, title='Mininet-WiFi View'):
+    def __init__(self, net, refresh=0.3, size=(900, 700),
+                 title='Mininet-WiFi 3D View', allow_move=True):
         self.net = net
         self.refresh = refresh
-        self.cfg = {'bounds': (min_x, min_y, max_x, max_y),
-                    'size': size, 'title': title}
-        self._queue = None
+        self.allow_move = allow_move
+        self.cfg = {'size': size, 'title': title, 'allow_move': allow_move}
+        self.overrides = {}          # positions for nodes without setPosition
+        self._to_win = None
+        self._from_win = None
         self._proc = None
         self._stop = threading.Event()
         self._thread = None
 
     def start(self):
-        ctx = mp.get_context('fork')            # Linux only, like Mininet
-        self._queue = ctx.Queue()
-        self._queue.put(snapshot(self.net))     # first picture right away
+        ctx = mp.get_context('fork')           # Linux only, like Mininet
+        self._to_win, self._from_win = ctx.Queue(), ctx.Queue()
+        self._to_win.put(snapshot(self.net, self.overrides))
         self._proc = ctx.Process(target=_window_main,
-                                 args=(self._queue, self.cfg), daemon=True)
+                                 args=(self._to_win, self._from_win, self.cfg),
+                                 daemon=True)
         self._proc.start()
-        self._thread = threading.Thread(target=self._sender, daemon=True)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return self
 
-    def _sender(self):
-        last = None
-        while not self._stop.wait(self.refresh):
-            if not self._proc.is_alive():       # window was closed
-                return
+    def _apply_move(self, name, x, y, z):
+        node = getattr(self.net, 'nameToNode', {}).get(name)
+        if node is None:
+            return
+        pos = '%.2f,%.2f,%.2f' % (x, y, z)
+        if getattr(node, 'wintfs', None) and hasattr(node, 'setPosition'):
             try:
-                data = snapshot(self.net)
+                node.setPosition(pos)          # Mininet-WiFi moves the node
+                self.overrides.pop(name, None)
+                return
+            except Exception as e:
+                print('\n*** wifi_gui: could not move %s (%s)' % (name, e))
+        self.overrides[name] = (x, y, z)       # controllers, wired hosts...
+
+    def _loop(self):
+        last = None
+        while not self._stop.is_set():
+            # 1) moves requested by the window
+            try:
+                while True:
+                    msg = self._from_win.get_nowait()
+                    if msg[0] == 'move' and self.allow_move:
+                        self._apply_move(*msg[1:])
+            except queue.Empty:
+                pass
             except Exception:
-                continue
-            if data != last:                    # only send changes
-                self._queue.put(data)
-                last = data
+                pass
+            # 2) send fresh data if something changed
+            if not self._proc.is_alive():
+                return                         # window was closed
+            try:
+                data = snapshot(self.net, self.overrides)
+                if data != last:
+                    self._to_win.put(data)
+                    last = data
+            except Exception:
+                pass
+            self._stop.wait(self.refresh)
 
     def stop(self):
         self._stop.set()
         if self._proc is not None and self._proc.is_alive():
-            self._queue.put(None)               # ask the window to close
+            self._to_win.put(None)
             self._proc.join(2)
             if self._proc.is_alive():
                 self._proc.terminate()
 
 
-# --------------------------------------------------------------------------
-# Part 2: the window (runs in its own process, only uses Tkinter)
-# --------------------------------------------------------------------------
+# ==========================================================================
+# Part 2 - the window (separate process, Tkinter only)
+# ==========================================================================
 
-COLORS = {
-    'bg': '#f7f7f5', 'grid': '#e3e3df', 'axis': '#8a8a85', 'text': '#2b2b2b',
-    'ap': '#2f6fd6', 'ap_range': '#2f6fd6', 'ap_fill': '#e3ecfb',
-    'sta': '#e07a1f',
-    'host': '#6b6b6b', 'link': '#2a9d55', 'warn': '#b3261e',
+C = {
+    'bg': '#f6f6f3', 'grid': '#dedfd9', 'grid_major': '#c9cbc3',
+    'axis': '#8a8b85', 'text': '#26272a', 'muted': '#6d6e69',
+    'ap': '#2563c9', 'ap_fill': '#e1eafa', 'ap_ring': '#7fa3e3',
+    'sta': '#e0761a', 'sta_ring': '#eaa66a',
+    'ctrl': '#7b3fc4', 'switch': '#4a4d55', 'host': '#6b6e74',
+    'rf': '#16a05a', 'rf_glow': '#cdebd9', 'rf_bad': '#cc3a2f',
+    'wired': '#4a4d55', 'control': '#7b3fc4',
+    'shadow': '#d4d5cf', 'select': '#111111', 'warn': '#b3261e',
+    'tip_bg': '#26272a', 'tip_fg': '#ffffff', 'bar': '#ebebe7',
 }
+
+KIND_LABEL = {'ap': 'access point', 'sta': 'station', 'ctrl': 'controller',
+              'switch': 'switch', 'host': 'host'}
+
+
+def _mix(c1, c2, t):
+    """Blend two #rrggbb colours (t=0 -> c1, t=1 -> c2)."""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return '#%02x%02x%02x' % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
 def _nice_step(span, target=8):
-    """Pick a grid step like 1, 2, 5, 10, 20, 50 ... giving ~target lines."""
     raw = max(span, 1e-9) / target
-    power = 10 ** math.floor(math.log10(raw))
+    p = 10 ** math.floor(math.log10(raw))
     for m in (1, 2, 5, 10):
-        if raw <= m * power:
-            return m * power
-    return 10 * power
+        if raw <= m * p:
+            return m * p
+    return 10 * p
 
 
 class _Window(object):
-    PAD = 48          # space around the plot for axis labels
+    HIT = 16           # px radius for clicking a node
 
-    def __init__(self, q, cfg):
+    def __init__(self, inq, outq, cfg):
         import tkinter as tk
         self.tk = tk
-        self.q = q
-        self.cfg = cfg
-        self.nodes = []
+        self.inq, self.outq, self.cfg = inq, outq, cfg
+        self.data = {'nodes': [], 'links': []}
+        self.local = {}            # name -> (xyz, until_time) while dragging
+        self.auto_pos = {}         # auto-placed controllers
+        self.hits = []
+        self.hover = None
+        self.mouse = (0, 0)
+        self.drag = None
+        self.t0 = time.time()
+        self.fitted = False
+        self.user_view = False     # becomes True once you rotate/pan/zoom
 
-        self.root = tk.Tk()
-        self.root.title(cfg['title'])
-        size = cfg['size']
-        self.canvas = tk.Canvas(self.root, width=size, height=size,
-                                bg=COLORS['bg'], highlightthickness=0)
+        # camera
+        self.yaw, self.pitch = math.radians(-30), math.radians(55)
+        self.scale, self.pan = 1.0, [0.0, 0.0]
+        self.target = (0.0, 0.0, 0.0)
+
+        root = self.root = tk.Tk()
+        root.title(cfg['title'])
+        w, h = cfg['size']
+
+        bar = tk.Frame(root, bg=C['bar'], padx=6, pady=4)
+        bar.pack(fill='x')
+        for text, cmd in (('3D view', self.view_3d), ('Top view', self.view_top),
+                          ('Fit', self.fit)):
+            tk.Button(bar, text=text, command=cmd, relief='flat', bg='white',
+                      padx=10).pack(side='left', padx=3)
+        self.v_ranges = tk.BooleanVar(value=True)
+        self.v_anim = tk.BooleanVar(value=True)
+        self.v_labels = tk.BooleanVar(value=True)
+        for text, var in (('Ranges', self.v_ranges), ('Animation', self.v_anim),
+                          ('Labels', self.v_labels)):
+            tk.Checkbutton(bar, text=text, variable=var, bg=C['bar'],
+                           command=self.redraw).pack(side='left', padx=6)
+
+        self.canvas = tk.Canvas(root, width=w, height=h, bg=C['bg'],
+                                highlightthickness=0)
         self.canvas.pack(fill='both', expand=True)
-        self.status = tk.Label(self.root, anchor='w', justify='left',
-                               font=('TkDefaultFont', 10), padx=8, pady=6,
-                               bg='#ececea', fg=COLORS['text'])
+        self.status = tk.Label(root, anchor='w', justify='left', padx=10,
+                               pady=6, bg=C['bar'], fg=C['text'],
+                               font=('TkDefaultFont', 10))
         self.status.pack(fill='x')
-        self.tip = None
 
-        self.canvas.bind('<Configure>', lambda e: self.redraw())
-        self.root.after(100, self.poll)
+        cv = self.canvas
+        cv.bind('<Configure>', self.on_resize)
+        cv.bind('<ButtonPress-1>', self.on_press)
+        cv.bind('<B1-Motion>', self.on_drag)
+        cv.bind('<ButtonRelease-1>', self.on_release)
+        cv.bind('<ButtonPress-3>', self.on_pan_start)
+        cv.bind('<B3-Motion>', self.on_pan)
+        cv.bind('<ButtonPress-2>', self.on_pan_start)
+        cv.bind('<B2-Motion>', self.on_pan)
+        cv.bind('<Motion>', self.on_motion)
+        cv.bind('<Double-Button-1>', lambda e: self.fit())
+        cv.bind('<MouseWheel>', lambda e: self.zoom(e, 1 if e.delta > 0 else -1))
+        cv.bind('<Button-4>', lambda e: self.zoom(e, 1))
+        cv.bind('<Button-5>', lambda e: self.zoom(e, -1))
+        root.bind('<Key-t>', lambda e: self.view_top())
+        root.bind('<Key-3>', lambda e: self.view_3d())
+        root.bind('<Key-f>', lambda e: self.fit())
+        root.bind('<Key-a>', lambda e: (self.v_anim.set(not self.v_anim.get()),
+                                        self.redraw()))
+        root.after(50, self.tick)
 
-    # ---- data -----------------------------------------------------------
-    def poll(self):
-        latest, got = None, False
+    def on_resize(self, e):
+        if self.user_view or not self.placed():
+            self.redraw()
+        else:
+            self.fit()                 # keep the network centred until you move the view
+
+    # ------------------------------------------------------------ data ----
+    def tick(self):
+        changed = False
         try:
             while True:
-                item = self.q.get_nowait()
-                if item is None:                 # stop() was called
+                item = self.inq.get_nowait()
+                if item is None:
                     self.root.destroy()
                     return
-                latest, got = item, True
+                self.data, changed = item, True
         except queue.Empty:
             pass
-        if got:
-            self.nodes = latest
+        except (EOFError, OSError):
+            pass
+        if changed and not self.fitted and self.placed():
+            self.fit()
+            self.fitted = True
+        if changed or self.v_anim.get() or self.drag:
             self.redraw()
-        self.root.after(200, self.poll)
+        self.root.after(40, self.tick)          # ~25 frames per second
 
-    # ---- coordinates ----------------------------------------------------
-    def world_bounds(self):
-        min_x, min_y, max_x, max_y = self.cfg['bounds']
-        placed = [n for n in self.nodes if n['xy']]
+    def positions(self):
+        """name -> xyz for every drawable node (incl. auto/local ones)."""
+        now = time.time()
+        pos = {}
+        for n in self.data['nodes']:
+            loc = self.local.get(n['name'])
+            if loc and (loc[1] > now or (self.drag and self.drag.get('name') == n['name'])):
+                pos[n['name']] = loc[0]
+            elif n['xyz'] is not None:
+                pos[n['name']] = n['xyz']
+        # place controllers that have no position: behind the network
+        placed = [p for name, p in pos.items()]
         if placed:
-            xs_lo = [n['xy'][0] - n['range'] for n in placed if n['kind'] == 'ap'] + \
-                    [n['xy'][0] for n in placed]
-            xs_hi = [n['xy'][0] + n['range'] for n in placed if n['kind'] == 'ap'] + \
-                    [n['xy'][0] for n in placed]
-            ys_lo = [n['xy'][1] - n['range'] for n in placed if n['kind'] == 'ap'] + \
-                    [n['xy'][1] for n in placed]
-            ys_hi = [n['xy'][1] + n['range'] for n in placed if n['kind'] == 'ap'] + \
-                    [n['xy'][1] for n in placed]
-            auto = (min(xs_lo), min(ys_lo), max(xs_hi), max(ys_hi))
+            xs = [p[0] for p in placed]; ys = [p[1] for p in placed]
+            span = max(max(xs) - min(xs), max(ys) - min(ys), 50)
+            cx, top = (min(xs) + max(xs)) / 2, max(ys)
         else:
-            auto = (0, 0, 100, 100)
-        lo_x = auto[0] if min_x is None else min_x
-        lo_y = auto[1] if min_y is None else min_y
-        hi_x = auto[2] if max_x is None else max_x
-        hi_y = auto[3] if max_y is None else max_y
-        # small margin when auto-fitting
-        if max_x is None or min_x is None:
-            m = (hi_x - lo_x) * 0.05 or 10
-            lo_x, hi_x = (lo_x - m if min_x is None else lo_x,
-                          hi_x + m if max_x is None else hi_x)
-        if max_y is None or min_y is None:
-            m = (hi_y - lo_y) * 0.05 or 10
-            lo_y, hi_y = (lo_y - m if min_y is None else lo_y,
-                          hi_y + m if max_y is None else hi_y)
-        return lo_x, lo_y, max(hi_x, lo_x + 1), max(hi_y, lo_y + 1)
+            span, cx, top = 100, 50, 50
+        ctrls = [n for n in self.data['nodes']
+                 if n['kind'] == 'ctrl' and n['name'] not in pos]
+        for i, n in enumerate(ctrls):
+            off = (i - (len(ctrls) - 1) / 2) * span * 0.35
+            pos[n['name']] = (cx + off, top + span * 0.45, 0.0)
+            self.auto_pos[n['name']] = True
+        return pos
 
-    def setup_transform(self):
-        w = max(self.canvas.winfo_width(), 100)
-        h = max(self.canvas.winfo_height(), 100)
-        lo_x, lo_y, hi_x, hi_y = self.world_bounds()
-        # same scale on both axes so circles stay round
-        scale = min((w - 2 * self.PAD) / (hi_x - lo_x),
-                    (h - 2 * self.PAD) / (hi_y - lo_y))
-        used_w, used_h = (hi_x - lo_x) * scale, (hi_y - lo_y) * scale
-        self.ox = (w - used_w) / 2
-        self.oy = (h + used_h) / 2
-        self.scale = scale
-        self.bounds = lo_x, lo_y, hi_x, hi_y
+    def placed(self):
+        return any(n['xyz'] is not None for n in self.data['nodes'])
 
-    def to_px(self, x, y):
-        lo_x, lo_y, _, _ = self.bounds
-        return (self.ox + (x - lo_x) * self.scale,
-                self.oy - (y - lo_y) * self.scale)       # y grows upward
+    # ---------------------------------------------------------- camera ----
+    def project(self, x, y, z):
+        """world -> (screen x, screen y, depth). Bigger depth = farther."""
+        tx, ty, tz = self.target
+        dx, dy, dz = x - tx, y - ty, z - tz
+        cy, sy = math.cos(self.yaw), math.sin(self.yaw)
+        x1 = dx * cy - dy * sy
+        y1 = dx * sy + dy * cy
+        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
+        up = y1 * cp + dz * sp
+        depth = y1 * sp - dz * cp
+        w, h = self.size()
+        return (w / 2 + self.pan[0] + x1 * self.scale,
+                h / 2 + self.pan[1] - up * self.scale, depth)
 
-    # ---- drawing --------------------------------------------------------
-    def redraw(self):
-        c = self.canvas
-        c.delete('all')
-        self.setup_transform()
+    def unproject(self, sx, sy, z):
+        """screen point -> world (x, y) on the horizontal plane at height z."""
+        w, h = self.size()
+        x1 = (sx - w / 2 - self.pan[0]) / self.scale
+        up = (h / 2 + self.pan[1] - sy) / self.scale
+        dz = z - self.target[2]
+        y1 = (up - dz * math.sin(self.pitch)) / max(math.cos(self.pitch), 0.05)
+        cy, syw = math.cos(self.yaw), math.sin(self.yaw)
+        dx = x1 * cy + y1 * syw
+        dy = -x1 * syw + y1 * cy
+        return dx + self.target[0], dy + self.target[1]
 
-        by_name = {n['name']: n for n in self.nodes}
-        placed = [n for n in self.nodes if n['xy']]
+    def size(self):
+        return (max(self.canvas.winfo_width(), 200),
+                max(self.canvas.winfo_height(), 200))
 
-        # 1) ranges (behind everything)
-        for n in placed:
-            if n['range'] <= 0:
-                continue
-            x, y = self.to_px(*n['xy'])
-            r = n['range'] * self.scale
-            if n['kind'] == 'ap':      # only AP coverage matters for connecting
-                c.create_oval(x - r, y - r, x + r, y + r,
-                              outline=COLORS['ap_range'], width=1.5,
-                              fill=COLORS['ap_fill'])
+    def world_box(self):
+        pos = self.positions()
+        if not pos:
+            return 0, 0, 100, 100
+        ranges = {n['name']: n['range'] for n in self.data['nodes']}
+        xs_lo = [p[0] - ranges.get(k, 0) for k, p in pos.items()]
+        xs_hi = [p[0] + ranges.get(k, 0) for k, p in pos.items()]
+        ys_lo = [p[1] - ranges.get(k, 0) for k, p in pos.items()]
+        ys_hi = [p[1] + ranges.get(k, 0) for k, p in pos.items()]
+        return min(xs_lo), min(ys_lo), max(xs_hi), max(ys_hi)
 
-        self.draw_grid()          # grid on top of the light range fill
+    def fit(self):
+        lo_x, lo_y, hi_x, hi_y = self.world_box()
+        zs = [p[2] for p in self.positions().values()] or [0]
+        self.target = ((lo_x + hi_x) / 2, (lo_y + hi_y) / 2, (min(zs) + max(zs)) / 2)
+        w, h = self.size()
+        span = max(hi_x - lo_x, hi_y - lo_y, 1)
+        self.scale = 0.8 * min(w, h) / span
+        self.pan = [0.0, 0.0]
+        self.redraw()
 
-        # 2) station -> AP connections
-        for n in placed:
-            ap = by_name.get(n['ap']) if n['ap'] else None
-            if ap and ap['xy']:
-                x1, y1 = self.to_px(*n['xy'])
-                x2, y2 = self.to_px(*ap['xy'])
-                c.create_line(x1, y1, x2, y2, fill=COLORS['link'], width=2)
+    def view_top(self):
+        self.yaw, self.pitch = 0.0, 0.0
+        self.fit()
 
-        # 3) nodes and labels
-        for n in placed:
-            x, y = self.to_px(*n['xy'])
-            tag = 'node_' + n['name']
-            if n['kind'] == 'ap':
-                c.create_rectangle(x - 8, y - 8, x + 8, y + 8,
-                                   fill=COLORS['ap'], outline='white',
-                                   width=2, tags=(tag,))
-            elif n['kind'] == 'sta':
-                c.create_oval(x - 7, y - 7, x + 7, y + 7, fill=COLORS['sta'],
-                              outline='white', width=2, tags=(tag,))
+    def view_3d(self):
+        self.yaw, self.pitch = math.radians(-30), math.radians(55)
+        self.fit()
+
+    # ----------------------------------------------------------- mouse ----
+    def node_at(self, x, y):
+        best, bd = None, self.HIT
+        for name, sx, sy in self.hits:
+            d = math.hypot(sx - x, sy - y)
+            if d <= bd:
+                best, bd = name, d
+        return best
+
+    def on_press(self, e):
+        name = self.node_at(e.x, e.y)
+        if name and self.cfg.get('allow_move', True):
+            xyz = self.positions()[name]
+            self.drag = {'mode': 'node', 'name': name, 'xyz': xyz,
+                         'start': (e.x, e.y), 'sent': 0}
+        else:
+            self.drag = {'mode': 'rotate', 'last': (e.x, e.y)}
+
+    def on_drag(self, e):
+        d = self.drag
+        if not d:
+            return
+        if d['mode'] == 'rotate':
+            self.user_view = True
+            lx, ly = d['last']
+            self.yaw += (e.x - lx) * 0.01
+            self.pitch = min(max(self.pitch + (e.y - ly) * 0.01, 0.0),
+                             math.radians(85))
+            d['last'] = (e.x, e.y)
+        else:
+            x, y, z = d['xyz']
+            if e.state & 0x0001:                       # Shift: change height
+                z = z - (e.y - d['start'][1]) / self.scale
+                z = max(z, 0.0)
+                d['start'] = (e.x, e.y)
             else:
-                c.create_oval(x - 6, y - 6, x + 6, y + 6, fill=COLORS['host'],
-                              outline='white', width=2, tags=(tag,))
-            c.create_text(x, y + 18, text=n['name'], fill=COLORS['text'],
-                          font=('TkDefaultFont', 10, 'bold'), tags=(tag,))
-            c.tag_bind(tag, '<Enter>', lambda e, n=n: self.show_tip(e, n))
-            c.tag_bind(tag, '<Leave>', lambda e: self.hide_tip())
+                x, y = self.unproject(e.x, e.y, z)
+            d['xyz'] = (x, y, z)
+            self.local[d['name']] = ((x, y, z), time.time() + 2.0)
+            if time.time() - d['sent'] > 0.15:         # don't flood Mininet
+                self.send_move(d['name'], (x, y, z))
+                d['sent'] = time.time()
+        self.redraw()
 
-        self.draw_legend()
-        self.update_status(by_name)
+    def on_release(self, e):
+        d, self.drag = self.drag, None
+        if d and d['mode'] == 'node':
+            self.send_move(d['name'], d['xyz'])
+            self.local[d['name']] = (d['xyz'], time.time() + 2.0)
+        self.redraw()
+
+    def send_move(self, name, xyz):
+        try:
+            self.outq.put(('move', name) + tuple(round(v, 2) for v in xyz))
+        except Exception:
+            pass
+
+    def on_pan_start(self, e):
+        self.pan_last = (e.x, e.y)
+
+    def on_pan(self, e):
+        self.user_view = True
+        lx, ly = self.pan_last
+        self.pan[0] += e.x - lx
+        self.pan[1] += e.y - ly
+        self.pan_last = (e.x, e.y)
+        self.redraw()
+
+    def zoom(self, e, direction):
+        self.user_view = True
+        k = 1.15 if direction > 0 else 1 / 1.15
+        w, h = self.size()
+        mx, my = e.x - w / 2, e.y - h / 2
+        self.pan[0] = mx - (mx - self.pan[0]) * k        # zoom toward mouse
+        self.pan[1] = my - (my - self.pan[1]) * k
+        self.scale *= k
+        self.redraw()
+
+    def on_motion(self, e):
+        self.mouse = (e.x, e.y)
+        h = self.node_at(e.x, e.y)
+        if h != self.hover:
+            self.hover = h
+            self.canvas.config(cursor='fleur' if h else '')
+            if not self.v_anim.get():
+                self.redraw()
+        elif h:
+            if not self.v_anim.get():
+                self.redraw()
+
+    # --------------------------------------------------------- drawing ----
+    def circle_pts(self, x, y, z, r, n=56):
+        pts = []
+        for i in range(n):
+            a = 2 * math.pi * i / n
+            sx, sy, _ = self.project(x + r * math.cos(a), y + r * math.sin(a), z)
+            pts += [sx, sy]
+        return pts
+
+    def redraw(self):
+        cv = self.canvas
+        cv.delete('all')
+        t = time.time() - self.t0
+        anim = self.v_anim.get()
+        pos = self.positions()
+        nodes = {n['name']: n for n in self.data['nodes']}
+
+        self.draw_grid()
+
+        # ranges: AP fills, ripples, then every outline
+        if self.v_ranges.get():
+            for name, p in pos.items():
+                n = nodes[name]
+                if n['kind'] == 'ap' and n['range'] > 0:
+                    cv.create_polygon(self.circle_pts(*p, n['range']),
+                                      fill=C['ap_fill'], outline='')
+            if anim:
+                for name, p in pos.items():
+                    n = nodes[name]
+                    if n['range'] <= 0:
+                        continue
+                    is_ap = n['kind'] == 'ap'
+                    period = 2.4 if is_ap else 3.2
+                    count = 3 if is_ap else 1
+                    base = C['ap_ring'] if is_ap else C['sta_ring']
+                    end = C['ap_fill'] if is_ap else C['bg']
+                    for k in range(count):
+                        f = ((t / period) + k / count) % 1.0
+                        cv.create_polygon(self.circle_pts(*p, n['range'] * f, 40),
+                                          fill='', outline=_mix(base, end, f),
+                                          width=2 if is_ap else 1)
+            for name, p in pos.items():
+                n = nodes[name]
+                if n['range'] > 0:
+                    if n['kind'] == 'ap':
+                        cv.create_polygon(self.circle_pts(*p, n['range']),
+                                          fill='', outline=C['ap'], width=1.5)
+                    else:
+                        cv.create_polygon(self.circle_pts(*p, n['range']),
+                                          fill='', outline=C['sta'], dash=(4, 4))
+
+        # height stems + ground shadows (helps reading 3D)
+        for name, p in pos.items():
+            if abs(p[2]) > 1e-6:
+                gx, gy, _ = self.project(p[0], p[1], 0)
+                sx, sy, _ = self.project(*p)
+                cv.create_oval(gx - 7, gy - 3, gx + 7, gy + 3,
+                               fill=C['shadow'], outline='')
+                cv.create_line(gx, gy, sx, sy, fill=C['axis'], dash=(2, 3))
+
+        # links
+        for a, b, kind in self.data['links']:
+            if a in pos and b in pos:
+                x1, y1, _ = self.project(*pos[a])
+                x2, y2, _ = self.project(*pos[b])
+                if kind == 'wired':
+                    cv.create_line(x1, y1, x2, y2, fill=C['wired'], width=3)
+                else:
+                    cv.create_line(x1, y1, x2, y2, fill=C['control'], width=2,
+                                   dash=(8, 5))
+                    if self.v_labels.get():
+                        cv.create_text((x1 + x2) / 2, (y1 + y2) / 2 - 8,
+                                       text='OpenFlow', fill=C['control'],
+                                       font=('TkDefaultFont', 8))
+        for name, n in nodes.items():
+            if n['kind'] == 'sta' and n['ap'] in pos and name in pos:
+                d = math.dist(pos[name][:3], pos[n['ap']][:3])
+                ok = d <= max(nodes[n['ap']]['range'], 1e-9)
+                self.draw_rf(pos[name], pos[n['ap']], t if anim else 0, ok)
+
+        # nodes, far ones first
+        self.hits = []
+        order = sorted(pos.items(), key=lambda kv: -self.project(*kv[1])[2])
+        for name, p in order:
+            self.draw_node(nodes[name], *self.project(*p)[:2])
+
+        self.draw_overlay()
+        self.update_status(pos, nodes)
 
     def draw_grid(self):
-        c = self.canvas
-        lo_x, lo_y, hi_x, hi_y = self.bounds
+        cv = self.canvas
+        lo_x, lo_y, hi_x, hi_y = self.world_box()
         step = _nice_step(max(hi_x - lo_x, hi_y - lo_y))
-        x0, y0 = self.to_px(lo_x, lo_y)
-        x1, y1 = self.to_px(hi_x, hi_y)
-        v = math.ceil(lo_x / step) * step
-        while v <= hi_x + 1e-9:
-            px, _ = self.to_px(v, lo_y)
-            c.create_line(px, y1, px, y0, fill=COLORS['grid'])
-            c.create_text(px, y0 + 12, text='%g' % v, fill=COLORS['axis'],
-                          font=('TkDefaultFont', 8))
+        gx0 = math.floor(lo_x / step) * step
+        gy0 = math.floor(lo_y / step) * step
+        gx1 = math.ceil(hi_x / step) * step
+        gy1 = math.ceil(hi_y / step) * step
+        v = gx0
+        while v <= gx1 + 1e-9:
+            a = self.project(v, gy0, 0); b = self.project(v, gy1, 0)
+            major = abs(v) < 1e-9
+            cv.create_line(a[0], a[1], b[0], b[1],
+                           fill=C['grid_major'] if major else C['grid'])
+            cv.create_text(a[0], a[1] + 12, text='%g' % v, fill=C['axis'],
+                           font=('TkDefaultFont', 8))
             v += step
-        v = math.ceil(lo_y / step) * step
-        while v <= hi_y + 1e-9:
-            _, py = self.to_px(lo_x, v)
-            c.create_line(x0, py, x1, py, fill=COLORS['grid'])
-            c.create_text(x0 - 6, py, text='%g' % v, anchor='e',
-                          fill=COLORS['axis'], font=('TkDefaultFont', 8))
+        v = gy0
+        while v <= gy1 + 1e-9:
+            a = self.project(gx0, v, 0); b = self.project(gx1, v, 0)
+            major = abs(v) < 1e-9
+            cv.create_line(a[0], a[1], b[0], b[1],
+                           fill=C['grid_major'] if major else C['grid'])
+            cv.create_text(a[0] - 14, a[1], text='%g' % v, fill=C['axis'],
+                           font=('TkDefaultFont', 8))
             v += step
-        c.create_rectangle(x0, y1, x1, y0, outline=COLORS['axis'])
-        c.create_text((x0 + x1) / 2, y0 + 28, text='meters',
-                      fill=COLORS['axis'], font=('TkDefaultFont', 8))
+        o = self.project(gx0, gy0, 0)
+        ex = self.project(gx0 + step, gy0, 0)
+        ey = self.project(gx0, gy0 + step, 0)
+        ez = self.project(gx0, gy0, step)
+        for end, label, col in ((ex, 'x', '#c0392b'), (ey, 'y', '#1e8449'),
+                                (ez, 'z', '#2457a6')):
+            cv.create_line(o[0], o[1], end[0], end[1], fill=col, width=2,
+                           arrow='last')
+            cv.create_text(end[0] + 8, end[1] - 6, text=label, fill=col,
+                           font=('TkDefaultFont', 9, 'bold'))
 
-    def draw_legend(self):
-        c = self.canvas
-        x, y = 12, 12
-        c.create_rectangle(x, y, x + 10, y + 10, fill=COLORS['ap'], outline='')
-        c.create_text(x + 16, y + 5, text='Access point', anchor='w',
-                      fill=COLORS['text'], font=('TkDefaultFont', 9))
-        c.create_oval(x + 100, y, x + 110, y + 10, fill=COLORS['sta'], outline='')
-        c.create_text(x + 116, y + 5, text='Station', anchor='w',
-                      fill=COLORS['text'], font=('TkDefaultFont', 9))
-        c.create_line(x + 172, y + 5, x + 190, y + 5, fill=COLORS['link'], width=2)
-        c.create_text(x + 196, y + 5, text='Connected', anchor='w',
-                      fill=COLORS['text'], font=('TkDefaultFont', 9))
+    def draw_rf(self, a, b, t, ok):
+        """A radio link: soft glow + a travelling sine wave."""
+        cv = self.canvas
+        x1, y1, _ = self.project(*a)
+        x2, y2, _ = self.project(*b)
+        L = math.hypot(x2 - x1, y2 - y1)
+        if L < 2:
+            return
+        ux, uy = (x2 - x1) / L, (y2 - y1) / L
+        nx, ny = -uy, ux
+        color = C['rf'] if ok else C['rf_bad']
+        cv.create_line(x1, y1, x2, y2, fill=C['rf_glow'] if ok else '#f3d0cc',
+                       width=7, capstyle='round')
+        wl, amp, speed = 16.0, 4.5, 40.0
+        pts = []
+        steps = max(int(L / 2.5), 8)
+        for i in range(steps + 1):
+            d = L * i / steps
+            env = min(1.0, d / 12.0, (L - d) / 12.0)      # taper the ends
+            off = amp * env * math.sin(2 * math.pi * (d - speed * t) / wl)
+            pts += [x1 + ux * d + nx * off, y1 + uy * d + ny * off]
+        cv.create_line(*pts, fill=color, width=2, smooth=True)
+        if not ok:
+            cv.create_text((x1 + x2) / 2, (y1 + y2) / 2 - 12, text='out of range',
+                           fill=C['rf_bad'], font=('TkDefaultFont', 8, 'bold'))
 
-    def update_status(self, by_name):
-        lines = []
-        for n in self.nodes:
-            if not n['xy']:
-                lines.append('! %s has no position, so it is not drawn '
-                             '(add position="x,y,0")' % n['name'])
+    def draw_node(self, n, x, y):
+        cv = self.canvas
+        kind, name = n['kind'], n['name']
+        hl = (self.hover == name) or (self.drag and self.drag.get('name') == name)
+        ow = C['select'] if hl else 'white'
+        if kind == 'ap':
+            cv.create_rectangle(x - 10, y - 7, x + 10, y + 7, fill=C['ap'],
+                                outline=ow, width=2)
+            cv.create_line(x + 6, y - 7, x + 6, y - 15, fill=C['ap'], width=2)
+            for r in (5, 9):                                # wifi arcs
+                cv.create_arc(x + 6 - r, y - 15 - r, x + 6 + r, y - 15 + r,
+                              start=45, extent=90, style='arc',
+                              outline=C['ap'], width=1.5)
+            for i in (-5, 0):                               # leds
+                cv.create_oval(x + i - 1.5, y - 1.5, x + i + 1.5, y + 1.5,
+                               fill='#9ff0b8', outline='')
+        elif kind == 'sta':
+            cv.create_oval(x - 8, y - 8, x + 8, y + 8, fill=C['sta'],
+                           outline=ow, width=2)
+            cv.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5, fill='white',
+                           outline='')
+        elif kind == 'ctrl':
+            pts = []
+            for i in range(6):
+                a = math.pi / 6 + i * math.pi / 3
+                pts += [x + 12 * math.cos(a), y + 12 * math.sin(a)]
+            cv.create_polygon(pts, fill=C['ctrl'], outline=ow, width=2)
+            cv.create_text(x, y, text='C', fill='white',
+                           font=('TkDefaultFont', 9, 'bold'))
+        elif kind == 'switch':
+            cv.create_rectangle(x - 12, y - 6, x + 12, y + 6, fill=C['switch'],
+                                outline=ow, width=2)
+        else:
+            cv.create_rectangle(x - 8, y - 8, x + 8, y + 8, fill=C['host'],
+                                outline=ow, width=2)
+        if self.v_labels.get():
+            label = name + (' (auto)' if kind == 'ctrl' and self.is_auto(name) else '')
+            cv.create_text(x, y + 20, text=label, fill=C['text'],
+                           font=('TkDefaultFont', 10, 'bold'))
+        self.hits.append((name, x, y))
+
+    def is_auto(self, name):
+        for n in self.data['nodes']:
+            if n['name'] == name:
+                return n['xyz'] is None and name not in self.local
+        return False
+
+    def draw_overlay(self):
+        cv = self.canvas
+        w, h = self.size()
+        # legend
+        x, y = 12, 14
+        items = [('ap', 'Access point'), ('sta', 'Station'), ('ctrl', 'Controller')]
+        for kind, text in items:
+            col = C[kind]
+            if kind == 'ap':
+                cv.create_rectangle(x, y - 5, x + 12, y + 5, fill=col, outline='')
+            elif kind == 'sta':
+                cv.create_oval(x + 1, y - 5, x + 11, y + 5, fill=col, outline='')
+            else:
+                cv.create_polygon(x + 6, y - 6, x + 12, y - 3, x + 12, y + 3,
+                                  x + 6, y + 6, x, y + 3, x, y - 3, fill=col)
+            cv.create_text(x + 18, y, text=text, anchor='w', fill=C['text'],
+                           font=('TkDefaultFont', 9))
+            x += 26 + 7 * len(text)
+        for kind, text, dash, col, wd in (('rf', 'Wireless', None, C['rf'], 2),
+                                          ('wired', 'Cable', None, C['wired'], 3),
+                                          ('control', 'Control', (6, 4), C['control'], 2)):
+            if kind == 'rf':
+                pts = []
+                for i in range(13):
+                    pts += [x + i * 2, y + 3 * math.sin(i * 1.1)]
+                cv.create_line(*pts, fill=col, width=wd, smooth=True)
+            else:
+                cv.create_line(x, y, x + 24, y, fill=col, width=wd, dash=dash)
+            cv.create_text(x + 30, y, text=text, anchor='w', fill=C['text'],
+                           font=('TkDefaultFont', 9))
+            x += 40 + 7 * len(text)
+        # help
+        cv.create_text(12, h - 12, anchor='sw', fill=C['muted'],
+                       font=('TkDefaultFont', 8),
+                       text='drag: rotate   right-drag: pan   wheel: zoom   '
+                            'drag node: move   Shift+drag node: height   '
+                            'T/3/F: top/3D/fit')
+        # tooltip
+        if self.hover and not (self.drag and self.drag.get('mode') == 'rotate'):
+            self.draw_tip()
+
+    def draw_tip(self):
+        cv = self.canvas
+        n = next((n for n in self.data['nodes'] if n['name'] == self.hover), None)
+        p = self.positions().get(self.hover)
+        if not n or not p:
+            return
+        lines = ['%s  (%s)' % (n['name'], KIND_LABEL.get(n['kind'], n['kind'])),
+                 'position: %.1f, %.1f, %.1f' % p]
+        if n['range'] > 0:
+            lines.append('range: %g m' % n['range'])
+        if n['kind'] == 'sta':
+            lines.append('connected to: %s' % (n['ap'] or 'nothing'))
+        if n['kind'] == 'ctrl' and self.is_auto(n['name']):
+            lines.append('(placed automatically, drag to move)')
+        mx, my = self.mouse
+        tid = cv.create_text(mx + 16, my - 12, text='\n'.join(lines), anchor='sw',
+                             fill=C['tip_fg'], font=('TkDefaultFont', 9))
+        b = cv.bbox(tid)
+        bg = cv.create_rectangle(b[0] - 7, b[1] - 5, b[2] + 7, b[3] + 5,
+                                 fill=C['tip_bg'], outline='')
+        cv.tag_raise(tid, bg)
+
+    def update_status(self, pos, nodes):
+        lines, warn = [], False
+        for n in self.data['nodes']:
+            if n['name'] not in pos:
+                warn = True
+                lines.append('!  %s has no position, so it is not drawn  '
+                             '(add position="x,y,z")' % n['name'])
             elif n['kind'] == 'sta':
-                ap = by_name.get(n['ap']) if n['ap'] else None
-                if ap and ap['xy']:
-                    d = math.dist(n['xy'], ap['xy'])
-                    lines.append('%s  ->  %s   (%.0f m)' % (n['name'], ap['name'], d))
+                ap = n['ap']
+                if ap and ap in pos:
+                    d = math.dist(pos[n['name']], pos[ap])
+                    rng = nodes[ap]['range']
+                    state = 'in range' if d <= rng else 'OUT OF RANGE'
+                    lines.append('%s  ->  %s    %.0f m   (%s, AP range %g m)'
+                                 % (n['name'], ap, d, state, rng))
                 else:
                     lines.append('%s  ->  not connected' % n['name'])
-        if not self.nodes:
+        if not self.data['nodes']:
             lines.append('Waiting for network data...')
-        warn = any(l.startswith('!') for l in lines)
-        self.status.config(text='\n'.join(lines) or ' ',
-                           fg=COLORS['warn'] if warn else COLORS['text'])
-
-    # ---- hover tooltip --------------------------------------------------
-    def show_tip(self, event, n):
-        self.hide_tip()
-        x, y = n['xy']
-        text = '%s (%s)\nposition: %g, %g\nrange: %g m' % (
-            n['name'], {'ap': 'access point', 'sta': 'station'}.get(n['kind'], n['kind']),
-            x, y, n['range'])
-        if n['kind'] == 'sta':
-            text += '\nconnected to: %s' % (n['ap'] or 'nothing')
-        self.tip = self.canvas.create_text(event.x + 14, event.y - 10, text=text,
-                                           anchor='sw', fill='white',
-                                           font=('TkDefaultFont', 9))
-        bbox = self.canvas.bbox(self.tip)
-        bg = self.canvas.create_rectangle(bbox[0] - 6, bbox[1] - 4,
-                                          bbox[2] + 6, bbox[3] + 4,
-                                          fill='#2b2b2b', outline='')
-        self.canvas.tag_raise(self.tip, bg)
-        self.tip = (self.tip, bg)
-
-    def hide_tip(self):
-        if self.tip:
-            for item in self.tip:
-                self.canvas.delete(item)
-            self.tip = None
+        text = '\n'.join(lines) or ' '
+        if text != self.status.cget('text'):
+            self.status.config(text=text, fg=C['warn'] if warn else C['text'])
 
     def run(self):
         self.root.mainloop()
 
 
-def _window_main(q, cfg):
-    # Ctrl+C in the Mininet CLI must not kill the window process
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+def _window_main(inq, outq, cfg):
+    signal.signal(signal.SIGINT, signal.SIG_IGN)    # Ctrl+C belongs to the CLI
     try:
-        win = _Window(q, cfg)
-    except Exception as e:      # usually: no display available
+        win = _Window(inq, outq, cfg)
+    except Exception as e:
         print('\n*** wifi_gui: could not open the window (%s)\n'
               '*** Try: sudo -E python3 your_script.py\n'
               '*** or run "xhost +local:root" first.\n' % e)
