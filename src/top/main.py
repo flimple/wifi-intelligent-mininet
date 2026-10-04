@@ -10,9 +10,6 @@ def topology():
     sta1 = net.addStation("sta1", ip="10.0.0.1/8", position="200,200,0", range=100)
 
     net.configureNodes()
-    net.addLink(sta1, ap1)
-
-    net.setPropagationModel("logDistance", exp=3)
 
     net.build()
     c0.start()

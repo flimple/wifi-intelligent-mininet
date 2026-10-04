@@ -70,6 +70,17 @@ import time
 WIRELESS_LINK_WORDS = ('wifi', 'wireless', 'wmediumd', 'assoc', 'adhoc',
                        'mesh', 'its', 'direct', 'mode')
 
+def _rssi(node):
+    """
+    Retourne le RSSI de la première interface Wi-Fi de la station.
+    """
+    try:
+        if node.wintfs:
+            return float(node.wintfs[0].rssi)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        pass
+
+    return None
 
 def _xyz(node, overrides):
     """(x, y, z) of a node, or None if it has no position."""
@@ -131,7 +142,8 @@ def snapshot(net, overrides=None):
             item = {'name': node.name, 'kind': kind,
                     'xyz': _xyz(node, overrides),
                     'range': _range(node),
-                    'ap': _associated_ap(node) if kind == 'sta' else None}
+                    'ap': _associated_ap(node) if kind == 'sta' else None,
+                    'rssi': _rssi(node) if kind == 'sta' else None}
             by_name[node.name] = node
             nodes.append(item)
 
@@ -628,7 +640,7 @@ class _Window(object):
             if n['kind'] == 'sta' and n['ap'] in pos and name in pos:
                 d = math.dist(pos[name][:3], pos[n['ap']][:3])
                 ok = d <= max(nodes[n['ap']]['range'], 1e-9)
-                self.draw_rf(pos[name], pos[n['ap']], t if anim else 0, ok)
+                self.draw_rf(pos[name], pos[n['ap']], t if anim else 0, ok, n.get('rssi'))
 
         # nodes, far ones first
         self.hits = []
@@ -676,7 +688,7 @@ class _Window(object):
             cv.create_text(end[0] + 8, end[1] - 6, text=label, fill=col,
                            font=('TkDefaultFont', 9, 'bold'))
 
-    def draw_rf(self, a, b, t, ok):
+    def draw_rf(self, a, b, t, ok, rssi=None):
         """A radio link: soft glow + a travelling sine wave."""
         cv = self.canvas
         x1, y1, _ = self.project(*a)
@@ -686,9 +698,32 @@ class _Window(object):
             return
         ux, uy = (x2 - x1) / L, (y2 - y1) / L
         nx, ny = -uy, ux
-        color = C['rf'] if ok else C['rf_bad']
-        cv.create_line(x1, y1, x2, y2, fill=C['rf_glow'] if ok else '#f3d0cc',
-                       width=7, capstyle='round')
+
+        if not ok:
+            color = '#cc3a2f'
+            glow = '#f3d0cc'
+        elif rssi is None:
+            color = '#16a05a'
+            glow = '#cdebd9'
+        elif rssi >= -50:
+            # Excellent
+            color = '#16a05a'
+            glow = '#cdebd9'
+        elif rssi >= -65:
+            # Bon
+            color = '#7cb342'
+            glow = '#dcedc8'
+        elif rssi >= -75:
+            # Moyen
+            color = '#f39c12'
+            glow = '#fdebd0'
+        else:
+            # Mauvais
+            color = '#cc3a2f'
+            glow = '#f3d0cc'
+
+        cv.create_line(x1, y1, x2, y2, fill=glow,
+                       width=8, capstyle='round')
         wl, amp, speed = 16.0, 4.5, 40.0
         pts = []
         steps = max(int(L / 2.5), 8)
@@ -697,10 +732,12 @@ class _Window(object):
             env = min(1.0, d / 12.0, (L - d) / 12.0)      # taper the ends
             off = amp * env * math.sin(2 * math.pi * (d - speed * t) / wl)
             pts += [x1 + ux * d + nx * off, y1 + uy * d + ny * off]
-        cv.create_line(*pts, fill=color, width=2, smooth=True)
-        if not ok:
-            cv.create_text((x1 + x2) / 2, (y1 + y2) / 2 - 12, text='out of range',
-                           fill=C['rf_bad'], font=('TkDefaultFont', 8, 'bold'))
+        cv.create_line(*pts, fill=color, width=3, smooth=True)
+        if rssi is not None:
+            text = '%.1f dBm' % rssi
+            cv.create_text((x1 + x2) / 2,(y1 + y2) / 2 - 15,text=text,fill=color,font=('TkDefaultFont',10,'bold'))
+        elif not ok:
+            cv.create_text((x1 + x2) / 2,(y1 + y2) / 2 - 12,text='OUT OF RANGE',fill='#cc3a2f',font=('TkDefaultFont',8,'bold'))
 
     def draw_node(self, n, x, y):
         cv = self.canvas
@@ -801,7 +838,22 @@ class _Window(object):
         if n['range'] > 0:
             lines.append('range: %g m' % n['range'])
         if n['kind'] == 'sta':
-            lines.append('connected to: %s' % (n['ap'] or 'nothing'))
+            lines.append(
+                'connected to: %s'
+                % (n['ap'] or 'nothing')
+            )
+
+            rssi = n.get('rssi')
+
+            if rssi is not None:
+                lines.append(
+                    'RSSI: %.1f dBm'
+                    % rssi
+                )
+            else:
+                lines.append(
+                    'RSSI: unavailable'
+                )
         if n['kind'] == 'ctrl' and self.is_auto(n['name']):
             lines.append('(placed automatically, drag to move)')
         mx, my = self.mouse
