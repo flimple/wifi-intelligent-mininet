@@ -320,10 +320,11 @@ class _Window(object):
             tk.Button(bar, text=text, command=cmd, relief='flat', bg='white',
                       padx=10).pack(side='left', padx=3)
         self.v_ranges = tk.BooleanVar(value=True)
+        self.v_sphere = tk.BooleanVar(value=True)
         self.v_anim = tk.BooleanVar(value=True)
         self.v_labels = tk.BooleanVar(value=True)
-        for text, var in (('Ranges', self.v_ranges), ('Animation', self.v_anim),
-                          ('Labels', self.v_labels)):
+        for text, var in (('Ranges', self.v_ranges), ('Sphere', self.v_sphere),
+                          ('Animation', self.v_anim), ('Labels', self.v_labels)):
             tk.Checkbutton(bar, text=text, variable=var, bg=C['bar'],
                            command=self.redraw).pack(side='left', padx=6)
 
@@ -350,6 +351,8 @@ class _Window(object):
         cv.bind('<Button-4>', lambda e: self.zoom(e, 1))
         cv.bind('<Button-5>', lambda e: self.zoom(e, -1))
         root.bind('<Key-t>', lambda e: self.view_top())
+        root.bind('<Key-s>', lambda e: (self.v_sphere.set(not self.v_sphere.get()),
+                                        self.redraw()))
         root.bind('<Key-3>', lambda e: self.view_3d())
         root.bind('<Key-f>', lambda e: self.fit())
         root.bind('<Key-a>', lambda e: (self.v_anim.set(not self.v_anim.get()),
@@ -571,6 +574,36 @@ class _Window(object):
             pts += [sx, sy]
         return pts
 
+    def sphere(self, p, r, color, width=1.5, dash=None, fill=None,
+               rings=(-60, -30, 0, 30, 60), meridians=3, soft=0.55):
+        """Wireframe sphere of radius r (world units) centred on p."""
+        cv = self.canvas
+        x, y, z = p
+        cx, cy, _ = self.project(x, y, z)
+        R = r * self.scale
+        if fill:                                   # translucent body
+            cv.create_oval(cx - R, cy - R, cx + R, cy + R,
+                           fill=fill, stipple='gray12', outline='')
+        inner = _mix(color, C['bg'], soft)         # lighter inner lines
+        for lat in rings:                          # horizontal rings
+            a = math.radians(lat)
+            pts = self.circle_pts(x, y, z + r * math.sin(a),
+                                  r * math.cos(a), 40)
+            cv.create_polygon(pts, fill='', outline=inner,
+                              width=1.5 if lat == 0 else 1, dash=dash)
+        for k in range(meridians):                 # vertical great circles
+            az = math.pi * k / meridians
+            pts = []
+            for i in range(41):
+                t = 2 * math.pi * i / 40
+                sx, sy, _ = self.project(x + r * math.cos(t) * math.cos(az),
+                                         y + r * math.cos(t) * math.sin(az),
+                                         z + r * math.sin(t))
+                pts += [sx, sy]
+            cv.create_line(*pts, fill=inner, dash=dash)
+        cv.create_oval(cx - R, cy - R, cx + R, cy + R,     # silhouette
+                       outline=color, width=width, dash=dash)
+
     def redraw(self):
         cv = self.canvas
         cv.delete('all')
@@ -581,14 +614,29 @@ class _Window(object):
 
         self.draw_grid()
 
-        # ranges: AP fills, ripples, then every outline
+         # ranges: spheres or flat circles, depending on the toggle
         if self.v_ranges.get():
+            sphere = self.v_sphere.get()
             for name, p in pos.items():
                 n = nodes[name]
-                if n['kind'] == 'ap' and n['range'] > 0:
-                    cv.create_polygon(self.circle_pts(*p, n['range']),
-                                      fill=C['ap_fill'], outline='')
-            if anim:
+                if n['range'] <= 0:
+                    continue
+                is_ap = n['kind'] == 'ap'
+                if sphere:
+                    if is_ap:
+                        self.sphere(p, n['range'], C['ap'], fill=C['ap_fill'])
+                    else:
+                        self.sphere(p, n['range'], C['sta'], width=1.2,
+                                    dash=(4, 4), rings=(0,), meridians=1)
+                else:
+                    pts = self.circle_pts(*p, n['range'])
+                    if is_ap:
+                        cv.create_polygon(pts, fill=C['ap_fill'], outline='')
+                        cv.create_polygon(pts, fill='', outline=C['ap'], width=1.5)
+                    else:
+                        cv.create_polygon(pts, fill='', outline=C['sta'],
+                                          dash=(4, 4))
+            if anim:                                   # expanding ripples
                 for name, p in pos.items():
                     n = nodes[name]
                     if n['range'] <= 0:
@@ -598,20 +646,18 @@ class _Window(object):
                     count = 3 if is_ap else 1
                     base = C['ap_ring'] if is_ap else C['sta_ring']
                     end = C['ap_fill'] if is_ap else C['bg']
+                    cx, cy, _ = self.project(*p)
                     for k in range(count):
                         f = ((t / period) + k / count) % 1.0
-                        cv.create_polygon(self.circle_pts(*p, n['range'] * f, 40),
-                                          fill='', outline=_mix(base, end, f),
-                                          width=2 if is_ap else 1)
-            for name, p in pos.items():
-                n = nodes[name]
-                if n['range'] > 0:
-                    if n['kind'] == 'ap':
-                        cv.create_polygon(self.circle_pts(*p, n['range']),
-                                          fill='', outline=C['ap'], width=1.5)
-                    else:
-                        cv.create_polygon(self.circle_pts(*p, n['range']),
-                                          fill='', outline=C['sta'], dash=(4, 4))
+                        r = n['range'] * f
+                        col = _mix(base, end, f)
+                        w = 2 if is_ap else 1
+                        if sphere:
+                            R = r * self.scale
+                            cv.create_oval(cx - R, cy - R, cx + R, cy + R,
+                                           outline=col, width=w)
+                        cv.create_polygon(self.circle_pts(*p, r, 40),
+                                          fill='', outline=col, width=w)
 
         # height stems + ground shadows (helps reading 3D)
         for name, p in pos.items():
