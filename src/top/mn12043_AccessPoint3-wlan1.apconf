@@ -1,9 +1,0 @@
-interface=AccessPoint3-wlan1
-driver=nl80211
-ssid=Wifi_Name3_5G
-wds_sta=1
-country_code=US
-hw_mode=a
-channel=36
-ctrl_interface=/var/run/hostapd
-ctrl_interface_group=0
