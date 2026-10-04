@@ -19,6 +19,18 @@ What you get
   - AP client badges: each AP shows how many devices are connected to it
     (Wi-Fi links + stations that would auto-associate because they are in
     its range). Details in the tooltip and in the Inspector
+  - Walls: BUILD > Wall, drag a zone on the ground, then set its
+    properties (material concrete / brick / wood / drywall / glass / metal
+    with preset dB loss, or custom loss + color; height: 0 = flat 2D wall,
+    > 0 = 3D wall; base Z for upper floors). Select a wall to move it,
+    stretch its ends, change thickness, rotate it or drag its height;
+    Ctrl+D duplicates, Del deletes. Each wall crossed subtracts its loss
+    from the RSSI: in the editor's estimates (labels, AP clients) and in
+    the simulation (tc mode and wmediumd SNR mode - wmediumd interference
+    mode computes signals itself and cannot see walls)
+  - WALLS > camera: walls always visible, front walls transparent, front
+    walls cut down (like building games), or outlines. SHOW > Walls hides
+    them. SHOW > Ranges > outline only draws just the range boundaries
   - Pictures (floor plans, maps): Insert > Picture, then drag to move,
     corner squares to scale, round handle to rotate; Inspector sets
     position, floor height, width, rotation, opacity, visible, locked.
@@ -69,7 +81,11 @@ Mouse & keys
   AP / Station / ... tool .. click the grid to place a device
   Link tool ................ drag from one device to another
   picture .................. drag: move   corners: scale   round: rotate
+  Wall tool ................ drag a zone; selected wall: drag = move,
+                             ends = length, side = thickness, round =
+                             rotate, blue diamond = height
   Del delete   Esc select tool   I inspector   L link tool   P picture
+  W wall tool   Ctrl+D duplicate wall
   T top view   3 3D view   F fit   Ctrl+Z / Ctrl+Y undo / redo
   Ctrl+S save  Ctrl+Shift+S save as  Ctrl+O open  Ctrl+N new  Ctrl+E export
 """
@@ -271,6 +287,150 @@ PIC_SCHEMA = [
 PIC_KEYS = [f['key'] for f in PIC_SCHEMA]
 
 
+# walls - attenuation per crossing (typical values at 2.4 GHz; 5 GHz is
+# usually a few dB worse). "custom" lets you type your own.
+WALL_MATERIALS = {
+    'concrete': (12.0, '#9c9a94'),
+    'brick': (8.0, '#b4583d'),
+    'wood': (4.0, '#a97a4b'),
+    'drywall': (3.0, '#d8d0bd'),
+    'glass': (3.0, '#86c5de'),
+    'metal': (20.0, '#6e7c88'),
+    'custom': (10.0, '#8c6bb1'),
+}
+MATERIAL_ORDER = ['concrete', 'brick', 'wood', 'drywall', 'glass', 'metal',
+                  'custom']
+WALL_MODES = [('solid', 'Walls always visible'),
+              ('fade', 'Front walls transparent'),
+              ('cutaway', 'Front walls cut down'),
+              ('outline', 'Walls as outlines')]
+
+WALL_SCHEMA = [
+    F('name', 'Name', 'wallname', 'general', ''),
+    F('material', 'Material', 'choice', 'wall', 'concrete', MATERIAL_ORDER),
+    F('loss', 'Attenuation (dB)', 'float', 'wall', 12.0,
+      hint='subtracted from the RSSI of every path crossing the wall'),
+    F('color', 'Color', 'color', 'wall', '#9c9a94',
+      hint='editable for custom walls'),
+    F('height', 'Height (m)', 'slider', 'geometry', 3.0, opts=(0, 20, 0.1),
+      hint='0 = flat 2D wall: blocks every path crossing it'),
+    F('z', 'Base height Z (m)', 'pos', 'geometry', 0.0),
+    F('length', 'Length (m)', 'slider', 'geometry', 10.0,
+      opts=(0.1, 100, 0.1)),
+    F('thickness', 'Thickness (m)', 'slider', 'geometry', 0.2,
+      opts=(0.02, 5, 0.01)),
+    F('rotation', 'Rotation (deg)', 'slider', 'geometry', 0.0,
+      opts=(-180, 180, 1)),
+    F('x', 'Center X (m)', 'pos', 'placement', 0.0),
+    F('y', 'Center Y (m)', 'pos', 'placement', 0.0),
+]
+WALL_KEYS = [f['key'] for f in WALL_SCHEMA]
+
+
+def default_wall(material='concrete'):
+    w = dict((f['key'], f['default']) for f in WALL_SCHEMA)
+    w['material'] = material
+    w['loss'], w['color'] = WALL_MATERIALS[material]
+    return w
+
+
+def wall_corners(w):
+    """Footprint corners (x, y), counter-clockwise."""
+    a = math.radians(float(w['rotation']))
+    ca, sa = math.cos(a), math.sin(a)
+    L, T = float(w['length']) / 2, float(w['thickness']) / 2
+    return [(w['x'] + lx * ca - ly * sa, w['y'] + lx * sa + ly * ca)
+            for lx, ly in ((-L, -T), (L, -T), (L, T), (-L, T))]
+
+
+def wall_crossed(w, a, b):
+    """True when the segment a -> b (x, y, z) passes through the wall.
+    Height 0 = 2D wall (any height). Pure math, also used at run time."""
+    ang = math.radians(float(w['rotation']))
+    ca, sa = math.cos(ang), math.sin(ang)
+
+    def local(p):
+        dx, dy = p[0] - w['x'], p[1] - w['y']
+        return dx * ca + dy * sa, -dx * sa + dy * ca
+    (ax, ay), (bx, by) = local(a), local(b)
+    dx, dy = bx - ax, by - ay
+    t0, t1 = 0.0, 1.0
+    L, T = float(w['length']) / 2, float(w['thickness']) / 2
+    for p, q in ((-dx, ax + L), (dx, L - ax), (-dy, ay + T), (dy, T - ay)):
+        if abs(p) < 1e-12:
+            if q < 0:
+                return False
+            continue
+        r = q / p
+        if p < 0:
+            t0 = max(t0, r)
+        else:
+            t1 = min(t1, r)
+        if t0 > t1:
+            return False
+    h = float(w.get('height') or 0)
+    if h <= 0:
+        return True
+    za = a[2] + (b[2] - a[2]) * t0
+    zb = a[2] + (b[2] - a[2]) * t1
+    base = float(w.get('z') or 0)
+    return max(za, zb) >= base and min(za, zb) <= base + h
+
+
+def wall_loss(walls, a, b):
+    """(total dB, walls crossed) between two points."""
+    total, hit = 0.0, []
+    for w in walls or []:
+        if wall_crossed(w, a, b):
+            total += float(w.get('loss') or 0)
+            hit.append(w)
+    return total, hit
+
+
+def apply_walls(walls):
+    """Make Mininet-WiFi subtract wall losses from its RSSI.
+
+    Mininet-WiFi computes RSSI in PropagationModel.__init__. This wraps it.
+    Effective without wmediumd (tc mode) and with wmediumd in its default
+    SNR mode. In interference mode wmediumd computes signals itself (C
+    code), so walls cannot be applied there."""
+    if not walls:
+        return
+    from mn_wifi.propagationModels import PropagationModel
+    orig = getattr(PropagationModel.__init__, '_orig', PropagationModel.__init__)
+
+    def pos(node):
+        try:
+            return [float(v) for v in node.getxyz()]
+        except Exception:
+            return [float(v) for v in node.position]
+
+    def __init__(self, intf, apintf, dist=0):
+        orig(self, intf, apintf, dist)
+        try:
+            loss = wall_loss(walls, pos(intf.node), pos(apintf.node))[0]
+            if loss:
+                self.rssi = self.rssi - loss
+        except Exception:
+            pass
+    __init__._orig = orig
+    PropagationModel.__init__ = __init__
+
+
+def _walls_in(lst):
+    out = []
+    for w in lst or []:
+        d = default_wall(w.get('material') if w.get('material')
+                         in WALL_MATERIALS else 'custom')
+        for f in WALL_SCHEMA:
+            if f['key'] in w and w[f['key']] is not None:
+                v = w[f['key']]
+                d[f['key']] = str(v) if f['type'] in (
+                    'choice', 'color', 'wallname') else float(v)
+        out.append(d)
+    return out
+
+
 def default_pic(path=''):
     p = dict((f['key'], f['default']) for f in PIC_SCHEMA)
     p['path'] = path
@@ -287,7 +447,8 @@ NET_SCHEMA = [
     F('lF', 'Floor loss (ITU)', 'float', 'propagation', None),
     F('pL', 'Power loss coef. (ITU)', 'float', 'propagation', None),
     F('wmediumd', 'Use wmediumd', 'bool', 'medium', True),
-    F('interference', 'Interference mode', 'bool', 'medium', True),
+    F('interference', 'Interference mode', 'bool', 'medium', True,
+      hint='walls are not applied in this mode (wmediumd computes signals)'),
     F('noise_th', 'Noise threshold (dBm)', 'float', 'medium', -91.0),
     F('fading_cof', 'Fading coefficient', 'float', 'medium', 0.0),
     F('autoAssociation', 'Auto association', 'bool', 'association', True),
@@ -305,6 +466,7 @@ GROUP_TITLE = {
     'association': 'Association', 'extra': 'Extra parameters',
     'clients': 'Connected devices', 'picture': 'Picture',
     'placement': 'Placement', 'size': 'Size & rotation', 'look': 'Display',
+    'wall': 'Material & signal loss', 'geometry': 'Geometry',
 }
 
 PROP_KEYS = ('exp', 'sL', 'variance', 'nFloors', 'lF', 'pL')
@@ -525,6 +687,8 @@ def doc_to_normalized(doc):
                     l['b']: l['p'].get('intf2') or l['b'] + '-wlan0'}
             out['links'].append({'type': l['kind'], 'nodes': [l['a'], l['b']],
                                  'intf': intf, 'params': params})
+    out['walls'] = [dict((k, w[k]) for k in WALL_KEYS)
+                    for w in doc.get('walls', [])]
     out['editor'] = {'pictures': [dict(pc) for pc in doc.get('pictures', [])]}
     return out
 
@@ -583,7 +747,8 @@ def normalized_to_doc(d):
         p['extra'] = params
         links.append({'kind': t, 'a': a, 'b': b, 'p': p})
     return {'net': net, 'nodes': nodes, 'links': links,
-            'pictures': _pics_in((d.get('editor') or {}).get('pictures'))}
+            'pictures': _pics_in((d.get('editor') or {}).get('pictures')),
+            'walls': _walls_in(d.get('walls'))}
 
 
 def _pics_in(lst):
@@ -632,6 +797,15 @@ def doc_to_custom(doc):
                              'params': params,
                              'extra': dict(l['p'].get('extra') or {})})
     out['pictures'] = [dict(pc) for pc in doc.get('pictures', [])]
+    out['walls'] = [{'name': w['name'], 'material': w['material'],
+                     'loss_db': w['loss'], 'color': w['color'],
+                     'footprint': {'x': w['x'], 'y': w['y'],
+                                   'length': w['length'],
+                                   'thickness': w['thickness'],
+                                   'rotation': w['rotation']},
+                     'z': w['z'], 'height': w['height'],
+                     'is_3d': float(w['height']) > 0}
+                    for w in doc.get('walls', [])]
     return out
 
 
@@ -681,7 +855,13 @@ def custom_to_doc(d):
                 p['extra'][k] = v
         links.append({'kind': t, 'a': l['from'], 'b': l['to'], 'p': p})
     return {'net': net, 'nodes': nodes, 'links': links,
-            'pictures': _pics_in(d.get('pictures'))}
+            'pictures': _pics_in(d.get('pictures')),
+            'walls': _walls_in([dict(w.get('footprint') or {}, name=w.get('name'),
+                                     material=w.get('material'),
+                                     loss=w.get('loss_db', w.get('loss')),
+                                     color=w.get('color'), z=w.get('z'),
+                                     height=w.get('height'))
+                                for w in d.get('walls') or []])}
 
 
 def read_doc(path):
@@ -786,9 +966,25 @@ def script_from_normalized(nd):
     w('from mn_wifi.cli import CLI')
     w('from mn_wifi.link import wmediumd, adhoc, mesh')
     w('from mn_wifi.wmediumdConnector import interference')
+    walls = nd.get('walls') or []
+    if walls:
+        import inspect
+        w('import math')
+        w('')
+        w('# Walls drawn in the editor: attenuation (dB) is subtracted from')
+        w('# the RSSI of every path that crosses them (tc mode and wmediumd')
+        w('# SNR mode; not in wmediumd interference mode).')
+        w('WALLS = %s' % json.dumps(walls, indent=4).replace(
+            'true', 'True').replace('false', 'False').replace('null', 'None'))
+        for fn in (wall_crossed, wall_loss, apply_walls):
+            w('')
+            w('')
+            L.extend(inspect.getsource(fn).rstrip().split('\n'))
     w('')
     w('')
     w('def topology(gui=False):')
+    if walls:
+        w('    apply_walls(WALLS)')
     args = []
     if nw.get('wmediumd'):
         args.append('link=wmediumd')
@@ -880,6 +1076,12 @@ def build_network(nd):
     wl = {'adhoc': adhoc, 'mesh': mesh}
 
     nw = nd.get('network') or {}
+    if nd.get('walls'):
+        apply_walls(nd['walls'])
+        if nw.get('wmediumd') and nw.get('interference'):
+            from mininet.log import info
+            info('*** Note: wmediumd interference mode computes signals '
+                 'itself; wall losses are not applied in this mode.\n')
     kw = dict(nw.get('mininet_wifi') or {})
     if nw.get('wmediumd'):
         kw['link'] = wmediumd
@@ -962,6 +1164,8 @@ TOOL_HINT = {
     'link': 'Link: drag from one device to another (%s link). Esc: back '
             'to select.',
     'picture': '',
+    'wall': 'Wall: drag a zone on the ground (XY plane) to create a wall, '
+            'then set its properties. Esc: back to select.',
 }
 HELP_TEXT = '''Mouse
   click a device ........ select it (local X / Y / Z axes appear)
@@ -972,9 +1176,18 @@ HELP_TEXT = '''Mouse
   Link tool ............. drag from one device to another
   picture (selected) .... drag: move   corner squares: scale
                           round handle: rotate (Shift: 15 degree steps)
+  Wall tool ............. drag a zone on the ground, then set properties
+  wall (selected) ....... drag: move   end squares: length
+                          side dot: thickness   round: rotate
+                          blue diamond (3D view): height
+
+Walls subtract their attenuation (dB) from the RSSI of every path that
+crosses them: in the editor estimates, and in the simulation (tc mode and
+wmediumd SNR mode; not wmediumd interference mode).
 
 Keys
   Del delete    Esc select tool    I inspector    L link tool
+  W wall tool (drag a zone)   Ctrl+D duplicate wall
   P insert picture    T top view    3 3D view    F fit
   Ctrl+Z / Ctrl+Y undo / redo    Ctrl+S save    Ctrl+O open
   Ctrl+N new    Ctrl+E export Python script
@@ -1013,6 +1226,18 @@ def _seg_dist(px, py, x1, y1, x2, y2):
         return math.hypot(px - x1, py - y1)
     t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / L2))
     return math.hypot(px - x1 - t * dx, py - y1 - t * dy)
+
+
+def _in_poly(x, y, pts):
+    inside, j = False, len(pts) - 1
+    for i in range(len(pts)):
+        xi, yi = pts[i]
+        xj, yj = pts[j]
+        if (yi > y) != (yj > y) and \
+                x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-9) + xi:
+            inside = not inside
+        j = i
+    return inside
 
 
 def draw_icon(cv, kind, x, y, ow='white', s=1.0):
@@ -1119,12 +1344,14 @@ class Editor(object):
         # model
         self.nodes, self.links = {}, {}          # id -> dict
         self.pics = {}                           # id -> picture dict
+        self.walls = {}                          # id -> wall dict
+        self.wall_hits, self.wall_handles = [], []
         self._pic_src, self._pic_tk = {}, {}     # image caches
         self.pic_hits = []
         self.netp = default_net()
         self.next_id = 1
         # state
-        self.sel = None                     # ('node'|'link'|'pic', id)
+        self.sel = None              # ('node'|'link'|'pic'|'wall', id)
         self.tool = 'select'
         self.hover = self.hover_axis = None
         self.mouse = (0, 0)
@@ -1151,6 +1378,11 @@ class Editor(object):
         self.v_labels = tk.BooleanVar(value=True)
         self.v_snap = tk.BooleanVar(value=False)
         self.v_clients = tk.BooleanVar(value=True)
+        self.v_outline = tk.BooleanVar(value=False)
+        self.v_walls = tk.BooleanVar(value=True)
+        self.wall_mode_label = tk.StringVar(value=WALL_MODES[1][1])
+        self.wall_ask = True                     # wall dialog after drawing
+        self.last_wall = default_wall()
         self.link_kind = tk.StringVar(value='wired')
 
         self.build_toolbar()
@@ -1183,32 +1415,44 @@ class Editor(object):
                         ('<Control-o>', self.open), ('<Control-n>', self.new),
                         ('<Control-e>', self.export_py),
                         ('<Control-z>', self.undo), ('<Control-y>', self.redo),
+                        ('<Control-d>', self.duplicate_wall),
                         ('<Control-Z>', self.redo)):
             root.bind(seq, lambda e, f=fn: (f(), 'break')[1])
         root.protocol('WM_DELETE_WINDOW', self.on_close)
 
         self.set_tool('select')
+        self.on_toggle()
         if path:
             self.open_path(path)
         self.update_title()
         root.after(80, self.fit)
 
     # --------------------------------------------------------- toolbar ----
-    def _btn(self, parent, text, cmd, accent=False, side='left'):
+    def _btn(self, parent, text, cmd, accent=False, side='left', width=None):
         b = self.tk.Button(parent, text=text, command=cmd, relief='flat',
                            bg=C['ap'] if accent else 'white',
                            fg='white' if accent else C['text'],
                            activebackground=C['ap_ring'] if accent
-                           else C['grid'], padx=7, pady=2)
+                           else C['grid'], padx=6, pady=1)
+        if width:
+            b.config(width=width)
         b.pack(side=side, padx=2, pady=1)
         return b
 
-    def _group(self, caption):
-        """A captioned toolbar group (wraps as one block)."""
+    def _group(self, bar, caption, inline=False):
+        """Captioned toolbar group (wraps as one block).
+        inline=True puts the caption on the left (slim view bar)."""
         tk = self.tk
-        outer = self.toolbar.group()
+        outer = bar.group()
         tk.Frame(outer, width=1, bg=C['grid_major']).pack(side='right',
                                                           fill='y', padx=(8, 0))
+        if inline:
+            tk.Label(outer, text=caption, bg=C['bar'], fg=C['muted'],
+                     font=('TkDefaultFont', 7, 'bold')).pack(side='left',
+                                                             padx=(0, 6))
+            body = tk.Frame(outer, bg=C['bar'])
+            body.pack(side='left')
+            return body
         col = tk.Frame(outer, bg=C['bar'])
         col.pack(side='left', fill='y')
         tk.Label(col, text=caption, bg=C['bar'], fg=C['muted'],
@@ -1228,6 +1472,17 @@ class Editor(object):
             cv.create_polygon(6, 19, 13, 10, 18, 16, 21, 13, 25, 19,
                               fill=C['y'], outline='')
             cv.create_oval(19, 5, 24, 10, fill=C['sta'], outline='')
+        elif what == 'wall':
+            col = WALL_MATERIALS['brick'][1]
+            cv.create_polygon(5, 9, 19, 4, 26, 8, 12, 13, fill=_mix(
+                col, '#ffffff', 0.35), outline=C['text'])
+            cv.create_polygon(5, 9, 12, 13, 12, 22, 5, 18, fill=_mix(
+                col, '#000000', 0.25), outline=C['text'])
+            cv.create_polygon(12, 13, 26, 8, 26, 17, 12, 22, fill=col,
+                              outline=C['text'])
+            for y in (15, 18):
+                cv.create_line(12, y + 1, 26, y - 4, fill=_mix(col, '#ffffff',
+                                                               0.4))
         else:                                                   # link
             cv.create_line(7, 19, 23, 6, fill=C['wired'], width=3)
             for x, y in ((7, 19), (23, 6)):
@@ -1245,7 +1500,7 @@ class Editor(object):
         self._icon(cv, tool)
         cv.pack(side='top')
         lb = tk.Label(f, text=text, bg=C['bar'], fg=C['text'],
-                      font=('TkDefaultFont', 8))
+                      font=('TkDefaultFont', 8), width=8)
         lb.pack(side='top')
         cb = command or (lambda t=tool: self.set_tool(t))
         for w in (f, cv, lb):
@@ -1283,6 +1538,8 @@ class Editor(object):
         em.add_separator()
         em.add_command(label='Inspector', command=self.open_inspector,
                        accelerator='I')
+        em.add_command(label='Duplicate wall', command=self.duplicate_wall,
+                       accelerator='Ctrl+D')
         em.add_command(label='Delete selection', command=self.delete_selection,
                        accelerator='Del')
         m.add_cascade(label='Edit', menu=em)
@@ -1295,21 +1552,36 @@ class Editor(object):
             im.add_command(label='%s link' % LINK_LABEL[lk],
                            command=lambda k=lk: self.pick_link(k))
         im.add_separator()
+        im.add_command(label='Wall (drag a zone)',
+                       command=lambda: self.set_tool('wall'), accelerator='W')
         im.add_command(label='Picture...', command=self.insert_picture,
                        accelerator='P')
         m.add_cascade(label='Insert', menu=im)
-        vm = tk.Menu(m, tearoff=0)
+        vm = self.view_menu = tk.Menu(m, tearoff=0)
         vm.add_command(label='3D view', command=self.view_3d, accelerator='3')
         vm.add_command(label='Top view', command=self.view_top,
                        accelerator='T')
         vm.add_command(label='Fit', command=self.fit, accelerator='F')
         vm.add_separator()
         for label, var in self.toggles:
-            vm.add_checkbutton(label=label, variable=var, command=self.redraw)
+            vm.add_checkbutton(label=label, variable=var,
+                               command=self.on_toggle)
+        vm.add_separator()
+        for key, label in WALL_MODES:
+            vm.add_radiobutton(label=label, value=label,
+                               variable=self.wall_mode_label,
+                               command=self.redraw)
         m.add_cascade(label='View', menu=vm)
         hm = tk.Menu(m, tearoff=0)
         hm.add_command(label='Mouse & keys', command=lambda: self.mb.showinfo(
             'Mouse & keys', HELP_TEXT, parent=self.root))
+        hm.add_command(label='Wall materials', command=lambda: self.mb.showinfo(
+            'Wall materials', '\n'.join(
+                '%-9s %5s dB' % (m_, fmt_num(WALL_MATERIALS[m_][0]))
+                for m_ in MATERIAL_ORDER if m_ != 'custom') +
+            '\n\nTypical attenuation per wall at 2.4 GHz (5 GHz is usually '
+            'a few dB worse). Choose "custom" to type your own value.',
+            parent=self.root))
         m.add_cascade(label='Help', menu=hm)
         self.root.config(menu=m)
 
@@ -1317,45 +1589,73 @@ class Editor(object):
         self.link_kind.set(kind)
         self.set_tool('link')
 
+    def wall_mode(self):
+        lab = self.wall_mode_label.get()
+        for k, l in WALL_MODES:
+            if l == lab:
+                return k
+        return 'solid'
+
+    def on_toggle(self):
+        """A SHOW checkbox changed: keep dependent controls in sync."""
+        if self.v_ranges.get():
+            self.cb_outline.grid()
+        else:
+            self.cb_outline.grid_remove()
+        st = 'normal' if self.v_ranges.get() else 'disabled'
+        try:
+            idx = self.view_menu.index('Ranges: outline only')
+            self.view_menu.entryconfig(idx, state=st)
+        except Exception:
+            pass
+        st = 'readonly' if self.v_walls.get() else 'disabled'
+        self.cb_wallmode.config(state=st)
+        self.redraw()
+
     def build_toolbar(self):
-        """Ribbon of captioned groups. Groups wrap onto new rows when the
-        window is too narrow, so every control stays reachable."""
+        """Two bars. Top: editing ribbon (FILE, EDIT, ADD, CONNECT, BUILD).
+        Bottom: slim view bar (VIEW, SHOW, WALLS, RANGE). Groups wrap onto
+        new rows when the window is too narrow."""
         tk, ttk = self.tk, self.ttk
-        self.toggles = (('Ranges', self.v_ranges), ('Sphere', self.v_sphere),
+        self.toggles = (('Ranges', self.v_ranges),
+                        ('Ranges: outline only', self.v_outline),
+                        ('Sphere', self.v_sphere),
                         ('Labels', self.v_labels),
                         ('AP clients', self.v_clients),
+                        ('Walls', self.v_walls),
                         ('Snap %g m' % self.SNAP, self.v_snap))
         self.build_menu()
-        self.toolbar = _FlowBar(tk, self.root, C['bar'])
-        self.toolbar.frame.pack(fill='x')
         self.tool_widgets = {}
 
-        g = self._group('FILE')
+        # ---- editing ribbon
+        top = self.toolbar = _FlowBar(tk, self.root, C['bar'])
+        top.frame.pack(fill='x')
+
+        g = self._group(top, 'FILE')
         r1, r2 = tk.Frame(g, bg=C['bar']), tk.Frame(g, bg=C['bar'])
         r1.pack(anchor='w'); r2.pack(anchor='w')
-        for text, cmd in (('New', self.new), ('Open', self.open),
-                          ('Save', self.save)):
-            self._btn(r1, text, cmd)
-        for text, cmd in (('Save as', self.save_as),
-                          ('Export .py', self.export_py)):
-            self._btn(r2, text, cmd)
+        self._btn(r1, 'New', self.new, width=5)
+        self._btn(r1, 'Open', self.open, width=5)
+        self._btn(r1, 'Save', self.save, width=5)
+        self._btn(r2, 'Save as', self.save_as, width=8)
+        self._btn(r2, 'Export .py', self.export_py, width=8)
 
-        g = self._group('EDIT')
+        g = self._group(top, 'EDIT')
         r1, r2 = tk.Frame(g, bg=C['bar']), tk.Frame(g, bg=C['bar'])
         r1.pack(anchor='w'); r2.pack(anchor='w')
-        self._btn(r1, 'Inspector', self.open_inspector, accent=True)
-        self._btn(r1, 'Delete', self.delete_selection)
-        self._btn(r2, 'Undo', self.undo)
-        self._btn(r2, 'Redo', self.redo)
+        self._btn(r1, 'Inspector', self.open_inspector, accent=True, width=8)
+        self._btn(r1, 'Delete', self.delete_selection, width=6)
+        self._btn(r2, 'Undo', self.undo, width=8)
+        self._btn(r2, 'Redo', self.redo, width=6)
 
-        g = self._group('DEVICES  (click the grid to place)')
+        g = self._group(top, 'ADD DEVICE  (click the grid)')
         self._tool(g, 'select', 'Select')
         for kind, text in (('ap', 'AP'), ('sta', 'Station'), ('car', 'Car'),
                            ('host', 'Host'), ('switch', 'Switch'),
                            ('ctrl', 'Controller')):
             self._tool(g, kind, text)
 
-        g = self._group('CONNECT  (drag device to device)')
+        g = self._group(top, 'CONNECT  (drag device to device)')
         self._tool(g, 'link', 'Link')
         col = tk.Frame(g, bg=C['bar'])
         col.pack(side='left', padx=(2, 0))
@@ -1372,41 +1672,80 @@ class Editor(object):
             text=LINK_HELP[self.link_kind.get()]))
         self.link_help.config(text=LINK_HELP['wired'])
 
-        g = self._group('PICTURE')
-        self._tool(g, 'picture', 'Insert', command=self.insert_picture)
+        g = self._group(top, 'BUILD')
+        self._tool(g, 'wall', 'Wall')
+        self._tool(g, 'picture', 'Picture', command=self.insert_picture)
 
-        g = self._group('VIEW')
-        r1, r2 = tk.Frame(g, bg=C['bar']), tk.Frame(g, bg=C['bar'])
-        r1.pack(anchor='w'); r2.pack(anchor='w')
-        self._btn(r1, '3D', self.view_3d)
-        self._btn(r1, 'Top', self.view_top)
-        self._btn(r2, 'Fit', self.fit)
+        # ---- slim view bar
+        vb = _FlowBar(tk, self.root, _mix(C['bar'], '#ffffff', 0.45),
+                      gap=10, vgap=3)
+        self.viewbar = vb
+        vb.frame.pack(fill='x')
+        vbg = vb.bg
 
-        g = self._group('SHOW')
-        for i, (text, var) in enumerate(self.toggles):
-            tk.Checkbutton(g, text=text, variable=var, bg=C['bar'],
-                           activebackground=C['bar'], highlightthickness=0,
-                           font=('TkDefaultFont', 9),
-                           command=self.redraw).grid(row=i % 2, column=i // 2,
-                                                     sticky='w', padx=2)
+        def checkbox(parent, text, var, **grid):
+            c = tk.Checkbutton(parent, text=text, variable=var, bg=vbg,
+                               activebackground=vbg, highlightthickness=0,
+                               font=('TkDefaultFont', 9),
+                               command=self.on_toggle)
+            c.grid(**grid)
+            return c
 
-        g = self._group('RANGE  (selected device)')
-        top = tk.Frame(g, bg=C['bar'])
-        top.pack(side='top', fill='x')
-        self.range_name = tk.Label(top, text='select an AP, station or car',
-                                   bg=C['bar'], fg=C['muted'], anchor='w',
+        g = self._group_v(vb, 'VIEW')
+        self._btn(g, '3D', self.view_3d, width=3)
+        self._btn(g, 'Top', self.view_top, width=3)
+        self._btn(g, 'Fit', self.fit, width=3)
+
+        g = self._group_v(vb, 'SHOW')
+        checkbox(g, 'Ranges', self.v_ranges, row=0, column=0, sticky='w')
+        self.cb_outline = checkbox(g, 'outline only', self.v_outline, row=0,
+                                   column=1, sticky='w')
+        checkbox(g, 'Sphere', self.v_sphere, row=0, column=2, sticky='w')
+        checkbox(g, 'Labels', self.v_labels, row=0, column=3, sticky='w')
+        checkbox(g, 'AP clients', self.v_clients, row=0, column=4,
+                 sticky='w')
+        checkbox(g, 'Snap %g m' % self.SNAP, self.v_snap, row=0, column=5,
+                 sticky='w')
+
+        g = self._group_v(vb, 'WALLS')
+        checkbox(g, 'Show', self.v_walls, row=0, column=0, sticky='w')
+        tk.Label(g, text='camera:', bg=vbg, fg=C['muted'],
+                 font=('TkDefaultFont', 8)).grid(row=0, column=1, padx=(6, 2))
+        self.cb_wallmode = ttk.Combobox(
+            g, textvariable=self.wall_mode_label, state='readonly', width=22,
+            values=[l for _, l in WALL_MODES])
+        self.cb_wallmode.grid(row=0, column=2)
+        self.cb_wallmode.bind('<<ComboboxSelected>>', lambda e: (
+            self.redraw(), self.canvas.focus_set()))
+
+        g = self._group_v(vb, 'RANGE')
+        self.range_name = tk.Label(g, text='select an AP, station or car',
+                                   bg=vbg, fg=C['muted'], anchor='w', width=20,
                                    font=('TkDefaultFont', 9))
         self.range_name.pack(side='left')
-        self.range_val = tk.Label(top, text='', bg=C['bar'], fg=C['text'],
-                                  anchor='e', font=('TkDefaultFont', 10, 'bold'))
-        self.range_val.pack(side='right')
         self.slider = tk.Scale(g, from_=0, to=300, orient='horizontal',
-                               length=210, resolution=1, showvalue=0,
+                               length=170, resolution=1, showvalue=0,
                                bg=C['ap_ring'], highlightthickness=0, bd=1,
                                troughcolor='white', sliderrelief='flat',
                                activebackground=C['ap'], sliderlength=14,
-                               width=12, command=self.on_slider)
-        self.slider.pack(side='top', pady=(3, 0))
+                               width=11, command=self.on_slider)
+        self.slider.pack(side='left', padx=4)
+        self.range_val = tk.Label(g, text='', bg=vbg, fg=C['text'], width=6,
+                                  anchor='w', font=('TkDefaultFont', 9, 'bold'))
+        self.range_val.pack(side='left')
+
+    def _group_v(self, bar, caption):
+        """Inline-captioned group for the view bar (uses the bar colour)."""
+        tk = self.tk
+        outer = bar.group()
+        tk.Frame(outer, width=1, bg=C['grid_major']).pack(side='right',
+                                                          fill='y', padx=(8, 0))
+        tk.Label(outer, text=caption, bg=bar.bg, fg=C['muted'],
+                 font=('TkDefaultFont', 7, 'bold')).pack(side='left',
+                                                         padx=(0, 6))
+        body = tk.Frame(outer, bg=bar.bg)
+        body.pack(side='left')
+        return body
 
     def set_tool(self, tool):
         self.tool = tool
@@ -1542,6 +1881,9 @@ class Editor(object):
             del self.pics[oid]
             self._pic_tk.pop(oid, None)
             self.msg = 'Deleted picture.'
+        elif kind == 'wall' and oid in self.walls:
+            self.msg = 'Deleted wall %s.' % self.walls[oid]['name']
+            del self.walls[oid]
         self.sel = None
         self.changed()
 
@@ -1565,14 +1907,34 @@ class Editor(object):
                     continue
                 if i in busy and int(n['p'].get('wlans') or 1) <= 1:
                     continue
-                best, bd = None, None
+                best, br = None, None
                 for a in res:
-                    d = math.dist(n['xyz'], self.nodes[a]['xyz'])
-                    if d <= self.rng(self.nodes[a]) and (bd is None or d < bd):
-                        best, bd = a, d
+                    r = self.est_rssi(n, self.nodes[a])[0]
+                    if r >= self.noise_th() and (br is None or r > br):
+                        best, br = a, r
                 if best is not None:
                     res[best].append((i, 'auto'))
         return res
+
+    def noise_th(self):
+        v = self.netp.get('noise_th')
+        return -91.0 if v is None else float(v)
+
+    def est_rssi(self, sta, ap):
+        """Estimated RSSI (dBm) at sta from ap, with wall losses.
+        Log-distance model like Mininet-WiFi: the AP range is the distance
+        where the signal reaches the noise threshold, so
+            rssi = noise_th + 10 * exp * log10(range / d) - walls.
+        Returns (rssi, wall dB, walls crossed)."""
+        exp = self.netp.get('exp') or 3.0
+        d = max(math.dist(sta['xyz'], ap['xyz']), 0.1)
+        r = max(self.rng(ap), 0.1)
+        loss, hit = wall_loss(list(self.walls.values()), sta['xyz'], ap['xyz'])
+        rssi = self.noise_th() + 10 * float(exp) * math.log10(r / d) - loss
+        return rssi, loss, hit
+
+    def link_ok(self, sta, ap):
+        return self.est_rssi(sta, ap)[0] >= self.noise_th()
 
     def client_of(self, nid, assoc=None):
         """[(ap id, how)] a station / car is connected to."""
@@ -1590,13 +1952,106 @@ class Editor(object):
         for i, how in lst:
             n = self.nodes[i]
             d = math.dist(n['xyz'], ap['xyz'])
-            lines.append('  %s  -  %s, %s m%s' % (
-                n['name'], 'Wi-Fi link' if how == 'link' else 'auto (in range)',
-                fmt_num(round(d, 1)),
-                '  OUT OF RANGE' if d > self.rng(ap) else ''))
+            rssi, loss, hit = self.est_rssi(n, ap)
+            lines.append('  %s  -  %s, %s m, est. %d dBm%s%s' % (
+                n['name'], 'Wi-Fi link' if how == 'link' else 'auto',
+                fmt_num(round(d, 1)), round(rssi),
+                ('  (%d wall%s, -%s dB)' % (len(hit), '' if len(hit) == 1
+                                            else 's', fmt_num(loss)))
+                if hit else '',
+                '  NO SIGNAL' if rssi < self.noise_th() else ''))
         return '\n'.join(lines)
 
     # -------------------------------------------------------- pictures ----
+    # ----------------------------------------------------------- walls ----
+    def sel_wall(self):
+        if self.sel and self.sel[0] == 'wall':
+            return self.walls.get(self.sel[1])
+        return None
+
+    def unique_wall_name(self):
+        names = set(w['name'] for w in self.walls.values())
+        i = 1
+        while 'wall%d' % i in names:
+            i += 1
+        return 'wall%d' % i
+
+    def add_wall(self, w):
+        self.push_undo()
+        wid = self.next_id
+        self.next_id += 1
+        w['id'] = wid
+        self.walls[wid] = w
+        self.msg = ('Added %s (%s, %s dB%s). Drag it to move; handles: ends '
+                    '= length, side = thickness, round = rotate, top = height.'
+                    % (w['name'], w['material'], fmt_num(w['loss']),
+                       ', %s m high' % fmt_num(w['height'])
+                       if float(w['height']) > 0 else ', flat 2D'))
+        self.select(('wall', wid), quiet=True)
+        self.changed()
+
+    def wall_from_zone(self, p0, p1):
+        (x0, y0), (x1, y1) = p0, p1
+        dx, dy = abs(x1 - x0), abs(y1 - y0)
+        if max(dx, dy) < 0.3:
+            self.msg = 'Wall: press and drag on the ground to draw a zone.'
+            return self.redraw()
+        w = copy.deepcopy(self.last_wall)
+        w.pop('id', None)
+        w['name'] = self.unique_wall_name()
+        w['x'], w['y'] = round((x0 + x1) / 2, 2), round((y0 + y1) / 2, 2)
+        if dx >= dy:
+            w['length'], w['thickness'], w['rotation'] = dx, dy, 0.0
+        else:
+            w['length'], w['thickness'], w['rotation'] = dy, dx, 90.0
+        w['length'] = round(max(w['length'], 0.1), 2)
+        w['thickness'] = round(max(w['thickness'], 0.05), 2)
+        if self.wall_ask:
+            res = WallDialog(self, w).result
+            if res is None:
+                self.msg = 'Wall cancelled.'
+                return self.redraw()
+            w = res
+        keep = dict((k, w[k]) for k in ('material', 'loss', 'color',
+                                         'height', 'z'))
+        self.last_wall.update(keep)
+        self.add_wall(w)
+
+    def duplicate_wall(self):
+        w = self.sel_wall()
+        if not w:
+            self.msg = 'Select a wall to duplicate it.'
+            return self.redraw()
+        n = copy.deepcopy(w)
+        a = math.radians(float(w['rotation']))
+        off = max(float(w['thickness']) * 2, 1.0)
+        n['x'] = round(w['x'] - math.sin(a) * off, 2)
+        n['y'] = round(w['y'] + math.cos(a) * off, 2)
+        n['name'] = self.unique_wall_name()
+        self.add_wall(n)
+
+    def wall_at(self, x, y):
+        for wid, pts in reversed(self.wall_hits):
+            if _in_poly(x, y, pts):
+                return wid
+        return None
+
+    def wall_handle_at(self, x, y):
+        for h in self.wall_handles:
+            if math.hypot(h[1] - x, h[2] - y) <= 8:
+                return h
+        return None
+
+    def walls_crossing(self, w):
+        """Station / car -> AP pairs (links or auto) that cross wall w."""
+        out = []
+        for aid, lst in self.associations().items():
+            for i, how in lst:
+                if wall_crossed(w, self.nodes[i]['xyz'], self.nodes[aid]['xyz']):
+                    out.append('%s -> %s' % (self.nodes[i]['name'],
+                                             self.nodes[aid]['name']))
+        return out
+
     def sel_pic(self):
         if self.sel and self.sel[0] == 'pic':
             return self.pics.get(self.sel[1])
@@ -1727,7 +2182,7 @@ class Editor(object):
     # ------------------------------------------------------------ undo ----
     def snapshot(self):
         return copy.deepcopy((self.nodes, self.links, self.netp,
-                              self.next_id, self.pics))
+                              self.next_id, self.pics, self.walls))
 
     def push_undo(self, key=None):
         """Save state before a change. Edits with the same key in a row
@@ -1740,9 +2195,11 @@ class Editor(object):
         self._undo_key = key
 
     def _restore(self, snap):
-        self.nodes, self.links, self.netp, self.next_id, self.pics = snap
+        (self.nodes, self.links, self.netp, self.next_id, self.pics,
+         self.walls) = snap
         self._undo_key = None
-        pool = {'node': self.nodes, 'link': self.links, 'pic': self.pics}
+        pool = {'node': self.nodes, 'link': self.links, 'pic': self.pics,
+                'wall': self.walls}
         if self.sel and self.sel[1] not in pool[self.sel[0]]:
             self.sel = None
         self.changed()
@@ -1833,9 +2290,13 @@ class Editor(object):
                 max(self.canvas.winfo_height(), 200))
 
     def world_box(self):
-        if not self.nodes and not self.pics:
+        if not self.nodes and not self.pics and not self.walls:
             return 0.0, 0.0, 100.0, 100.0
         xs_lo, xs_hi, ys_lo, ys_hi = [], [], [], []
+        for w in self.walls.values():
+            for x, y in wall_corners(w):
+                xs_lo.append(x); xs_hi.append(x)
+                ys_lo.append(y); ys_hi.append(y)
         for pic in self.pics.values():
             if pic.get('visible', True):
                 for x, y, _ in self.pic_corners(pic):
@@ -1936,6 +2397,25 @@ class Editor(object):
     def on_press(self, e):
         self.canvas.focus_set()
         self.press = (e.x, e.y)
+        w = self.sel_wall()
+        if w and self.tool in ('select', 'wall'):
+            h = self.wall_handle_at(e.x, e.y)
+            if h:
+                c = self.project(w['x'], w['y'], w['z'])
+                u = self.project(w['x'], w['y'], w['z'] + 1.0)
+                mx, my = self.unproject(e.x, e.y, w['z'])
+                self.drag = {'mode': 'wall_' + h[0], 'id': w['id'],
+                             'moved': False, 'w0': dict(w), 'sign': h[3],
+                             'start': (e.x, e.y),
+                             'zv': (u[0] - c[0], u[1] - c[1]),
+                             'a0': math.atan2(my - w['y'], mx - w['x'])}
+                return
+        if self.tool == 'wall':
+            x, y = self.unproject(e.x, e.y, 0.0)
+            p = (self.snap(x), self.snap(y))
+            self.drag = {'mode': 'wall_draw', 'p0': p, 'p1': p,
+                         'moved': False}
+            return
         if self.tool != 'link' and self.sel_node():
             h = self.axis_at(e.x, e.y)
             if h:
@@ -1982,6 +2462,15 @@ class Editor(object):
         if self.tool in KINDS:
             self.add_node(self.tool, e.x, e.y)
             return
+        wid = self.wall_at(e.x, e.y) if self.tool == 'select' else None
+        if wid is not None:
+            if self.sel != ('wall', wid):
+                self.select(('wall', wid))
+            w = self.walls[wid]
+            mx, my = self.unproject(e.x, e.y, w['z'])
+            self.drag = {'mode': 'wall_move', 'id': wid, 'moved': False,
+                         'off': (w['x'] - mx, w['y'] - my)}
+            return
         pid = self.pic_at(e.x, e.y) if self.tool == 'select' else None
         if pid is not None and pic is not None and pid == pic['id'] and \
                 not pic.get('locked'):
@@ -2012,6 +2501,57 @@ class Editor(object):
         elif d['mode'] == 'link':
             d['to'] = (e.x, e.y)
             self.hover = self.node_at(e.x, e.y)
+        elif d['mode'] == 'wall_draw':
+            x, y = self.unproject(e.x, e.y, 0.0)
+            d['p1'] = (self.snap(x), self.snap(y))
+            d['moved'] = d['moved'] or far
+        elif d['mode'].startswith('wall_'):
+            if not d['moved']:
+                if not far:
+                    return
+                d['moved'] = True
+                self.push_undo()
+            w = self.walls.get(d['id'])
+            if w is None:
+                return
+            mx, my = self.unproject(e.x, e.y, w['z'])
+            if d['mode'] == 'wall_move':
+                w['x'] = round(self.snap(mx + d['off'][0]), 2)
+                w['y'] = round(self.snap(my + d['off'][1]), 2)
+            else:
+                w0 = d['w0']
+                a = math.radians(float(w0['rotation']))
+                ux, uy = math.cos(a), math.sin(a)          # along the wall
+                px, py = -uy, ux                           # across
+                if d['mode'] == 'wall_end':
+                    sg = d['sign']
+                    ox = w0['x'] - sg * ux * w0['length'] / 2   # fixed end
+                    oy = w0['y'] - sg * uy * w0['length'] / 2
+                    L = max(self.snap((mx - ox) * ux * sg + (my - oy) * uy * sg),
+                            0.1)
+                    w['length'] = round(L, 2)
+                    w['x'] = round(ox + sg * ux * L / 2, 2)
+                    w['y'] = round(oy + sg * uy * L / 2, 2)
+                elif d['mode'] == 'wall_thick':
+                    t = abs((mx - w0['x']) * px + (my - w0['y']) * py) * 2
+                    w['thickness'] = round(max(t, 0.02), 2)
+                elif d['mode'] == 'wall_rot':
+                    ang = float(w0['rotation']) + math.degrees(
+                        math.atan2(my - w0['y'], mx - w0['x']) - d['a0'])
+                    if e.state & 0x0001:                    # Shift: 15 deg
+                        ang = round(ang / 15.0) * 15.0
+                    w['rotation'] = round((ang + 180) % 360 - 180, 1)
+                elif d['mode'] == 'wall_height':
+                    vx, vy = d['zv']
+                    dx, dy = e.x - d['start'][0], e.y - d['start'][1]
+                    t = (dx * vx + dy * vy) / max(vx * vx + vy * vy, 1e-9)
+                    h = max(float(w0['height']) + t, 0.0)
+                    w['height'] = round(self.snap(h) if self.v_snap.get()
+                                        else h, 2)
+            self.dirty = True
+            self.update_title()
+            if self.inspector:
+                self.inspector.refresh()
         elif d['mode'].startswith('pic_'):
             if not d['moved']:
                 if not far:
@@ -2080,6 +2620,12 @@ class Editor(object):
             self.select(('pic', d['pick']) if d.get('pick') is not None
                         else None)
             return
+        if d['mode'] == 'wall_draw':
+            self.wall_from_zone(d['p0'], d['p1'])
+            return
+        if d['mode'].startswith('wall_') and d['moved']:
+            self.changed()
+            return
         if d['mode'].startswith('pic_') and d['moved']:
             self.changed()
             return
@@ -2101,6 +2647,9 @@ class Editor(object):
             self.open_inspector()
         elif lid:
             self.select(('link', lid))
+            self.open_inspector()
+        elif self.tool == 'select' and self.wall_at(e.x, e.y) is not None:
+            self.select(('wall', self.wall_at(e.x, e.y)))
             self.open_inspector()
         elif self.tool == 'select' and self.pic_at(e.x, e.y) is not None:
             self.select(('pic', self.pic_at(e.x, e.y)))
@@ -2140,7 +2689,8 @@ class Editor(object):
         h = self.axis_at(e.x, e.y) if self.tool != 'link' else None
         axis = h[0] if h else None
         node = None if h else self.node_at(e.x, e.y)
-        ph = self.pic_handle_at(e.x, e.y) if self.tool == 'select' else None
+        ph = (self.pic_handle_at(e.x, e.y) or self.wall_handle_at(e.x, e.y)) \
+            if self.tool in ('select', 'wall') else None
         if ph:
             self.canvas.config(cursor='exchange' if ph[0] == 'rot'
                                else 'sizing')
@@ -2175,6 +2725,8 @@ class Editor(object):
             self.set_tool('link')
         elif k in ('p', 'P'):
             self.insert_picture()
+        elif k in ('w', 'W'):
+            self.set_tool('wall')
         elif k in ('t', 'T'):
             self.view_top()
         elif k == '3':
@@ -2230,15 +2782,17 @@ class Editor(object):
         sel_node = self.sel[1] if self.sel and self.sel[0] == 'node' else None
         sel_link = self.sel[1] if self.sel and self.sel[0] == 'link' else None
         sel_pic = self.sel[1] if self.sel and self.sel[0] == 'pic' else None
+        sel_wall = self.sel[1] if self.sel and self.sel[0] == 'wall' else None
         self._assoc = assoc = self.associations()
 
         for pid in sorted(self.pics):                  # pictures under all
             self.draw_picture(self.pics[pid], pid == sel_pic)
         self.draw_grid()
 
-        # ranges
+        # ranges (outline only = just the boundaries, see what is under)
         if self.v_ranges.get():
             sphere = self.v_sphere.get()
+            outline = self.v_outline.get()
             order = sorted(self.nodes.values(), key=lambda n: n['kind'] != 'ap')
             for n in order:
                 r = self.rng(n)
@@ -2249,7 +2803,10 @@ class Editor(object):
                 col = C['ap'] if is_ap else C[n['kind']]
                 wd = 2.8 if n['id'] == sel_node else (1.5 if is_ap else 1.2)
                 if sphere:
-                    if is_ap:
+                    if is_ap and outline:
+                        self.sphere(p, r, col, width=wd, rings=(0,),
+                                    meridians=0)
+                    elif is_ap:
                         self.sphere(p, r, col, width=wd, fill=C['ap_fill'])
                     else:
                         self.sphere(p, r, col, width=wd, dash=(4, 4),
@@ -2257,11 +2814,16 @@ class Editor(object):
                 else:
                     pts = self.circle_pts(*p, r)
                     if is_ap:
-                        cv.create_polygon(pts, fill=C['ap_fill'], outline='')
+                        if not outline:
+                            cv.create_polygon(pts, fill=C['ap_fill'],
+                                              outline='')
                         cv.create_polygon(pts, fill='', outline=col, width=wd)
                     else:
                         cv.create_polygon(pts, fill='', outline=col, width=wd,
                                           dash=(4, 4))
+
+        # walls: flat ones are drawn now, 3D faces are depth-sorted below
+        wall_items = self.wall_items(pos, sel_wall)
 
         # height stems + ground shadows
         for nid, p in pos.items():
@@ -2300,7 +2862,8 @@ class Editor(object):
                                capstyle='round')
             if l['kind'] == 'wifi':
                 ap = self.nodes[l['b']]
-                ok = math.dist(pos[l['a']], pos[l['b']]) <= self.rng(ap)
+                rssi, wl, whit = self.est_rssi(self.nodes[l['a']], ap)
+                ok = rssi >= self.noise_th()
                 col = C['rf'] if ok else C['rf_bad']
                 cv.create_line(x1, y1, x2, y2, fill=C['rf_glow'] if ok
                                else '#f3d0cc', width=7, capstyle='round')
@@ -2313,7 +2876,9 @@ class Editor(object):
                                   outline=col, width=2)
                 cv.create_oval(mx - 1.5, my + 1.5, mx + 1.5, my + 4.5,
                                fill=col, outline='')
-                txt = 'Wi-Fi' if ok else 'Wi-Fi  OUT OF RANGE'
+                txt = 'Wi-Fi  %d dBm%s%s' % (
+                    round(rssi), ('  (-%s dB walls)' % fmt_num(wl)) if whit
+                    else '', '' if ok else '  NO SIGNAL')
                 if labels:
                     cv.create_text(mx, my - 14, text=txt, fill=col,
                                    font=('TkDefaultFont', 8, 'bold'))
@@ -2354,12 +2919,41 @@ class Editor(object):
             cv.create_line(x1, y1, d['to'][0], d['to'][1], fill=col, width=2,
                            dash=(4, 3))
 
-        # nodes, far ones first
+        # nodes and 3D wall faces together, far ones first (painter)
         self.hits = []
-        order = sorted(pos.items(), key=lambda kv: -self.project(*kv[1])[2])
-        for nid, p in order:
-            sx, sy, _ = self.project(*p)
-            self.draw_node(self.nodes[nid], sx, sy, nid == sel_node)
+        items = list(wall_items)
+        for nid, p in pos.items():
+            sx, sy, dd = self.project(*p)
+            items.append((dd, 'node', nid, sx, sy))
+        items.sort(key=lambda it: -it[0])
+        for it in items:
+            if it[1] == 'node':
+                self.draw_node(self.nodes[it[2]], it[3], it[4],
+                               it[2] == sel_node)
+            else:
+                it[2]()
+                self.wall_hits.append((it[3], it[4]))
+        for fn in self._wall_late:                  # labels, ghost tops
+            fn()
+
+        # wall being drawn
+        d = self.drag
+        if d and d.get('mode') == 'wall_draw':
+            (x0, y0), (x1, y1) = d['p0'], d['p1']
+            pts = [self.project(x, y, 0)[:2] for x, y in
+                   ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
+            col = self.last_wall.get('color') or C['wired']
+            cv.create_polygon([v for q in pts for v in q], fill=col,
+                              stipple='gray50', outline=C['select'],
+                              dash=(4, 3), width=1.5)
+            cx = sum(q[0] for q in pts) / 4
+            cy = sum(q[1] for q in pts) / 4
+            cv.create_text(cx, cy, text='%s x %s m' % (
+                fmt_num(abs(x1 - x0)), fmt_num(abs(y1 - y0))),
+                fill=C['text'], font=('TkDefaultFont', 9, 'bold'))
+        self.wall_handles = []
+        if sel_wall in self.walls and self.tool in ('select', 'wall'):
+            self.draw_wall_handles(self.walls[sel_wall])
 
         # local axes of the selected device
         self.axis_hits = []
@@ -2371,6 +2965,171 @@ class Editor(object):
 
         self.draw_overlay()
         self.update_status()
+
+    def view_grad(self):
+        """World vector pointing away from the camera (depth gradient)."""
+        sy, cy = math.sin(self.yaw), math.cos(self.yaw)
+        sp, cp = math.sin(self.pitch), math.cos(self.pitch)
+        return (sy * sp, cy * sp, -cp)
+
+    @staticmethod
+    def box_faces(cs, z0, z1, rot):
+        a = math.radians(rot)
+        ux, uy = math.cos(a), math.sin(a)
+        px, py = -uy, ux
+        c0, c1, c2, c3 = cs
+        return [
+            ([c + (z1,) for c in cs], (0, 0, 1), 'top'),
+            ([c + (z0,) for c in reversed(cs)], (0, 0, -1), 'bottom'),
+            ([c0 + (z0,), c1 + (z0,), c1 + (z1,), c0 + (z1,)], (-px, -py, 0),
+             'side'),
+            ([c1 + (z0,), c2 + (z0,), c2 + (z1,), c1 + (z1,)], (ux, uy, 0),
+             'side'),
+            ([c2 + (z0,), c3 + (z0,), c3 + (z1,), c2 + (z1,)], (px, py, 0),
+             'side'),
+            ([c3 + (z0,), c0 + (z0,), c0 + (z1,), c3 + (z1,)], (-ux, -uy, 0),
+             'side'),
+        ]
+
+    def wall_items(self, pos, sel_wall):
+        """Draws flat (2D) walls now; returns depth-sorted items for the
+        faces of 3D walls. Camera modes: solid, fade (walls in front of the
+        camera become see-through), cutaway (lowered to a stub, like in
+        building games), outline."""
+        cv = self.canvas
+        self.wall_hits, self._wall_late = [], []
+        items = []
+        if not self.v_walls.get() or not self.walls:
+            return items
+        mode = self.wall_mode()
+        g = self.view_grad()
+        tdepth = self.project(*self.target)[2]
+        light = (-0.40, -0.55, 0.73)
+        labels = self.v_labels.get()
+        node_scr = [self.project(*p) for p in pos.values()]
+        tilted = self.pitch > math.radians(8)
+        for wid, w in sorted(self.walls.items()):
+            col = w.get('color') or '#999999'
+            dark = _mix(col, '#000000', 0.4)
+            glass = w.get('material') == 'glass'
+            sel = wid == sel_wall
+            h, z0 = float(w['height']), float(w['z'])
+            cs = wall_corners(w)
+            if h <= 0:                                   # flat 2D wall
+                pts = [self.project(x, y, z0)[:2] for x, y in cs]
+                cv.create_polygon([v for q in pts for v in q],
+                                  fill='' if mode == 'outline' else col,
+                                  stipple='gray50',
+                                  outline=C['ap'] if sel else dark,
+                                  width=2.2 if sel else 1.2)
+                self.wall_hits.append((wid, pts))
+                if labels:
+                    cx = sum(q[0] for q in pts) / 4
+                    cy = sum(q[1] for q in pts) / 4
+                    self._wall_late.append(lambda cx=cx, cy=cy, w=w, d=dark:
+                                           self.wall_label(w, cx, cy, d))
+                continue
+            faces = [f for f in self.box_faces(cs, z0, z0 + h, w['rotation'])
+                     if f[1][0] * g[0] + f[1][1] * g[1] + f[1][2] * g[2]
+                     < -1e-6]
+            scr = [[self.project(*c) for c in f[0]] for f in faces]
+            front = False
+            if mode in ('fade', 'cutaway') and tilted:
+                cdepth = self.project(w['x'], w['y'], z0 + h / 2)[2]
+                if cdepth < tdepth - 0.5:
+                    front = True
+                else:
+                    polys = [[q[:2] for q in sp] for sp in scr]
+                    for sx, sy, dd in node_scr:
+                        if dd > cdepth and any(_in_poly(sx, sy, pp)
+                                               for pp in polys):
+                            front = True
+                            break
+            top_h = h
+            if front and mode == 'cutaway':
+                top_h = min(h, 0.35)
+                faces = [f for f in self.box_faces(cs, z0, z0 + top_h,
+                                                   w['rotation'])
+                         if f[1][0] * g[0] + f[1][1] * g[1] +
+                         f[1][2] * g[2] < -1e-6]
+                scr = [[self.project(*c) for c in f[0]] for f in faces]
+                ghost = [self.project(x, y, z0 + h)[:2] for x, y in cs]
+                self._wall_late.append(
+                    lambda gp=ghost, d=dark: self.canvas.create_polygon(
+                        [v for q in gp for v in q], fill='', outline=d,
+                        dash=(2, 4)))
+            for f, sp in zip(faces, scr):
+                n = f[1]
+                if f[2] == 'top':
+                    fill = _mix(col, '#ffffff', 0.2)
+                else:
+                    k = 0.62 + 0.38 * max(0.0, n[0] * light[0] +
+                                          n[1] * light[1] + n[2] * light[2])
+                    fill = _mix('#000000', col, k)
+                stipple, dash = '', None
+                if mode == 'outline':
+                    fill = ''
+                elif front and mode == 'fade':
+                    stipple, dash = 'gray12', (3, 3)
+                elif glass:
+                    stipple = 'gray50'
+                pts = [q[:2] for q in sp]
+                depth = sum(q[2] for q in sp) / len(sp)
+                flat = [v for q in pts for v in q]
+
+                def draw(flat=flat, fill=fill, stipple=stipple, dash=dash,
+                         sel=sel, dark=dark):
+                    kw = {'stipple': stipple} if stipple and fill else {}
+                    self.canvas.create_polygon(
+                        flat, fill=fill, outline=C['ap'] if sel else dark,
+                        width=2.2 if sel else 1, dash=dash, **kw)
+                items.append((depth, 'face', draw, wid, pts))
+            if labels:
+                lx, ly, _ = self.project(w['x'], w['y'], z0 + top_h)
+                self._wall_late.append(lambda lx=lx, ly=ly, w=w, d=dark:
+                                       self.wall_label(w, lx, ly - 9, d))
+        return items
+
+    def wall_label(self, w, x, y, col):
+        self.canvas.create_text(
+            x, y, text='%s · %s %s dB' % (w['name'], w['material'],
+                                          fmt_num(w['loss'])),
+            fill=col, font=('TkDefaultFont', 8, 'bold'))
+
+    def draw_wall_handles(self, w):
+        """Ends: length. Side: thickness. Round: rotate. Top: height."""
+        cv = self.canvas
+        a = math.radians(float(w['rotation']))
+        ux, uy = math.cos(a), math.sin(a)
+        px, py = -uy, ux
+        h, z0 = float(w['height']), float(w['z'])
+        zm = z0 + h / 2
+        L, T = float(w['length']) / 2, float(w['thickness']) / 2
+        c = self.project(w['x'], w['y'], zm)
+        for sg in (1, -1):
+            x, y, _ = self.project(w['x'] + sg * ux * L, w['y'] + sg * uy * L,
+                                   zm)
+            cv.create_rectangle(x - 5, y - 5, x + 5, y + 5, fill='white',
+                                outline=C['ap'], width=2)
+            self.wall_handles.append(('end', x, y, sg))
+        x, y, _ = self.project(w['x'] + px * T, w['y'] + py * T, zm)
+        cv.create_oval(x - 4, y - 4, x + 4, y + 4, fill='white',
+                       outline=C['ap'], width=2)
+        self.wall_handles.append(('thick', x, y, 0))
+        dx, dy = x - c[0], y - c[1]
+        Ls = math.hypot(dx, dy) or 1
+        if Ls < 2:
+            dx, dy, Ls = 0, -1, 1
+        rx, ry = x + dx / Ls * 26, y + dy / Ls * 26
+        cv.create_line(x, y, rx, ry, fill=C['ap'], width=2)
+        cv.create_oval(rx - 6, ry - 6, rx + 6, ry + 6, fill=C['ap'],
+                       outline='white', width=2)
+        self.wall_handles.append(('rot', rx, ry, 0))
+        if self.pitch > math.radians(8):                 # height handle
+            tx, ty, _ = self.project(w['x'], w['y'], z0 + h)
+            cv.create_polygon(tx, ty - 8, tx + 6, ty, tx, ty + 8, tx - 6, ty,
+                              fill=C['z'], outline='white', width=1.5)
+            self.wall_handles.append(('height', tx, ty, 0))
 
     def draw_picture(self, pic, selected):
         """Draw a picture lying on the plane z = pic['z'].
@@ -2598,7 +3357,9 @@ class Editor(object):
                                     ('Wi-Fi', None, C['rf'], 2.5),
                                     ('Auto Wi-Fi', (2, 4), C['rf'], 1.5),
                                     ('Ad-hoc / mesh', (6, 4), C['rf'], 2),
-                                    ('Control', (6, 4), C['control'], 2)):
+                                    ('Control', (6, 4), C['control'], 2),
+                                    ('Wall', None, WALL_MATERIALS['brick'][1],
+                                     6)):
             cv.create_line(x, y, x + 24, y, fill=col, width=wd, dash=dash)
             cv.create_text(x + 30, y, text=text, anchor='w', fill=C['text'],
                            font=('TkDefaultFont', 9))
@@ -2639,6 +3400,13 @@ class Editor(object):
                 self.nodes[a]['name'] + (' (Wi-Fi link)' if how == 'link'
                                          else ' (auto)')
                 for a, how in conn) if conn else 'nothing'))
+            for a, how in conn:
+                rssi, wl, hit = self.est_rssi(n, self.nodes[a])
+                lines.append('est. RSSI from %s: %d dBm%s' % (
+                    self.nodes[a]['name'], round(rssi),
+                    ('  (%d wall%s, -%s dB)' % (len(hit), '' if len(hit) == 1
+                                                else 's', fmt_num(wl)))
+                    if hit else ''))
         if p.get('ip'):
             lines.append('ip: %s' % p['ip'])
         mx, my = self.mouse
@@ -2682,6 +3450,17 @@ class Editor(object):
                 c = len(self.associations().get(n['id'], []))
                 s += '   %d connected device%s' % (c, '' if c == 1 else 's')
             lines.append(s)
+        elif self.sel_wall():
+            w = self.sel_wall()
+            lines.append('%s   %s, -%s dB   %s x %s m%s   at %s, %s   '
+                         'rotation %s deg   crossed by %d connection(s)' % (
+                             w['name'], w['material'], fmt_num(w['loss']),
+                             fmt_num(w['length']), fmt_num(w['thickness']),
+                             (' x %s m high' % fmt_num(w['height']))
+                             if float(w['height']) > 0 else ' (flat 2D)',
+                             fmt_num(w['x']), fmt_num(w['y']),
+                             fmt_num(w['rotation']),
+                             len(self.walls_crossing(w))))
         elif self.sel_pic():
             pc = self.sel_pic()
             lines.append('picture %s   center %s, %s   floor z %s   width %s m'
@@ -2707,6 +3486,11 @@ class Editor(object):
                      ('   %d link%s' % (len(self.links),
                                         '' if len(self.links) == 1 else 's')
                       if self.links else ''))
+        if self.walls and self.netp.get('wmediumd') and \
+                self.netp.get('interference'):
+            lines.append('Walls: Mininet-WiFi ignores them in wmediumd '
+                         'interference mode. Untick "Interference mode" in '
+                         'Network settings to simulate them.')
         if not counts.get('ctrl') and (counts.get('ap') or
                                        counts.get('switch')):
             lines.append('No controller: APs / switches will be saved as '
@@ -2740,8 +3524,10 @@ class Editor(object):
                  for _, l in sorted(self.links.items())]
         pics = [dict((k, pc[k]) for k in PIC_KEYS)
                 for _, pc in sorted(self.pics.items())]
+        walls = [dict((k, w[k]) for k in WALL_KEYS)
+                 for _, w in sorted(self.walls.items())]
         return {'net': copy.deepcopy(self.netp), 'nodes': nodes,
-                'links': links, 'pictures': pics}
+                'links': links, 'pictures': pics, 'walls': walls}
 
     def from_doc(self, doc):
         self.nodes, self.links, self.next_id = {}, {}, 1
@@ -2773,6 +3559,14 @@ class Editor(object):
             pic.update(pc)
             pic['id'] = pid
             self.pics[pid] = pic
+        self.walls = {}
+        for w in doc.get('walls') or []:
+            wid = self.next_id
+            self.next_id += 1
+            ww = default_wall()
+            ww.update(w)
+            ww['id'] = wid
+            self.walls[wid] = ww
         self.sel = None
         self.undo_stack, self.redo_stack, self._undo_key = [], [], None
 
@@ -2939,6 +3733,160 @@ class Editor(object):
         self.root.mainloop()
 
 
+class WallDialog(object):
+    """Modal dialog shown after drawing a wall zone. .result is the wall
+    dict, or None when cancelled."""
+
+    def __init__(self, ed, wall):
+        tk, ttk = ed.tk, ed.ttk
+        self.ed, self.result = ed, None
+        w = self.w = dict(wall)
+        top = self.top = tk.Toplevel(ed.root)
+        top.title('New wall')
+        top.configure(bg=C['bg'])
+        top.transient(ed.root)
+        top.resizable(False, False)
+        head = tk.Frame(top, bg=C['bar'], padx=12, pady=8)
+        head.pack(fill='x')
+        ic = tk.Canvas(head, width=30, height=24, bg=C['bar'],
+                       highlightthickness=0)
+        ed._icon(ic, 'wall')
+        ic.pack(side='left')
+        tk.Label(head, text='Wall properties', bg=C['bar'], fg=C['text'],
+                 font=('TkDefaultFont', 12, 'bold')).pack(side='left', padx=8)
+        tk.Label(head, text='%s x %s m zone' % (fmt_num(w['length']),
+                                               fmt_num(w['thickness'])),
+                 bg=C['bar'], fg=C['muted']).pack(side='right')
+        body = tk.Frame(top, bg=C['bg'], padx=14, pady=8)
+        body.pack(fill='both')
+        body.columnconfigure(1, weight=1)
+        self.v = {}
+        r = [0]
+
+        def row(label, widget, hint=''):
+            tk.Label(body, text=label, bg=C['bg'], fg=C['text'],
+                     anchor='w').grid(row=r[0], column=0, sticky='w',
+                                      pady=3, padx=(0, 10))
+            widget.grid(row=r[0], column=1, sticky='ew', pady=3)
+            r[0] += 1
+            if hint:
+                tk.Label(body, text=hint, bg=C['bg'], fg=C['muted'],
+                         font=('TkDefaultFont', 8), anchor='w').grid(
+                    row=r[0], column=1, sticky='w')
+                r[0] += 1
+
+        def entry(key, width=10):
+            var = tk.StringVar(value=fmt_num(w[key]) if not isinstance(
+                w[key], str) else w[key])
+            self.v[key] = var
+            return tk.Entry(body, textvariable=var, width=width, relief='flat',
+                            bg='white', highlightthickness=1,
+                            highlightbackground=C['grid_major'],
+                            highlightcolor=C['ap'])
+
+        row('Name', entry('name', 18))
+        self.v['material'] = tk.StringVar(value=w['material'])
+        mat = ttk.Combobox(body, textvariable=self.v['material'],
+                           values=MATERIAL_ORDER, state='readonly', width=16)
+        mat.bind('<<ComboboxSelected>>', lambda e: self.on_material())
+        row('Material', mat, 'concrete 12, brick 8, wood 4, drywall 3, '
+            'glass 3, metal 20 dB')
+        self.e_loss = entry('loss')
+        row('Attenuation (dB)', self.e_loss,
+            'subtracted from the RSSI of every path crossing it')
+        cf = tk.Frame(body, bg=C['bg'])
+        self.swatch = tk.Label(cf, width=4, bg=w['color'], relief='solid',
+                               bd=1)
+        self.swatch.pack(side='left')
+        self.b_color = tk.Button(cf, text='Pick color...', relief='flat',
+                                 bg='white', command=self.pick_color)
+        self.b_color.pack(side='left', padx=6)
+        row('Color', cf, 'editable when the material is custom')
+        hf = tk.Frame(body, bg=C['bg'])
+        self.v['height'] = tk.StringVar(value=fmt_num(w['height']))
+        tk.Scale(hf, from_=0, to=20, resolution=0.1, orient='horizontal',
+                 showvalue=0, length=150, bg=C['ap_ring'], bd=1,
+                 highlightthickness=0, troughcolor='white',
+                 sliderrelief='flat', sliderlength=14, width=11,
+                 variable=tk.DoubleVar(value=float(w['height'])),
+                 command=lambda v: self.v['height'].set(fmt_num(float(v)))
+                 ).pack(side='left')
+        tk.Entry(hf, textvariable=self.v['height'], width=6, relief='flat',
+                 bg='white', highlightthickness=1,
+                 highlightbackground=C['grid_major']).pack(side='left',
+                                                           padx=(6, 0))
+        row('Height (m)', hf, '0 = flat 2D wall (blocks every crossing path);'
+            ' > 0 = 3D wall')
+        row('Base height Z (m)', entry('z'), 'e.g. 3 for a wall on floor 2')
+        row('Thickness (m)', entry('thickness'))
+        self.v_ask = tk.BooleanVar(value=ed.wall_ask)
+        tk.Checkbutton(body, text='Ask for properties every time I draw a '
+                       'wall', variable=self.v_ask, bg=C['bg'],
+                       activebackground=C['bg'], highlightthickness=0).grid(
+            row=r[0], column=0, columnspan=2, sticky='w', pady=(8, 0))
+        self.err = tk.Label(body, text='', bg=C['bg'], fg=C['warn'])
+        self.err.grid(row=r[0] + 1, column=0, columnspan=2, sticky='w')
+        bf = tk.Frame(top, bg=C['bar'], padx=8, pady=8)
+        bf.pack(fill='x')
+        tk.Button(bf, text='Create wall', relief='flat', bg=C['ap'],
+                  fg='white', padx=12, command=self.ok).pack(side='right',
+                                                             padx=4)
+        tk.Button(bf, text='Cancel', relief='flat', bg='white', padx=10,
+                  command=top.destroy).pack(side='right', padx=4)
+        top.bind('<Return>', lambda e: self.ok())
+        top.bind('<Escape>', lambda e: top.destroy())
+        self.on_material(init=True)
+        try:
+            top.wait_visibility()
+            top.grab_set()
+        except Exception:
+            pass
+        ed.root.wait_window(top)
+
+    def on_material(self, init=False):
+        m = self.v['material'].get()
+        custom = m == 'custom'
+        if not custom or not init:
+            if not custom:
+                loss, col = WALL_MATERIALS[m]
+                self.v['loss'].set(fmt_num(loss))
+                self.w['color'] = col
+                self.swatch.config(bg=col)
+        self.e_loss.config(state='normal' if custom else 'disabled')
+        self.b_color.config(state='normal' if custom else 'disabled')
+
+    def pick_color(self):
+        from tkinter import colorchooser
+        c = colorchooser.askcolor(color=self.w['color'], parent=self.top)
+        if c and c[1]:
+            self.w['color'] = c[1]
+            self.swatch.config(bg=c[1])
+
+    def ok(self):
+        w = self.w
+        try:
+            name = self.v['name'].get().strip()
+            if not name:
+                raise ValueError('name is empty')
+            if any(o['name'] == name for o in self.ed.walls.values()):
+                raise ValueError('name %s is already used' % name)
+            w['name'] = name
+            w['material'] = self.v['material'].get()
+            for k, lo in (('loss', 0.0), ('height', 0.0),
+                          ('thickness', 0.01)):
+                v = float(self.v[k].get())
+                if v < lo:
+                    raise ValueError('%s must be >= %g' % (k, lo))
+                w[k] = round(v, 2)
+            w['z'] = round(float(self.v['z'].get()), 2)
+        except ValueError as e:
+            self.err.config(text='!  %s' % e)
+            return
+        self.ed.wall_ask = self.v_ask.get()
+        self.result = w
+        self.top.destroy()
+
+
 class Inspector(object):
     """Pop-up window that edits everything about the selection
     (or the network settings when nothing is selected). Live: every valid
@@ -3025,6 +3973,8 @@ class Inspector(object):
             return ed.sel
         if ed.sel and ed.sel[0] == 'pic' and ed.sel[1] in ed.pics:
             return ed.sel
+        if ed.sel and ed.sel[0] == 'wall' and ed.sel[1] in ed.walls:
+            return ed.sel
         return ('net', None)
 
     def refresh(self):
@@ -3043,6 +3993,8 @@ class Inspector(object):
             return self.ed.links.get(oid)
         if kind == 'pic':
             return self.ed.pics.get(oid)
+        if kind == 'wall':
+            return self.ed.walls.get(oid)
         return None
 
     def dyn_row(self, fn):
@@ -3061,7 +4013,19 @@ class Inspector(object):
         self.body.columnconfigure(1, weight=1)
         self.target = self.current()
         kind, oid = self.target
-        if kind == 'pic':
+        if kind == 'wall':
+            self.section('general')
+            self.add_field(WALL_SCHEMA[0])
+            self.add_groups(WALL_SCHEMA[1:])
+            self.section('clients')
+            self.dyn_row(lambda: self.wall_info())
+            self.note('On the canvas: drag the wall to move it. Handles: '
+                      'end squares = length, side dot = thickness, round = '
+                      'rotate (Shift = 15 degrees), blue diamond = height. '
+                      'Ctrl+D duplicates the wall.')
+            self.b_del.config(state='normal')
+            self.b_net.pack(side='left', padx=3, before=self.b_del)
+        elif kind == 'pic':
             self.add_groups(PIC_SCHEMA)
             self.dyn_row(lambda: self.pic_info())
             self.note('On the canvas: drag the picture to move it, drag a '
@@ -3123,6 +4087,17 @@ class Inspector(object):
                                         else ' (auto, in range)')
             for a, how in conn)
 
+    def wall_info(self):
+        w = self.obj()
+        if w is None:
+            return ''
+        cr = self.ed.walls_crossing(w)
+        kind = ('3D wall, %s m high' % fmt_num(w['height'])
+                if float(w['height']) > 0 else 'flat 2D wall (any height)')
+        return '%s\nCrossed by %d connection%s%s' % (
+            kind, len(cr), '' if len(cr) == 1 else 's',
+            (':\n  ' + '\n  '.join(cr)) if cr else '')
+
     def pic_info(self):
         pic = self.obj()
         if pic is None:
@@ -3167,6 +4142,13 @@ class Inspector(object):
             self.title.config(text='%s - %s' % (self.ed.nodes[l['a']]['name'],
                                                 self.ed.nodes[l['b']]['name']))
             self.sub.config(text=LINK_LABEL[l['kind']] + ' link')
+        elif kind == 'wall':
+            self.ed._icon(cv, 'wall')
+            cv.move('all', 6, 7)
+            w = self.ed.walls[oid]
+            self.title.config(text=w['name'])
+            self.sub.config(text='wall  ·  %s  ·  %s dB' % (
+                w['material'], fmt_num(w['loss'])))
         elif kind == 'pic':
             self.ed._icon(cv, 'picture')
             cv.move('all', 6, 7)
@@ -3250,6 +4232,19 @@ class Inspector(object):
                 side='left', padx=(4, 0))
             rec['entry'] = e
             var.trace_add('write', lambda *a, k=key: self.on_edit(k))
+        elif t == 'color':
+            var = tk.StringVar()
+            w = tk.Frame(self.body, bg=C['bg'])
+            w.grid(row=self.row, column=1, sticky='ew', pady=2)
+            sw = tk.Label(w, width=3, relief='solid', bd=1, bg='#999999')
+            sw.pack(side='left')
+            e = self._entry(w, var, width=9)
+            e.pack(side='left', padx=4)
+            b = tk.Button(w, text='Pick...', relief='flat', bg='white',
+                          padx=6, command=lambda k=key: self.pick_color(k))
+            b.pack(side='left')
+            rec['entry'], rec['swatch'], rec['button'] = e, sw, b
+            var.trace_add('write', lambda *a, k=key: self.on_edit(k))
         elif t in ('range', 'slider'):
             lo, hi, res = f['opts'] if t == 'slider' else (0, 300, 0.5)
             var = tk.StringVar()
@@ -3291,6 +4286,13 @@ class Inspector(object):
                 row=self.row, column=1, sticky='w')
             self.row += 1
 
+    def pick_color(self, key):
+        from tkinter import colorchooser
+        c = colorchooser.askcolor(color=self.get_model(key) or '#999999',
+                                  parent=self.top)
+        if c and c[1]:
+            self.fields[key]['var'].set(c[1])
+
     def browse(self, key):
         path = self.ed.fd.askopenfilename(
             parent=self.top, title='Choose image',
@@ -3305,7 +4307,7 @@ class Inspector(object):
         if f['type'] == 'range':
             return max(300, math.ceil(v * 1.5 / 50) * 50)
         hi = f['opts'][1]
-        if f['key'] == 'width':
+        if f['key'] in ('width', 'length'):
             return max(hi, math.ceil(v * 1.5 / 50) * 50)
         return hi
 
@@ -3313,7 +4315,7 @@ class Inspector(object):
     def get_model(self, key):
         kind, oid = self.target
         o = self.obj()
-        if kind == 'pic':
+        if kind in ('pic', 'wall'):
             return o.get(key)
         if kind == 'node':
             if key == '__name':
@@ -3332,6 +4334,11 @@ class Inspector(object):
             if key == 'path':
                 self.ed._pic_tk.pop(oid, None)
             o[key] = val
+            return
+        if kind == 'wall':
+            o[key] = val
+            if key == 'material' and val != 'custom':
+                o['loss'], o['color'] = WALL_MATERIALS[val]
             return
         if kind == 'node':
             if key == '__name':
@@ -3386,6 +4393,21 @@ class Inspector(object):
                     if rec['scale'] is not None:
                         rec['scale'].config(to=self.scale_to(rec['f'], v))
                         rec['scale'].set(float(v or 0))
+            if self.target[0] == 'wall':
+                custom = self.get_model('material') == 'custom'
+                if 'loss' in self.fields:
+                    self.fields['loss']['entry'].config(
+                        state='normal' if custom else 'disabled')
+                rec = self.fields.get('color')
+                if rec:
+                    rec['entry'].config(state='normal' if custom
+                                        else 'disabled')
+                    rec['button'].config(state='normal' if custom
+                                         else 'disabled')
+                    try:
+                        rec['swatch'].config(bg=self.get_model('color'))
+                    except Exception:
+                        pass
             for lb, fn in self.dyn:
                 txt = fn()
                 if lb.cget('text') != txt:
@@ -3439,9 +4461,23 @@ class Inspector(object):
                 v = (v + 180) % 360 - 180
             elif f['key'] == 'opacity':
                 v = max(0.0, min(100.0, v))
+            elif f['key'] == 'height':
+                if v < 0:
+                    return False, None
             elif v <= 0:
                 return False, None
             return True, round(v, 2)
+        if t == 'wallname':
+            if not raw or any(w['name'] == raw and w['id'] != self.target[1]
+                              for w in self.ed.walls.values()):
+                return False, None
+            return True, raw
+        if t == 'color':
+            try:
+                self.top.winfo_rgb(raw)
+            except Exception:
+                return False, None
+            return True, raw
         if t == 'file':
             if not os.path.isfile(raw):
                 return False, None
@@ -3508,8 +4544,8 @@ class Inspector(object):
                         self.get_model(k) not in opts:
                     self.fields[k]['var'].set(opts[0])     # -> on_edit
         self.ed.changed('inspector')
-        if key == '__name':
-            self.load_values()                  # ssid may have followed
+        if key in ('__name', 'material'):
+            self.load_values()       # ssid followed / loss + color presets
         self.update_header()
 
 
