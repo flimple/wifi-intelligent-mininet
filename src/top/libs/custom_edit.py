@@ -1,14 +1,29 @@
 #!/usr/bin/env python3
 """
-wifi_edit.py  -  MiniEdit-style topology editor for Mininet-WiFi
+custom_edit.py  -  MiniEdit-style topology editor for Mininet-WiFi
 
-Same look as wifi_gui.py (pure Tkinter, no matplotlib), but it is an
+Same look as custom_gui.py (pure Tkinter, no matplotlib), but it is an
 EDITOR: no simulation, no animation. You draw the network, set every
 parameter, and save a file that Mininet-WiFi can run.
 
     sudo apt install python3-tk        (if Tkinter is missing)
 
 What you get
+  - Word-like ribbon: Home / Insert / Walls / Picture / View tabs with
+    captioned groups; collapse it (button on the right, double-click a
+    tab, Ctrl+F1). Dark mode (View tab), shared with custom_gui.py
+  - Devices list (Home tab or D) in a git-graph style: go to, inspect,
+    re-link (Wi-Fi to another AP, wired links, remove links), lock, delete
+  - Lock any device, wall or picture (Ctrl+L or Inspector): locked items
+    cannot be clicked or moved; double-click still inspects them
+  - Devices can never be placed or dragged inside a wall
+  - Range: drag the diamond handle on a selected device's range circle,
+    or type any value next to the range slider (Home tab)
+  - Picture tools (Picture tab + Inspector): rotate 90, flip, crop,
+    brightness / contrast / saturation, grayscale, invert, white to
+    transparent, fit to network (non-destructive, saved in the file)
+  - RSSI values in the editor are estimates (log-distance model + walls);
+    the real RSSI is simulated by Mininet-WiFi and shown in custom_gui.py
   - 3D view you can rotate, pan and zoom, plus a flat top view
   - Menu bar (File / Edit / Insert / View / Help) and a toolbar of
     captioned groups (FILE, EDIT, DEVICES, CONNECT, PICTURE, VIEW, SHOW,
@@ -59,16 +74,22 @@ Files
   Both JSON formats can be opened again in the editor.
 
 Usage
-  python3 wifi_edit.py                          open the editor
-  python3 wifi_edit.py topo.json                open a file in the editor
-  sudo -E python3 wifi_edit.py --run topo.json  build it and run it with
+  python3 custom_edit.py                          open the editor
+  python3 custom_edit.py topo.json                open a file in the editor
+  sudo -E python3 custom_edit.py --run topo.json  build it and run it with
                                                 Mininet-WiFi (+ CLI)
-       add --gui to also open wifi_gui.py on top of the running network
-  python3 wifi_edit.py --export topo.json out.py
+       add --gui to also open custom_gui.py on top of the running network
+  python3 custom_edit.py --export topo.json out.py
                                                 convert a file to a script
 
+  With your own devices (net.addStation... in your main) and the viewer:
+      from custom_gui import WifiGUI
+      gui = WifiGUI(net)
+      gui.load_json('topo.json')     # walls + pictures from this editor
+      net.build(); gui.start()
+
   From your own script:
-      from wifi_edit import load_normalized, build_network
+      from custom_edit import load_normalized, build_network
       net = build_network(load_normalized('topo.json'))   # built + started
       CLI(net); net.stop()
 
@@ -108,7 +129,7 @@ import sys
 
 FORMAT = 'mininet-wifi-topology'
 VERSION = 1
-GENERATOR = 'wifi_edit.py'
+GENERATOR = 'custom_edit.py'
 
 KINDS = ('ap', 'sta', 'car', 'host', 'switch', 'ctrl')
 WIRELESS_KINDS = ('ap', 'sta', 'car')
@@ -283,6 +304,25 @@ PIC_SCHEMA = [
     F('visible', 'Visible', 'bool', 'look', True),
     F('locked', 'Locked', 'bool', 'look', False,
       hint='locked = can be selected but not moved'),
+    F('rot90', 'Rotate image (clockwise)', 'choice', 'adjust', '0',
+      ['0', '90', '180', '270']),
+    F('flip_h', 'Flip horizontally', 'bool', 'adjust', False),
+    F('flip_v', 'Flip vertically', 'bool', 'adjust', False),
+    F('crop_l', 'Crop left (%)', 'slider', 'adjust', 0.0, opts=(0, 95, 1)),
+    F('crop_r', 'Crop right (%)', 'slider', 'adjust', 0.0, opts=(0, 95, 1)),
+    F('crop_t', 'Crop top (%)', 'slider', 'adjust', 0.0, opts=(0, 95, 1)),
+    F('crop_b', 'Crop bottom (%)', 'slider', 'adjust', 0.0, opts=(0, 95, 1)),
+    F('brightness', 'Brightness (%)', 'slider', 'adjust', 100.0,
+      opts=(0, 300, 1)),
+    F('contrast', 'Contrast (%)', 'slider', 'adjust', 100.0, opts=(0, 300, 1)),
+    F('saturation', 'Saturation (%)', 'slider', 'adjust', 100.0,
+      opts=(0, 300, 1)),
+    F('grayscale', 'Grayscale', 'bool', 'adjust', False),
+    F('invert', 'Invert colors', 'bool', 'adjust', False),
+    F('key_white', 'White -> transparent', 'bool', 'adjust', False,
+      hint='makes the white background of a plan see-through'),
+    F('key_level', 'Transparency threshold', 'slider', 'adjust', 235.0,
+      opts=(128, 255, 1)),
 ]
 PIC_KEYS = [f['key'] for f in PIC_SCHEMA]
 
@@ -362,6 +402,23 @@ def wall_db(w):
     if not k or ref <= 0:
         return loss
     return max(0.0, loss * (1 + k * (float(w['thickness']) / ref - 1)))
+
+
+def wall_contains_point(w, p, eps=1e-6):
+    """True when point p (x, y, z) is inside the wall's volume
+    (flat 2D walls: inside the footprint, any height)."""
+    a = math.radians(float(w['rotation']))
+    dx, dy = p[0] - w['x'], p[1] - w['y']
+    lx = dx * math.cos(a) + dy * math.sin(a)
+    ly = -dx * math.sin(a) + dy * math.cos(a)
+    if abs(lx) >= float(w['length']) / 2 - eps or \
+            abs(ly) >= float(w['thickness']) / 2 - eps:
+        return False
+    h = float(w.get('height') or 0)
+    if h <= 0:
+        return True
+    z0 = float(w.get('z') or 0)
+    return z0 - eps <= p[2] <= z0 + h + eps
 
 
 def wall_zrange(w):
@@ -563,6 +620,7 @@ GROUP_TITLE = {
     'clients': 'Connected devices', 'picture': 'Picture',
     'placement': 'Placement', 'size': 'Size & rotation', 'look': 'Display',
     'wall': 'Material & signal loss', 'geometry': 'Geometry',
+    'adjust': 'Image adjustments',
 }
 
 PROP_KEYS = ('exp', 'sL', 'variance', 'nFloors', 'lF', 'pL')
@@ -739,6 +797,8 @@ def doc_to_normalized(doc):
         params = _clean(SCHEMA[kind], n['p'], skip=('band',))
         params['position'] = fmt_pos(n['xyz'])
         entry = {'name': name, 'params': params}
+        if n.get('locked'):
+            entry['locked'] = True             # editor only, not for Mininet
         if kind == 'ctrl':
             params['controller'] = params.pop('cls', 'Controller')
         if kind == 'ap':
@@ -821,7 +881,8 @@ def normalized_to_doc(d):
             if kind == 'ap':
                 p['band'] = e.get('band') or band_of_channel(p.get('channel'))
             p['extra'] = params
-            nodes.append({'kind': kind, 'name': name, 'xyz': xyz, 'p': p})
+            nodes.append({'kind': kind, 'name': name, 'xyz': xyz, 'p': p,
+                          'locked': bool(e.get('locked'))})
     links = []
     for l in d.get('links') or []:
         t = l.get('type', 'wired')
@@ -878,6 +939,7 @@ def doc_to_custom(doc):
     for n in doc['nodes']:
         x, y, z = n['xyz']
         dev = {'name': n['name'], 'kind': KIND_NAME[n['kind']],
+               'locked': bool(n.get('locked')),
                'position': {'x': num(x), 'y': num(y), 'z': num(z)}}
         for f in SCHEMA[n['kind']]:
             if f['key'] == 'extra':
@@ -933,7 +995,8 @@ def custom_to_doc(d):
         p = default_params(kind, dev['name'], '')
         p['extra'] = dict(dev.get('extra') or {})
         for g, vals in dev.items():
-            if g in ('name', 'kind', 'position', 'controllers', 'extra') \
+            if g in ('name', 'kind', 'position', 'controllers', 'extra',
+                     'locked') \
                     or not isinstance(vals, dict):
                 continue
             for k, v in vals.items():
@@ -941,7 +1004,8 @@ def custom_to_doc(d):
                     p[k] = coerce(fm[k], v)
                 else:
                     p['extra'][k] = v
-        nodes.append({'kind': kind, 'name': dev['name'], 'xyz': xyz, 'p': p})
+        nodes.append({'kind': kind, 'name': dev['name'], 'xyz': xyz, 'p': p,
+                      'locked': bool(dev.get('locked'))})
     links = []
     for l in d.get('links') or []:
         t = l.get('kind', 'wired')
@@ -1059,7 +1123,7 @@ def script_from_normalized(nd):
         GENERATOR, datetime.datetime.now().strftime('%Y-%m-%d %H:%M')))
     w('')
     w('Run:  sudo -E python3 %s [--gui]' % 'this_script.py')
-    w('      --gui opens wifi_gui.py (must be next to this script)')
+    w('      --gui opens custom_gui.py (must be next to this script)')
     w('"""')
     w('import sys')
     w('')
@@ -1086,6 +1150,12 @@ def script_from_normalized(nd):
             w('')
             w('')
             L.extend(inspect.getsource(fn).rstrip().split('\n'))
+    pics = (nd.get('editor') or {}).get('pictures') or []
+    if pics:
+        w('')
+        w('# Pictures (floor plans) shown by custom_gui.py with --gui')
+        w('PICTURES = %s' % json.dumps(pics, indent=4).replace(
+            'true', 'True').replace('false', 'False').replace('null', 'None'))
     w('')
     w('')
     w('def topology(gui=False):')
@@ -1142,10 +1212,18 @@ def script_from_normalized(nd):
         w('    %s.start([%s])' % (_pyvar(name),
                                   ', '.join(_pyvar(c) for c in cs)))
     w('')
+    pics = (nd.get('editor') or {}).get('pictures') or []
     w('    viewer = None')
     w('    if gui:')
-    w('        from wifi_gui import WifiGUI')
+    w('        try:')
+    w('            from custom_gui import WifiGUI')
+    w('        except ImportError:')
+    w('            from wifi_gui import WifiGUI')
     w('        viewer = WifiGUI(net)')
+    if walls or pics:
+        w('        if hasattr(viewer, "load_layout"):   # walls + pictures')
+        w('            viewer.load_layout({"walls": %s, "pictures": %s})' % (
+            'WALLS' if walls else '[]', 'PICTURES' if pics else '[]'))
     w('        viewer.start()')
     w('')
     w("    info('*** Running CLI\\n')")
@@ -1235,11 +1313,16 @@ def run_topology(path, gui=False):
     viewer = None
     if gui:
         try:
-            from wifi_gui import WifiGUI
+            try:
+                from custom_gui import WifiGUI
+            except ImportError:
+                from wifi_gui import WifiGUI
             viewer = WifiGUI(net)
+            if hasattr(viewer, 'load_json'):   # walls + pictures of the file
+                viewer.load_json(path, apply_walls=False)  # already applied
             viewer.start()
         except ImportError:
-            info('*** wifi_gui.py not found, running without the viewer\n')
+            info('*** custom_gui.py not found, running without the viewer\n')
     CLI(net)
     if viewer:
         viewer.stop()
@@ -1250,19 +1333,483 @@ def run_topology(path, gui=False):
 # Part 2 - the editor window (Tkinter only)
 # ==========================================================================
 
-C = {
-    'bg': '#f6f6f3', 'grid': '#dedfd9', 'grid_major': '#c9cbc3',
-    'axis': '#8a8b85', 'text': '#26272a', 'muted': '#6d6e69',
-    'ap': '#2563c9', 'ap_fill': '#e1eafa', 'ap_ring': '#7fa3e3',
-    'sta': '#e0761a', 'sta_ring': '#eaa66a', 'car': '#b9461a',
-    'ctrl': '#7b3fc4', 'switch': '#4a4d55', 'host': '#6b6e74',
-    'rf': '#16a05a', 'rf_glow': '#cdebd9', 'rf_bad': '#cc3a2f',
-    'wired': '#4a4d55', 'control': '#7b3fc4',
-    'shadow': '#d4d5cf', 'select': '#111111', 'warn': '#b3261e',
-    'tip_bg': '#26272a', 'tip_fg': '#ffffff', 'bar': '#ebebe7',
-    'halo': '#a9c1ee', 'bad_entry': '#fbe3e0',
-    'x': '#c0392b', 'y': '#1e8449', 'z': '#2457a6',
+# ==========================================================================
+# Shared UI toolkit (same code in custom_edit.py and custom_gui.py):
+# themes (light / dark), Word-like collapsible ribbon, git-graph device
+# tree, picture adjustments.
+# ==========================================================================
+
+THEMES = {
+    'light': {
+        'bg': '#f6f6f3', 'grid': '#dedfd9', 'grid_major': '#c9cbc3',
+        'axis': '#8a8b85', 'text': '#26272a', 'muted': '#6d6e69',
+        'ap': '#2563c9', 'ap_fill': '#e1eafa', 'ap_ring': '#7fa3e3',
+        'sta': '#e0761a', 'sta_ring': '#eaa66a', 'car': '#b9461a',
+        'ctrl': '#7b3fc4', 'switch': '#4a4d55', 'host': '#6b6e74',
+        'rf': '#16a05a', 'rf_glow': '#cdebd9', 'rf_bad': '#cc3a2f',
+        'wired': '#4a4d55', 'control': '#7b3fc4', 'peer': '#0f9b8e',
+        'shadow': '#d4d5cf', 'select': '#111111', 'warn': '#b3261e',
+        'tip_bg': '#26272a', 'tip_fg': '#ffffff', 'bar': '#ebebe7',
+        'halo': '#a9c1ee', 'bad_entry': '#fbe3e0', 'btn': 'white',
+        'tabs': '#dcdcd6', 'x': '#c0392b', 'y': '#1e8449', 'z': '#2457a6',
+        'pkt_wifi': '#11a85a', 'pkt_wired': '#2563c9', 'pkt_peer': '#0f9b8e',
+        'wall': '#b4583d', 'outline': 'white',
+    },
+    'dark': {
+        'bg': '#1d1e21', 'grid': '#2c2e33', 'grid_major': '#3a3d43',
+        'axis': '#7e818a', 'text': '#e4e4e0', 'muted': '#9a9ca3',
+        'ap': '#4f86f0', 'ap_fill': '#1c2740', 'ap_ring': '#335a9e',
+        'sta': '#f28c3a', 'sta_ring': '#8a5226', 'car': '#e0602a',
+        'ctrl': '#9a63e0', 'switch': '#a3a7b0', 'host': '#8e9299',
+        'rf': '#2ec472', 'rf_glow': '#1c3b2b', 'rf_bad': '#ff5a4d',
+        'wired': '#a3a7b0', 'control': '#9a63e0', 'peer': '#2ec4a0',
+        'shadow': '#2a2b2f', 'select': '#f2f2f2', 'warn': '#ff6b5e',
+        'tip_bg': '#eeeeea', 'tip_fg': '#1d1e21', 'bar': '#26282c',
+        'halo': '#3d5a8f', 'bad_entry': '#5b2b2b', 'btn': '#34373d',
+        'tabs': '#18191c', 'x': '#e05a4a', 'y': '#3cbf6a', 'z': '#5a8de0',
+        'pkt_wifi': '#3ee08a', 'pkt_wired': '#6fa0ff', 'pkt_peer': '#3ee0c0',
+        'wall': '#c96a4f', 'outline': '#1d1e21',
+    },
 }
+C = dict(THEMES['light'])
+_BG_KEYS = ('bg', 'bar', 'btn', 'tabs', 'grid', 'grid_major', 'ap', 'ap_ring',
+            'halo', 'bad_entry', 'select', 'tip_bg', 'axis')
+_FG_KEYS = ('text', 'muted', 'warn', 'ap', 'tip_fg')
+_BG_OPTS = ('background', 'activebackground', 'highlightbackground',
+            'troughcolor', 'selectcolor', 'disabledbackground',
+            'readonlybackground', 'selectbackground')
+_FG_OPTS = ('foreground', 'activeforeground', 'insertbackground',
+            'disabledforeground', 'highlightcolor', 'selectforeground')
+PREFS_PATH = os.path.expanduser('~/.config/mininet_custom_ui.json')
+
+
+def load_prefs():
+    try:
+        with open(PREFS_PATH) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def save_prefs(**kw):
+    p = load_prefs()
+    p.update(kw)
+    try:
+        os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
+        with open(PREFS_PATH, 'w') as fh:
+            json.dump(p, fh, indent=2)
+    except Exception:
+        pass
+
+
+def _norm_col(root, c):
+    try:
+        r, g, b = root.winfo_rgb(c)
+        return '#%02x%02x%02x' % (r // 256, g // 256, b // 256)
+    except Exception:
+        return str(c).lower()
+
+
+def style_ttk(root):
+    """ttk widgets (comboboxes) follow the palette."""
+    from tkinter import ttk
+    st = ttk.Style(root)
+    try:
+        st.theme_use('clam')
+    except Exception:
+        pass
+    st.configure('TCombobox', fieldbackground=C['btn'], background=C['bar'],
+                 foreground=C['text'], arrowcolor=C['text'],
+                 bordercolor=C['grid_major'], lightcolor=C['bar'],
+                 darkcolor=C['bar'], selectbackground=C['ap'],
+                 selectforeground='white')
+    st.map('TCombobox',
+           fieldbackground=[('readonly', C['btn']), ('disabled', C['bar'])],
+           foreground=[('readonly', C['text']), ('disabled', C['muted'])],
+           background=[('readonly', C['bar'])])
+    root.option_add('*TCombobox*Listbox.background', C['btn'])
+    root.option_add('*TCombobox*Listbox.foreground', C['text'])
+    root.option_add('*TCombobox*Listbox.selectBackground', C['ap'])
+    return st
+
+
+def apply_theme(root, name):
+    """Switch palette and recolour every Tk widget already on screen."""
+    old = dict(C)
+    C.clear()
+    C.update(THEMES[name])
+    bgmap, fgmap = {}, {}
+    for keys, m in ((_BG_KEYS, bgmap), (_FG_KEYS, fgmap)):
+        for k in keys:
+            m[_norm_col(root, old[k])] = C[k]
+
+    def walk(w):
+        for opts, m in ((_BG_OPTS, bgmap), (_FG_OPTS, fgmap)):
+            for o in opts:
+                try:
+                    v = w.cget(o)
+                except Exception:
+                    continue
+                if not v:
+                    continue
+                nv = m.get(_norm_col(root, v))
+                if nv:
+                    try:
+                        w.configure(**{o: nv})
+                    except Exception:
+                        pass
+        for ch in w.winfo_children():
+            walk(ch)
+    walk(root)
+    style_ttk(root)
+
+
+class _FlowBar(object):
+    """A frame whose child groups flow left-to-right and wrap to new rows."""
+
+    def __init__(self, tk, parent, bg, gap=10, vgap=4):
+        self.tk, self.bg, self.gap, self.vgap = tk, bg, gap, vgap
+        self.frame = tk.Frame(parent, bg=bg, height=40)
+        self.groups = []
+        self.frame.bind('<Configure>', lambda e: self.layout())
+        self.frame.after_idle(self.layout)
+
+    def group(self):
+        g = self.tk.Frame(self.frame, bg=self.bg)
+        self.groups.append(g)
+        return g
+
+    def layout(self):
+        W = self.frame.winfo_width()
+        if W <= 1:
+            W = self.frame.winfo_toplevel().winfo_width()
+        x, y, row_h = 6, self.vgap, 0
+        for g in self.groups:
+            w, h = g.winfo_reqwidth(), g.winfo_reqheight()
+            if x > 6 and x + w > W - 6:            # wrap to a new row
+                x, y, row_h = 6, y + row_h + self.vgap, 0
+            g.place(x=x, y=y)
+            x += w + self.gap
+            row_h = max(row_h, h)
+        total = y + row_h + self.vgap
+        if int(self.frame.cget('height')) != total:
+            self.frame.config(height=total)
+
+
+class _Ribbon(object):
+    """Word-like ribbon: tabs (categories) with captioned groups.
+    Collapse with the button on the right, double-click on a tab, or
+    Ctrl+F1; clicking a tab while collapsed opens it again."""
+
+    def __init__(self, tk, parent):
+        self.tk = tk
+        self.frame = tk.Frame(parent, bg=C['bar'])
+        self.head = tk.Frame(self.frame, bg=C['tabs'])
+        self.head.pack(fill='x')
+        self.body = tk.Frame(self.frame, bg=C['bar'])
+        self.body.pack(fill='x')
+        self.tabs, self.current, self.collapsed = {}, None, False
+        self.btn = tk.Label(self.head, text='Collapse ribbon', bg=C['tabs'],
+                            fg=C['muted'], cursor='hand2',
+                            font=('TkDefaultFont', 8))
+        self.btn.pack(side='right', padx=10)
+        self.btn.bind('<Button-1>', lambda e: self.toggle())
+        self.extra = tk.Frame(self.head, bg=C['tabs'])  # right side widgets
+        self.extra.pack(side='right')
+
+    def tab(self, name):
+        tk = self.tk
+        lb = tk.Label(self.head, text=name, padx=14, pady=4, bg=C['tabs'],
+                      fg=C['muted'], cursor='hand2',
+                      font=('TkDefaultFont', 9, 'bold'))
+        lb.pack(side='left')
+        lb.bind('<Button-1>', lambda e, n=name: self.select(n))
+        lb.bind('<Double-Button-1>', lambda e: self.toggle())
+        page = _FlowBar(tk, self.body, C['bar'])
+        self.tabs[name] = (lb, page)
+        if self.current is None:
+            self.select(name)
+        return page
+
+    def group(self, page, caption):
+        """Captioned group inside a tab page (caption under it, like Word)."""
+        tk = self.tk
+        outer = page.group()
+        tk.Frame(outer, width=1, bg=C['grid_major']).pack(side='right',
+                                                          fill='y', padx=(8, 0))
+        col = tk.Frame(outer, bg=C['bar'])
+        col.pack(side='left', fill='y')
+        tk.Label(col, text=caption, bg=C['bar'], fg=C['muted'],
+                 font=('TkDefaultFont', 7, 'bold')).pack(side='bottom')
+        body = tk.Frame(col, bg=C['bar'])
+        body.pack(side='top', expand=True)
+        return body
+
+    def select(self, name):
+        if self.collapsed:
+            self.toggle()
+        for n, (lb, page) in self.tabs.items():
+            if n == name:
+                lb.config(bg=C['bar'], fg=C['ap'])
+                page.frame.pack(fill='x')
+                page.frame.after_idle(page.layout)
+            else:
+                lb.config(bg=C['tabs'], fg=C['muted'])
+                page.frame.pack_forget()
+        self.current = name
+
+    def toggle(self):
+        self.collapsed = not self.collapsed
+        if self.collapsed:
+            self.body.pack_forget()
+            self.btn.config(text='Expand ribbon')
+        else:
+            self.body.pack(fill='x')
+            self.btn.config(text='Collapse ribbon')
+
+
+LANE_COL = {'wifi': 'rf', 'auto': 'rf', 'wired': 'wired',
+            'control': 'control', 'adhoc': 'peer', 'mesh': 'peer'}
+KIND_RANK = {'ctrl': 0, 'switch': 1, 'ap': 2, 'host': 3, 'sta': 3, 'car': 3}
+
+
+def build_tree(nodes, edges):
+    """Turn devices + links into git-graph rows.
+    nodes: [(name, kind)]; edges: [(a, b, link_type, text)].
+    Each device appears once; parents are higher in the hierarchy
+    (controller > switch > AP > host / station). Extra links of an already
+    placed device are listed in its 'also' field."""
+    kind = dict(nodes)
+    kids, also = {}, {}
+    for a, b, lt, txt in edges:
+        if a not in kind or b not in kind:
+            continue
+        ra, rb = KIND_RANK.get(kind[a], 9), KIND_RANK.get(kind[b], 9)
+        if (rb, b) < (ra, a):
+            a, b = b, a
+        kids.setdefault(a, []).append((b, lt, txt))
+    order = sorted(kind, key=lambda n: (KIND_RANK.get(kind[n], 9), n))
+    rows, placed = [], {}
+
+    def visit(n, depth, parent, lt, txt):
+        placed[n] = len(rows)
+        rows.append({'name': n, 'kind': kind[n], 'depth': depth,
+                     'parent': parent, 'link': lt, 'link_text': txt,
+                     'also': []})
+        me = placed[n]
+        for c, clt, ctxt in sorted(kids.get(n, []),
+                                   key=lambda k: (KIND_RANK.get(kind[k[0]], 9),
+                                                  k[0])):
+            if c in placed:
+                rows[placed[c]]['also'].append('%s %s' % (clt, n))
+                rows[me]['also'].append('%s %s' % (clt, c))
+                continue
+            visit(c, depth + 1, me, clt, ctxt)
+    for n in order:
+        if n not in placed:
+            visit(n, 0, None, None, '')
+    return rows
+
+
+class _TreePanel(object):
+    """Device / connection list drawn like `git log --graph`.
+    provider must offer: tree_rows() -> rows (see build_tree, plus
+    optional 'detail'), tree_menu(menu, row), tree_activate(row),
+    tree_select(row), draw_kind_icon(canvas, kind, x, y)."""
+    ROW = 30
+
+    def __init__(self, tk, root, provider, title='Devices & connections'):
+        self.tk, self.p = tk, provider
+        top = self.top = tk.Toplevel(root)
+        top.title(title)
+        top.configure(bg=C['bg'])
+        top.geometry('460x620')
+        head = tk.Frame(top, bg=C['bar'], padx=8, pady=6)
+        head.pack(fill='x')
+        tk.Label(head, text=title, bg=C['bar'], fg=C['text'],
+                 font=('TkDefaultFont', 11, 'bold')).pack(side='left')
+        self.filter = tk.StringVar()
+        e = tk.Entry(head, textvariable=self.filter, width=14, relief='flat',
+                     bg=C['btn'], fg=C['text'], insertbackground=C['text'],
+                     highlightthickness=1, highlightbackground=C['grid_major'])
+        e.pack(side='right')
+        tk.Label(head, text='filter', bg=C['bar'], fg=C['muted']).pack(
+            side='right', padx=4)
+        self.filter.trace_add('write', lambda *a: self.refresh())
+        tk.Label(top, text='click: select   double-click: go to + inspect   '
+                 'right-click: actions', bg=C['bg'], fg=C['muted'],
+                 font=('TkDefaultFont', 8)).pack(fill='x')
+        wrap = tk.Frame(top, bg=C['bg'])
+        wrap.pack(fill='both', expand=True)
+        self.cv = tk.Canvas(wrap, bg=C['bg'], highlightthickness=0)
+        sb = tk.Scrollbar(wrap, orient='vertical', command=self.cv.yview)
+        self.cv.configure(yscrollcommand=sb.set)
+        sb.pack(side='right', fill='y')
+        self.cv.pack(side='left', fill='both', expand=True)
+        self.cv.bind('<Button-1>', self.on_click)
+        self.cv.bind('<Double-Button-1>', self.on_double)
+        self.cv.bind('<Button-3>', self.on_menu)
+        for ev, d in (('<Button-4>', -1), ('<Button-5>', 1)):
+            self.cv.bind(ev, lambda e, d=d: self.cv.yview_scroll(d * 2, 'units'))
+        self.cv.bind('<MouseWheel>', lambda e: self.cv.yview_scroll(
+            -1 if e.delta > 0 else 1, 'units'))
+        top.protocol('WM_DELETE_WINDOW', self.close)
+        self.rows, self.sel = [], None
+        self.alive = True
+        self.refresh()
+
+    def close(self):
+        self.alive = False
+        self.top.destroy()
+
+    def row_at(self, y):
+        i = int(self.cv.canvasy(y) // self.ROW)
+        return self.rows[i] if 0 <= i < len(self.rows) else None
+
+    def on_click(self, e):
+        r = self.row_at(e.y)
+        if r:
+            self.sel = r['name']
+            self.p.tree_select(r)
+            self.refresh()
+
+    def on_double(self, e):
+        r = self.row_at(e.y)
+        if r:
+            self.p.tree_activate(r)
+
+    def on_menu(self, e):
+        r = self.row_at(e.y)
+        if not r:
+            return
+        self.sel = r['name']
+        self.refresh()
+        m = self.tk.Menu(self.top, tearoff=0, bg=C['btn'], fg=C['text'],
+                         activebackground=C['ap'], activeforeground='white')
+        self.p.tree_menu(m, r)
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def refresh(self):
+        if not self.alive or not self.top.winfo_exists():
+            return
+        rows = self.p.tree_rows()
+        f = self.filter.get().strip().lower()
+        if f:
+            keep = set()
+            for i, r in enumerate(rows):
+                if f in (r['name'] + ' ' + r.get('detail', '')).lower():
+                    j = i
+                    while j is not None:               # keep the branch
+                        keep.add(j)
+                        j = rows[j]['parent']
+            remap, out = {}, []
+            for i, r in enumerate(rows):
+                if i in keep:
+                    remap[i] = len(out)
+                    out.append(dict(r))
+            for r in out:
+                r['parent'] = remap.get(r['parent'])
+            rows = out
+        self.rows = rows
+        cv, R = self.cv, self.ROW
+        cv.delete('all')
+        cv.configure(bg=C['bg'])
+        maxd = max([r['depth'] for r in rows] or [0])
+        tx = 22 + (maxd + 1) * 22
+        for i, r in enumerate(rows):
+            y = i * R + R / 2
+            if r['name'] == self.sel:
+                cv.create_rectangle(0, i * R + 1, 2000, (i + 1) * R - 1,
+                                    fill=C['halo'], outline='')
+        for i, r in enumerate(rows):                       # branches
+            if r['parent'] is None:
+                continue
+            p = r['parent']
+            px, py = 18 + rows[p]['depth'] * 22, p * R + R / 2
+            cx, cy = 18 + r['depth'] * 22, i * R + R / 2
+            col = C.get(LANE_COL.get(r['link'] or '', ''), C['axis'])
+            cv.create_line(px, py + 7, px, cy - 12, px, cy - 2, px + 4, cy,
+                           cx - 7, cy, fill=col, width=2.5, smooth=True,
+                           dash=(4, 3) if r['link'] in ('control', 'auto',
+                                                        'adhoc', 'mesh')
+                           else None)
+        for i, r in enumerate(rows):                       # dots + text
+            x, y = 18 + r['depth'] * 22, i * R + R / 2
+            self.p.draw_kind_icon(cv, r['kind'], x, y)
+            cv.create_text(tx, y - 6, anchor='w', text=r['name'],
+                           fill=C['text'], font=('TkDefaultFont', 10, 'bold'))
+            sub = r.get('detail', '')
+            if r['link']:
+                sub = ('%s %s' % (r['link'], r.get('link_text') or '')).strip() \
+                    + ('  ·  ' + sub if sub else '')
+            if r['also']:
+                sub += '  ·  also: ' + ', '.join(r['also'])
+            cv.create_text(tx, y + 8, anchor='w', text=sub, fill=C['muted'],
+                           font=('TkDefaultFont', 8))
+        cv.configure(scrollregion=(0, 0, 600, max(len(rows) * R, 10)))
+
+
+PIC_EDIT_KEYS = ('crop_l', 'crop_t', 'crop_r', 'crop_b', 'brightness',
+                 'contrast', 'saturation', 'grayscale', 'invert', 'flip_h',
+                 'flip_v', 'rot90', 'key_white', 'key_level')
+PIC_EDIT_DEFAULTS = {'crop_l': 0.0, 'crop_t': 0.0, 'crop_r': 0.0,
+                     'crop_b': 0.0, 'brightness': 100.0, 'contrast': 100.0,
+                     'saturation': 100.0, 'grayscale': False, 'invert': False,
+                     'flip_h': False, 'flip_v': False, 'rot90': '0',
+                     'key_white': False, 'key_level': 235.0}
+
+
+def pic_edits_key(p):
+    return tuple(p.get(k, PIC_EDIT_DEFAULTS[k]) for k in PIC_EDIT_KEYS)
+
+
+def apply_pic_edits(img, p):
+    """Non-destructive picture adjustments (RGBA in, RGBA out):
+    rotate (clockwise), flips, crop (% of each side), grayscale,
+    brightness / contrast / saturation (%), invert, white -> transparent."""
+    from PIL import Image, ImageChops, ImageEnhance, ImageOps
+    g = lambda k: p.get(k, PIC_EDIT_DEFAULTS[k])
+    rot = str(g('rot90'))
+    if rot == '90':
+        img = img.transpose(Image.ROTATE_270)
+    elif rot == '180':
+        img = img.transpose(Image.ROTATE_180)
+    elif rot == '270':
+        img = img.transpose(Image.ROTATE_90)
+    if g('flip_h'):
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    if g('flip_v'):
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    w, h = img.size  # crop what you see (after rotate / flip)
+    l, t = float(g('crop_l')) / 100.0, float(g('crop_t')) / 100.0
+    r, b = float(g('crop_r')) / 100.0, float(g('crop_b')) / 100.0
+    if (l or t or r or b) and l + r < 0.98 and t + b < 0.98:
+        img = img.crop((int(w * l), int(h * t), max(int(w * (1 - r)),
+                                                     int(w * l) + 1),
+                        max(int(h * (1 - b)), int(h * t) + 1)))
+    alpha = img.getchannel('A')
+    rgb = img.convert('RGB')
+    if g('grayscale'):
+        rgb = ImageOps.grayscale(rgb).convert('RGB')
+    for key, enh in (('brightness', ImageEnhance.Brightness),
+                     ('contrast', ImageEnhance.Contrast),
+                     ('saturation', ImageEnhance.Color)):
+        v = float(g(key))
+        if abs(v - 100.0) > 1e-6:
+            rgb = enh(rgb).enhance(max(v, 0.0) / 100.0)
+    if g('invert'):
+        rgb = ImageOps.invert(rgb)
+    if g('key_white'):
+        lvl = int(float(g('key_level')))
+        mask = rgb.convert('L').point(lambda v: 0 if v >= lvl else 255)
+        alpha = ImageChops.multiply(alpha, mask)
+    out = rgb.convert('RGBA')
+    out.putalpha(alpha)
+    return out
+
 
 TOOL_HINT = {
     'select': 'Select: click a device or link, drag to move it. Drag an '
@@ -1294,9 +1841,13 @@ wmediumd SNR mode; not wmediumd interference mode).
 
 Keys
   Del delete    Esc select tool    I inspector    L link tool
-  W wall tool (drag a zone)   Ctrl+D duplicate wall
+  W wall tool (drag a zone)   Ctrl+D duplicate wall   D devices list
+  Ctrl+F1 collapse / expand the ribbon
   Shift+click walls: multi-select   Ctrl+G group   Ctrl+Shift+G ungroup
-  Ctrl+L lock / unlock (locked walls: double-click to inspect)
+  Ctrl+L lock / unlock the selection (device, wall, picture);
+         locked items: double-click to inspect
+  Range handle: drag the diamond on a selected device's range circle,
+         or type the range next to the slider (Home tab)
   P insert picture    T top view    3 3D view    F fit
   Ctrl+Z / Ctrl+Y undo / redo    Ctrl+S save    Ctrl+O open
   Ctrl+N new    Ctrl+E export Python script
@@ -1359,7 +1910,7 @@ def _in_poly(x, y, pts):
 
 
 def draw_icon(cv, kind, x, y, ow='white', s=1.0):
-    """Device icons, same shapes as wifi_gui.py (+ car)."""
+    """Device icons, same shapes as custom_gui.py (+ car)."""
     k = s
     if kind == 'ap':
         cv.create_rectangle(x - 10 * k, y - 7 * k, x + 10 * k, y + 7 * k,
@@ -1417,38 +1968,6 @@ def icon_center(kind, w, h):
     return (w / 2, h / 2 + (4 if kind == 'ap' else 0))
 
 
-class _FlowBar(object):
-    """A frame whose child groups flow left-to-right and wrap to new rows."""
-
-    def __init__(self, tk, parent, bg, gap=10, vgap=4):
-        self.tk, self.bg, self.gap, self.vgap = tk, bg, gap, vgap
-        self.frame = tk.Frame(parent, bg=bg, height=40)
-        self.groups = []
-        self.frame.bind('<Configure>', lambda e: self.layout())
-        self.frame.after_idle(self.layout)
-
-    def group(self):
-        g = self.tk.Frame(self.frame, bg=self.bg)
-        self.groups.append(g)
-        return g
-
-    def layout(self):
-        W = self.frame.winfo_width()
-        if W <= 1:
-            W = self.frame.winfo_toplevel().winfo_width()
-        x, y, row_h = 6, self.vgap, 0
-        for g in self.groups:
-            w, h = g.winfo_reqwidth(), g.winfo_reqheight()
-            if x > 6 and x + w > W - 6:            # wrap to a new row
-                x, y, row_h = 6, y + row_h + self.vgap, 0
-            g.place(x=x, y=y)
-            x += w + self.gap
-            row_h = max(row_h, h)
-        total = y + row_h + self.vgap
-        if int(self.frame.cget('height')) != total:
-            self.frame.config(height=total)
-
-
 class Editor(object):
     HIT = 16           # px radius for clicking a node
     SNAP = 5.0         # metres, when "Snap" is on
@@ -1465,6 +1984,7 @@ class Editor(object):
         self.walls = {}                          # id -> wall dict
         self.wall_hits, self.wall_handles = [], []
         self._pic_src, self._pic_tk = {}, {}     # image caches
+        self._pic_raw = {}
         self.pic_hits = []
         self.netp = default_net()
         self.next_id = 1
@@ -1474,6 +1994,7 @@ class Editor(object):
         self.hover = self.hover_axis = None
         self.mouse = (0, 0)
         self.hits, self.link_hits, self.axis_hits = [], [], []
+        self.range_hit = None
         self.drag = None
         self.msg = ''
         self.undo_stack, self.redo_stack = [], []
@@ -1491,6 +2012,7 @@ class Editor(object):
         root.geometry('1300x840')
         root.minsize(640, 480)
         root.configure(bg=C['bar'])
+        style_ttk(root)
         self.v_ranges = tk.BooleanVar(value=True)
         self.v_sphere = tk.BooleanVar(value=True)
         self.v_labels = tk.BooleanVar(value=True)
@@ -1499,6 +2021,8 @@ class Editor(object):
         self.v_outline = tk.BooleanVar(value=False)
         self.v_walls = tk.BooleanVar(value=True)
         self.wall_mode_label = tk.StringVar(value=WALL_MODES[1][1])
+        self.v_dark = tk.BooleanVar(value=load_prefs().get('theme') == 'dark')
+        self.tree = None                         # devices list panel
         self.wall_ask = True                     # wall dialog after drawing
         self.last_wall = default_wall()
         self.link_kind = tk.StringVar(value='wired')
@@ -1543,6 +2067,8 @@ class Editor(object):
 
         self.set_tool('select')
         self.on_toggle()
+        if self.v_dark.get():
+            apply_theme(root, 'dark')
         if path:
             self.open_path(path)
         self.update_title()
@@ -1551,36 +2077,15 @@ class Editor(object):
     # --------------------------------------------------------- toolbar ----
     def _btn(self, parent, text, cmd, accent=False, side='left', width=None):
         b = self.tk.Button(parent, text=text, command=cmd, relief='flat',
-                           bg=C['ap'] if accent else 'white',
+                           bg=C['ap'] if accent else C['btn'],
                            fg='white' if accent else C['text'],
                            activebackground=C['ap_ring'] if accent
-                           else C['grid'], padx=6, pady=1)
+                           else C['grid'], activeforeground=C['text'],
+                           highlightthickness=0, padx=6, pady=1)
         if width:
             b.config(width=width)
         b.pack(side=side, padx=2, pady=1)
         return b
-
-    def _group(self, bar, caption, inline=False):
-        """Captioned toolbar group (wraps as one block).
-        inline=True puts the caption on the left (slim view bar)."""
-        tk = self.tk
-        outer = bar.group()
-        tk.Frame(outer, width=1, bg=C['grid_major']).pack(side='right',
-                                                          fill='y', padx=(8, 0))
-        if inline:
-            tk.Label(outer, text=caption, bg=C['bar'], fg=C['muted'],
-                     font=('TkDefaultFont', 7, 'bold')).pack(side='left',
-                                                             padx=(0, 6))
-            body = tk.Frame(outer, bg=C['bar'])
-            body.pack(side='left')
-            return body
-        col = tk.Frame(outer, bg=C['bar'])
-        col.pack(side='left', fill='y')
-        tk.Label(col, text=caption, bg=C['bar'], fg=C['muted'],
-                 font=('TkDefaultFont', 7, 'bold')).pack(side='bottom')
-        body = tk.Frame(col, bg=C['bar'])
-        body.pack(side='top', expand=True)
-        return body
 
     def _icon(self, cv, what):
         if what in KINDS:
@@ -1635,14 +2140,20 @@ class Editor(object):
 
     def _hl(self, ww, on):
         f = ww[0]
-        if f.cget('bg') == 'white':          # active tool keeps its look
+        if f.cget('bg') == C['btn']:         # active tool keeps its look
             return
         f.config(highlightbackground=C['grid_major'] if on else C['bar'])
 
+    def _menu(self, parent):
+        return self.tk.Menu(parent, tearoff=0, bg=C['bar'], fg=C['text'],
+                            activebackground=C['ap'],
+                            activeforeground='white', selectcolor=C['ap'],
+                            relief='flat', bd=0)
+
     def build_menu(self):
         tk = self.tk
-        m = tk.Menu(self.root)
-        fm = tk.Menu(m, tearoff=0)
+        m = self._menu(self.root)
+        fm = self._menu(m)
         for label, cmd, acc in (('New', self.new, 'Ctrl+N'),
                                 ('Open...', self.open, 'Ctrl+O'),
                                 ('Save', self.save, 'Ctrl+S'),
@@ -1653,24 +2164,26 @@ class Editor(object):
         fm.add_separator()
         fm.add_command(label='Quit', command=self.on_close)
         m.add_cascade(label='File', menu=fm)
-        em = tk.Menu(m, tearoff=0)
+        em = self._menu(m)
         em.add_command(label='Undo', command=self.undo, accelerator='Ctrl+Z')
         em.add_command(label='Redo', command=self.redo, accelerator='Ctrl+Y')
         em.add_separator()
         em.add_command(label='Inspector', command=self.open_inspector,
                        accelerator='I')
+        em.add_command(label='Devices & connections list',
+                       command=self.open_tree, accelerator='D')
         em.add_command(label='Duplicate wall', command=self.duplicate_wall,
                        accelerator='Ctrl+D')
         em.add_command(label='Group selected walls', command=self.group_walls,
                        accelerator='Ctrl+G')
         em.add_command(label='Ungroup walls', command=self.ungroup_walls,
                        accelerator='Ctrl+Shift+G')
-        em.add_command(label='Lock / unlock walls', command=self.toggle_lock,
-                       accelerator='Ctrl+L')
+        em.add_command(label='Lock / unlock selection',
+                       command=self.toggle_lock, accelerator='Ctrl+L')
         em.add_command(label='Delete selection', command=self.delete_selection,
                        accelerator='Del')
         m.add_cascade(label='Edit', menu=em)
-        im = tk.Menu(m, tearoff=0)
+        im = self._menu(m)
         for kind in KINDS:
             im.add_command(label=KIND_LABEL[kind].capitalize(),
                            command=lambda k=kind: self.set_tool(k))
@@ -1684,7 +2197,7 @@ class Editor(object):
         im.add_command(label='Picture...', command=self.insert_picture,
                        accelerator='P')
         m.add_cascade(label='Insert', menu=im)
-        vm = self.view_menu = tk.Menu(m, tearoff=0)
+        vm = self.view_menu = self._menu(m)
         vm.add_command(label='3D view', command=self.view_3d, accelerator='3')
         vm.add_command(label='Top view', command=self.view_top,
                        accelerator='T')
@@ -1698,8 +2211,14 @@ class Editor(object):
             vm.add_radiobutton(label=label, value=label,
                                variable=self.wall_mode_label,
                                command=self.redraw)
+        vm.add_separator()
+        vm.add_checkbutton(label='Dark mode', variable=self.v_dark,
+                           command=self.toggle_theme)
+        vm.add_command(label='Collapse / expand ribbon',
+                       command=lambda: self.ribbon.toggle(),
+                       accelerator='Ctrl+F1')
         m.add_cascade(label='View', menu=vm)
-        hm = tk.Menu(m, tearoff=0)
+        hm = self._menu(m)
         hm.add_command(label='Mouse & keys', command=lambda: self.mb.showinfo(
             'Mouse & keys', HELP_TEXT, parent=self.root))
         hm.add_command(label='Wall materials', command=lambda: self.mb.showinfo(
@@ -1726,9 +2245,9 @@ class Editor(object):
     def on_toggle(self):
         """A SHOW checkbox changed: keep dependent controls in sync."""
         if self.v_ranges.get():
-            self.cb_outline.grid()
+            self.cb_outline.pack(side='left', after=self.cb_ranges)
         else:
-            self.cb_outline.grid_remove()
+            self.cb_outline.pack_forget()
         st = 'normal' if self.v_ranges.get() else 'disabled'
         try:
             idx = self.view_menu.index('Ranges: outline only')
@@ -1739,10 +2258,19 @@ class Editor(object):
         self.cb_wallmode.config(state=st)
         self.redraw()
 
+    def toggle_theme(self):
+        name = 'dark' if self.v_dark.get() else 'light'
+        apply_theme(self.root, name)
+        save_prefs(theme=name)
+        self.set_tool(self.tool)
+        if self.tree and self.tree.alive:
+            self.tree.refresh()
+        self.redraw()
+
     def build_toolbar(self):
-        """Two bars. Top: editing ribbon (FILE, EDIT, ADD, CONNECT, BUILD).
-        Bottom: slim view bar (VIEW, SHOW, WALLS, RANGE). Groups wrap onto
-        new rows when the window is too narrow."""
+        """Word-like ribbon: tabs Home / Insert / Walls / Picture / View,
+        each with captioned groups. Collapse it with the button on the
+        right, a double-click on a tab, or Ctrl+F1."""
         tk, ttk = self.tk, self.ttk
         self.toggles = (('Ranges', self.v_ranges),
                         ('Ranges: outline only', self.v_outline),
@@ -1753,36 +2281,84 @@ class Editor(object):
                         ('Snap %g m' % self.SNAP, self.v_snap))
         self.build_menu()
         self.tool_widgets = {}
+        rb = self.ribbon = _Ribbon(tk, self.root)
+        rb.frame.pack(fill='x')
+        self.toolbar = rb
 
-        # ---- editing ribbon
-        top = self.toolbar = _FlowBar(tk, self.root, C['bar'])
-        top.frame.pack(fill='x')
+        def rows(g):
+            r1, r2 = tk.Frame(g, bg=C['bar']), tk.Frame(g, bg=C['bar'])
+            r1.pack(anchor='w')
+            r2.pack(anchor='w')
+            return r1, r2
 
-        g = self._group(top, 'FILE')
-        r1, r2 = tk.Frame(g, bg=C['bar']), tk.Frame(g, bg=C['bar'])
-        r1.pack(anchor='w'); r2.pack(anchor='w')
+        def check(parent, text, var, cmd=None):
+            c = tk.Checkbutton(parent, text=text, variable=var, bg=C['bar'],
+                               fg=C['text'], selectcolor=C['btn'],
+                               activebackground=C['bar'],
+                               activeforeground=C['text'],
+                               highlightthickness=0, font=('TkDefaultFont', 9),
+                               command=cmd or self.on_toggle)
+            c.pack(side='left', padx=2)
+            return c
+
+        # ---- Home
+        home = rb.tab('Home')
+        g = rb.group(home, 'FILE')
+        r1, r2 = rows(g)
         self._btn(r1, 'New', self.new, width=5)
         self._btn(r1, 'Open', self.open, width=5)
         self._btn(r1, 'Save', self.save, width=5)
         self._btn(r2, 'Save as', self.save_as, width=8)
         self._btn(r2, 'Export .py', self.export_py, width=8)
-
-        g = self._group(top, 'EDIT')
-        r1, r2 = tk.Frame(g, bg=C['bar']), tk.Frame(g, bg=C['bar'])
-        r1.pack(anchor='w'); r2.pack(anchor='w')
+        g = rb.group(home, 'EDIT')
+        r1, r2 = rows(g)
         self._btn(r1, 'Inspector', self.open_inspector, accent=True, width=8)
         self._btn(r1, 'Delete', self.delete_selection, width=6)
         self._btn(r2, 'Undo', self.undo, width=8)
         self._btn(r2, 'Redo', self.redo, width=6)
-
-        g = self._group(top, 'ADD DEVICE  (click the grid)')
+        g = rb.group(home, 'SELECT')
         self._tool(g, 'select', 'Select')
+        col = tk.Frame(g, bg=C['bar'])
+        col.pack(side='left', padx=2)
+        self._btn(col, 'Devices list', self.open_tree, side='top', width=10)
+        self._btn(col, 'Lock / unlock', self.toggle_lock, side='top', width=10)
+        g = rb.group(home, 'RANGE  (selected device, or drag its range handle)')
+        top = tk.Frame(g, bg=C['bar'])
+        top.pack(side='top', fill='x')
+        self.range_name = tk.Label(top, text='select an AP, station or car',
+                                   bg=C['bar'], fg=C['muted'], anchor='w',
+                                   font=('TkDefaultFont', 9))
+        self.range_name.pack(side='left')
+        bot = tk.Frame(g, bg=C['bar'])
+        bot.pack(side='top', pady=(3, 0))
+        self.slider = tk.Scale(bot, from_=0, to=300, orient='horizontal',
+                               length=190, resolution=1, showvalue=0,
+                               bg=C['ap_ring'], highlightthickness=0, bd=1,
+                               troughcolor=C['btn'], sliderrelief='flat',
+                               activebackground=C['ap'], sliderlength=14,
+                               width=11, command=self.on_slider)
+        self.slider.pack(side='left')
+        self.range_var = tk.StringVar()
+        self.range_entry = tk.Entry(bot, textvariable=self.range_var, width=7,
+                                    relief='flat', bg=C['btn'], fg=C['text'],
+                                    insertbackground=C['text'],
+                                    highlightthickness=1,
+                                    highlightbackground=C['grid_major'],
+                                    highlightcolor=C['ap'], justify='right')
+        self.range_entry.pack(side='left', padx=(6, 2))
+        self.range_entry.bind('<Return>', self.on_range_entry)
+        self.range_entry.bind('<KP_Enter>', self.on_range_entry)
+        self.range_entry.bind('<FocusOut>', self.on_range_entry)
+        tk.Label(bot, text='m', bg=C['bar'], fg=C['muted']).pack(side='left')
+
+        # ---- Insert
+        ins = rb.tab('Insert')
+        g = rb.group(ins, 'DEVICES  (click the grid to place)')
         for kind, text in (('ap', 'AP'), ('sta', 'Station'), ('car', 'Car'),
                            ('host', 'Host'), ('switch', 'Switch'),
                            ('ctrl', 'Controller')):
             self._tool(g, kind, text)
-
-        g = self._group(top, 'CONNECT  (drag device to device)')
+        g = rb.group(ins, 'CONNECT  (drag device to device)')
         self._tool(g, 'link', 'Link')
         col = tk.Frame(g, bg=C['bar'])
         col.pack(side='left', padx=(2, 0))
@@ -1798,89 +2374,281 @@ class Editor(object):
         self.link_kind.trace_add('write', lambda *a: self.link_help.config(
             text=LINK_HELP[self.link_kind.get()]))
         self.link_help.config(text=LINK_HELP['wired'])
-
-        g = self._group(top, 'BUILD  (Shift+click: multi-select)')
+        g = rb.group(ins, 'BUILD')
         self._tool(g, 'wall', 'Wall')
-        col = tk.Frame(g, bg=C['bar'])
-        col.pack(side='left', padx=2)
-        self._btn(col, 'Group', self.group_walls, side='top', width=7)
-        self._btn(col, 'Ungroup', self.ungroup_walls, side='top', width=7)
-        col = tk.Frame(g, bg=C['bar'])
-        col.pack(side='left', padx=2)
-        self._btn(col, 'Lock', self.toggle_lock, side='top', width=7)
-        self._btn(col, 'Duplicate', self.duplicate_wall, side='top', width=7)
         self._tool(g, 'picture', 'Picture', command=self.insert_picture)
 
-        # ---- slim view bar
-        vb = _FlowBar(tk, self.root, _mix(C['bar'], '#ffffff', 0.45),
-                      gap=10, vgap=3)
-        self.viewbar = vb
-        vb.frame.pack(fill='x')
-        vbg = vb.bg
-
-        def checkbox(parent, text, var, **grid):
-            c = tk.Checkbutton(parent, text=text, variable=var, bg=vbg,
-                               activebackground=vbg, highlightthickness=0,
-                               font=('TkDefaultFont', 9),
-                               command=self.on_toggle)
-            c.grid(**grid)
-            return c
-
-        g = self._group_v(vb, 'VIEW')
-        self._btn(g, '3D', self.view_3d, width=3)
-        self._btn(g, 'Top', self.view_top, width=3)
-        self._btn(g, 'Fit', self.fit, width=3)
-
-        g = self._group_v(vb, 'SHOW')
-        checkbox(g, 'Ranges', self.v_ranges, row=0, column=0, sticky='w')
-        self.cb_outline = checkbox(g, 'outline only', self.v_outline, row=0,
-                                   column=1, sticky='w')
-        checkbox(g, 'Sphere', self.v_sphere, row=0, column=2, sticky='w')
-        checkbox(g, 'Labels', self.v_labels, row=0, column=3, sticky='w')
-        checkbox(g, 'AP clients', self.v_clients, row=0, column=4,
-                 sticky='w')
-        checkbox(g, 'Snap %g m' % self.SNAP, self.v_snap, row=0, column=5,
-                 sticky='w')
-
-        g = self._group_v(vb, 'WALLS')
-        checkbox(g, 'Show', self.v_walls, row=0, column=0, sticky='w')
-        tk.Label(g, text='camera:', bg=vbg, fg=C['muted'],
-                 font=('TkDefaultFont', 8)).grid(row=0, column=1, padx=(6, 2))
+        # ---- Walls
+        wt = rb.tab('Walls')
+        g = rb.group(wt, 'WALLS  (Shift+click: multi-select)')
+        self._tool(g, 'wall', 'Draw wall', command=lambda: self.set_tool('wall'))
+        r1, r2 = rows(g)
+        self._btn(r1, 'Group', self.group_walls, width=8)
+        self._btn(r1, 'Lock', self.toggle_lock, width=8)
+        self._btn(r2, 'Ungroup', self.ungroup_walls, width=8)
+        self._btn(r2, 'Duplicate', self.duplicate_wall, width=8)
+        g = rb.group(wt, 'DISPLAY')
+        r1, r2 = rows(g)
+        check(r1, 'Show walls', self.v_walls)
+        tk.Label(r2, text='camera:', bg=C['bar'], fg=C['muted'],
+                 font=('TkDefaultFont', 8)).pack(side='left', padx=(2, 2))
         self.cb_wallmode = ttk.Combobox(
-            g, textvariable=self.wall_mode_label, state='readonly', width=22,
+            r2, textvariable=self.wall_mode_label, state='readonly', width=22,
             values=[l for _, l in WALL_MODES])
-        self.cb_wallmode.grid(row=0, column=2)
+        self.cb_wallmode.pack(side='left')
         self.cb_wallmode.bind('<<ComboboxSelected>>', lambda e: (
             self.redraw(), self.canvas.focus_set()))
 
-        g = self._group_v(vb, 'RANGE')
-        self.range_name = tk.Label(g, text='select an AP, station or car',
-                                   bg=vbg, fg=C['muted'], anchor='w', width=20,
-                                   font=('TkDefaultFont', 9))
-        self.range_name.pack(side='left')
-        self.slider = tk.Scale(g, from_=0, to=300, orient='horizontal',
-                               length=170, resolution=1, showvalue=0,
-                               bg=C['ap_ring'], highlightthickness=0, bd=1,
-                               troughcolor='white', sliderrelief='flat',
-                               activebackground=C['ap'], sliderlength=14,
-                               width=11, command=self.on_slider)
-        self.slider.pack(side='left', padx=4)
-        self.range_val = tk.Label(g, text='', bg=vbg, fg=C['text'], width=6,
-                                  anchor='w', font=('TkDefaultFont', 9, 'bold'))
-        self.range_val.pack(side='left')
+        # ---- Picture
+        pt = rb.tab('Picture')
+        g = rb.group(pt, 'PICTURE')
+        self._tool(g, 'picture', 'Insert', command=self.insert_picture)
+        g = rb.group(pt, 'TRANSFORM  (selected picture)')
+        r1, r2 = rows(g)
+        self._btn(r1, 'Rotate 90°', lambda: self.pic_rotate(), width=10)
+        self._btn(r1, 'Flip H', lambda: self.pic_flag('flip_h'), width=7)
+        self._btn(r2, 'Crop...', self.open_inspector, width=10)
+        self._btn(r2, 'Flip V', lambda: self.pic_flag('flip_v'), width=7)
+        g = rb.group(pt, 'ADJUST')
+        r1, r2 = rows(g)
+        self._btn(r1, 'Grayscale', lambda: self.pic_flag('grayscale'), width=9)
+        self._btn(r1, 'Invert', lambda: self.pic_flag('invert'), width=7)
+        self._btn(r2, 'White to clear', lambda: self.pic_flag('key_white'),
+                  width=11)
+        self._btn(r2, 'Reset', self.pic_reset, width=5)
+        g = rb.group(pt, 'ARRANGE')
+        r1, r2 = rows(g)
+        self._btn(r1, 'Fit to network', self.pic_fit, width=12)
+        self._btn(r2, 'Lock / unlock', self.toggle_lock, width=12)
 
-    def _group_v(self, bar, caption):
-        """Inline-captioned group for the view bar (uses the bar colour)."""
-        tk = self.tk
-        outer = bar.group()
-        tk.Frame(outer, width=1, bg=C['grid_major']).pack(side='right',
-                                                          fill='y', padx=(8, 0))
-        tk.Label(outer, text=caption, bg=bar.bg, fg=C['muted'],
-                 font=('TkDefaultFont', 7, 'bold')).pack(side='left',
-                                                         padx=(0, 6))
-        body = tk.Frame(outer, bg=bar.bg)
-        body.pack(side='left')
-        return body
+        # ---- View
+        vt = rb.tab('View')
+        g = rb.group(vt, 'CAMERA')
+        r1, r2 = rows(g)
+        self._btn(r1, '3D', self.view_3d, width=4)
+        self._btn(r1, 'Top', self.view_top, width=4)
+        self._btn(r2, 'Fit', self.fit, width=4)
+        g = rb.group(vt, 'SHOW')
+        r1, r2 = rows(g)
+        self.cb_ranges = check(r1, 'Ranges', self.v_ranges)
+        self.cb_outline = check(r1, 'outline only', self.v_outline)
+        check(r1, 'Sphere', self.v_sphere)
+        check(r2, 'Labels', self.v_labels)
+        check(r2, 'AP clients', self.v_clients)
+        check(r2, 'Snap %g m' % self.SNAP, self.v_snap)
+        g = rb.group(vt, 'THEME')
+        check(g, 'Dark mode', self.v_dark, self.toggle_theme)
+        self.root.bind('<Control-F1>', lambda e: rb.toggle())
+
+    # -------------------------------------------------- range entry ----
+    def on_range_entry(self, e=None):
+        n = self.sel_node()
+        if not n or n['kind'] not in WIRELESS_KINDS:
+            return
+        try:
+            v = float(self.range_var.get().replace('m', '').strip())
+        except ValueError:
+            self.range_entry.config(bg=C['bad_entry'])
+            return
+        self.range_entry.config(bg=C['btn'])
+        if v < 0 or abs(v - self.rng(n)) < 1e-9:
+            return
+        self.push_undo()
+        n['p']['range'] = round(v, 2)
+        self.changed()
+
+    # ------------------------------------------------ picture tools ----
+    def _pic_or_msg(self):
+        pic = self.sel_pic()
+        if pic is None:
+            self.msg = 'Select a picture first (click it with the Select tool).'
+            self.redraw()
+        elif pic.get('locked'):
+            self.msg = '!  The picture is locked.'
+            self.redraw()
+            return None
+        return pic
+
+    def pic_flag(self, key):
+        pic = self._pic_or_msg()
+        if pic is None:
+            return
+        self.push_undo()
+        pic[key] = not pic.get(key, False)
+        self.changed()
+
+    def pic_rotate(self):
+        pic = self._pic_or_msg()
+        if pic is None:
+            return
+        self.push_undo()
+        pic['rot90'] = str((int(pic.get('rot90') or 0) + 90) % 360)
+        self.changed()
+
+    def pic_reset(self):
+        pic = self._pic_or_msg()
+        if pic is None:
+            return
+        self.push_undo()
+        pic.update(PIC_EDIT_DEFAULTS)
+        self.changed()
+
+    def pic_fit(self):
+        pic = self._pic_or_msg()
+        if pic is None:
+            return
+        pts = [n['xyz'] for n in self.nodes.values()] + \
+            [c for w in self.walls.values() for c in wall_corners(w)]
+        if not pts:
+            self.msg = 'Nothing to fit the picture to yet.'
+            return self.redraw()
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        self.push_undo()
+        pic['x'], pic['y'] = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+        span = max(max(xs) - min(xs), (max(ys) - min(ys)) /
+                   max(self.pic_aspect(pic), 1e-6), 10)
+        pic['width'] = round(span * 1.1, 2)
+        pic['rotation'] = 0.0
+        self.changed()
+
+    # ------------------------------------------------- devices tree ----
+    def open_tree(self):
+        if self.tree and self.tree.alive:
+            self.tree.top.lift()
+            self.tree.refresh()
+        else:
+            self.tree = _TreePanel(self.tk, self.root, self)
+
+    def draw_kind_icon(self, cv, kind, x, y):
+        draw_icon(cv, kind, x, y + (3 if kind == 'ap' else 0), s=0.6,
+                  ow=C['outline'])
+
+    def tree_rows(self):
+        """Devices and connections for the git-graph list."""
+        name = dict((i, n['name']) for i, n in self.nodes.items())
+        nodes = [(n['name'], n['kind']) for n in self.nodes.values()]
+        edges = []
+        for l in self.links.values():
+            txt = ''
+            if l['kind'] == 'wifi':
+                txt = 'est. %d dBm' % round(self.est_rssi(
+                    self.nodes[l['a']], self.nodes[l['b']])[0])
+            elif l['kind'] == 'wired' and l['p'].get('bw') is not None:
+                txt = '%s Mb/s' % fmt_num(l['p']['bw'])
+            elif l['kind'] in ('adhoc', 'mesh'):
+                txt = l['p'].get('ssid') or ''
+            edges.append((name[l['a']], name[l['b']], l['kind'], txt))
+        for aid, lst in self.associations().items():
+            for i, how in lst:
+                if how == 'auto':
+                    edges.append((name[aid], name[i], 'auto', 'est. %d dBm' %
+                                  round(self.est_rssi(self.nodes[i],
+                                                      self.nodes[aid])[0])))
+        ctrls = [n for n in self.nodes.values() if n['kind'] == 'ctrl']
+        for n in self.nodes.values():
+            if n['kind'] in ('ap', 'switch') and \
+                    n['p'].get('failMode') != 'standalone':
+                for c in ctrls:
+                    edges.append((c['name'], n['name'], 'control', ''))
+        rows = build_tree(nodes, edges)
+        by = dict((n['name'], n) for n in self.nodes.values())
+        for r in rows:
+            n = by[r['name']]
+            bits = [KIND_LABEL[n['kind']]]
+            if n['p'].get('ip'):
+                bits.append(str(n['p']['ip']).split('/')[0])
+            if n['kind'] == 'ap':
+                bits.append('ch %s' % n['p'].get('channel'))
+                bits.append('%d clients' % len(
+                    self.associations().get(n['id'], [])))
+            if n.get('locked'):
+                bits.append('locked')
+            r['detail'] = '  '.join(bits)
+            r['id'] = n['id']
+        return rows
+
+    def center_on(self, nid):
+        n = self.nodes.get(nid)
+        if n is None:
+            return
+        self.target = tuple(n['xyz'])
+        self.pan = [0.0, 0.0]
+        self.user_view = True
+        self.redraw()
+
+    def tree_select(self, row):
+        self.select(('node', row['id']))
+
+    def tree_activate(self, row):
+        self.center_on(row['id'])
+        self.select(('node', row['id']))
+        self.open_inspector()
+
+    def set_wifi(self, sid, aid):
+        """Station / car joins this AP (replaces its Wi-Fi links)."""
+        self.push_undo()
+        for lid in [i for i, l in self.links.items()
+                    if l['kind'] == 'wifi' and l['a'] == sid]:
+            del self.links[lid]
+        if aid is not None:
+            lid = self.next_id
+            self.next_id += 1
+            self.links[lid] = {'id': lid, 'kind': 'wifi', 'a': sid, 'b': aid,
+                               'p': default_link_params('wifi')}
+        self.msg = '%s: %s.' % (self.nodes[sid]['name'],
+                                'Wi-Fi link to %s' % self.nodes[aid]['name']
+                                if aid else 'auto association')
+        self.changed()
+
+    def tree_menu(self, m, row):
+        nid = row['id']
+        n = self.nodes[nid]
+        m.add_command(label='Go to %s' % n['name'],
+                      command=lambda: self.center_on(nid))
+        m.add_command(label='Inspect', command=lambda: self.tree_activate(row))
+        m.add_separator()
+        others = sorted((o for o in self.nodes.values() if o['id'] != nid),
+                        key=lambda o: o['name'])
+        if n['kind'] in ('sta', 'car'):
+            sub = self.self._menu(m)
+            for ap in (o for o in others if o['kind'] == 'ap'):
+                sub.add_command(label='%s  (est. %d dBm)' % (
+                    ap['name'], round(self.est_rssi(n, ap)[0])),
+                    command=lambda a=ap['id']: self.set_wifi(nid, a))
+            m.add_cascade(label='Connect via Wi-Fi to', menu=sub)
+            m.add_command(label='Use auto association (no Wi-Fi link)',
+                          command=lambda: self.set_wifi(nid, None))
+        if n['kind'] != 'ctrl':
+            sub = self.self._menu(m)
+            for o in others:
+                if o['kind'] != 'ctrl':
+                    sub.add_command(label=o['name'], command=lambda o=o: (
+                        self.link_kind.set('wired'),
+                        self.add_link(nid, o['id'])))
+            m.add_cascade(label='Add wired link to', menu=sub)
+        mine = [l for l in self.links.values() if nid in (l['a'], l['b'])]
+        if mine:
+            sub = self.self._menu(m)
+            for l in mine:
+                other = self.nodes[l['b'] if l['a'] == nid else l['a']]
+                sub.add_command(label='%s link to %s' % (l['kind'],
+                                                         other['name']),
+                                command=lambda lid=l['id']: self.remove_link(
+                                    lid))
+            m.add_cascade(label='Remove link', menu=sub)
+        m.add_separator()
+        m.add_command(label='Unlock' if n.get('locked') else 'Lock',
+                      command=lambda: (self.select(('node', nid)),
+                                       self.toggle_lock()))
+        m.add_command(label='Delete', command=lambda: (
+            self.select(('node', nid)), self.delete_selection()))
+
+    def remove_link(self, lid):
+        if lid in self.links:
+            self.push_undo()
+            del self.links[lid]
+            self.msg = 'Link removed.'
+            self.changed()
 
     def set_tool(self, tool):
         self.tool = tool
@@ -1888,7 +2656,7 @@ class Editor(object):
             self.drag = None
         for t, (f, cv, lb) in self.tool_widgets.items():
             on = t == tool
-            bg = 'white' if on else C['bar']
+            bg = C['btn'] if on else C['bar']
             f.config(bg=bg, highlightbackground=C['axis'] if on else C['bar'])
             cv.config(bg=bg)
             lb.config(bg=bg)
@@ -1941,9 +2709,19 @@ class Editor(object):
                 return '%s/%d' % (h, netw.prefixlen)
         return ''
 
+    def point_in_wall(self, p):
+        for w in self.walls.values():
+            if wall_contains_point(w, p):
+                return w
+        return None
+
     def add_node(self, kind, sx, sy):
         x, y = self.unproject(sx, sy, 0.0)
         x, y = self.snap(x), self.snap(y)
+        w = self.point_in_wall((x, y, 0.0))
+        if w is not None:
+            self.msg = '!  Cannot place a device inside %s.' % w['name']
+            return self.redraw()
         self.push_undo()
         name = self.unique_name(kind)
         nid = self.next_id
@@ -2002,6 +2780,12 @@ class Editor(object):
             return
         kind, oid = self.sel
         self.push_undo()
+        if kind == 'node' and oid in self.nodes and \
+                self.nodes[oid].get('locked'):
+            self.undo_stack.pop()
+            self.msg = '!  Unlock %s before deleting it.' % \
+                self.nodes[oid]['name']
+            return self.redraw()
         if kind == 'node' and oid in self.nodes:
             name = self.nodes[oid]['name']
             for lid in [l for l, v in self.links.items()
@@ -2143,12 +2927,16 @@ class Editor(object):
         return 'wall%d' % i
 
     def overlapping_wall(self, w, ignore=()):
-        """First other wall that w would overlap (None = fine)."""
+        """First other wall that w would overlap, or a device it would
+        swallow (None = fine)."""
         for i, o in self.walls.items():
             if i in ignore or i == w.get('id'):
                 continue
             if walls_overlap(w, o):
                 return o
+        for n in self.nodes.values():
+            if wall_contains_point(w, n['xyz']):
+                return {'name': 'device %s' % n['name']}
         return None
 
     def check_wall(self, w):
@@ -2344,16 +3132,26 @@ class Editor(object):
         self.changed()
 
     def toggle_lock(self):
+        """Lock / unlock the selection: walls, a device or a picture."""
         ids = self.sel_wall_ids()
-        if not ids:
-            self.msg = 'Select a wall (double-click works on locked ones).'
+        n, pic = self.sel_node(), self.sel_pic()
+        if not ids and n is None and pic is None:
+            self.msg = ('Select a device, wall or picture (double-click works '
+                        'on locked ones).')
             return self.redraw()
         self.push_undo()
-        new = not all(self.walls[i].get('locked') for i in ids)
-        for i in ids:
-            self.walls[i]['locked'] = new
-        self.msg = '%s %d wall%s.' % ('Locked' if new else 'Unlocked',
-                                      len(ids), '' if len(ids) == 1 else 's')
+        if ids:
+            new = not all(self.walls[i].get('locked') for i in ids)
+            for i in ids:
+                self.walls[i]['locked'] = new
+            what = '%d wall%s' % (len(ids), '' if len(ids) == 1 else 's')
+        elif n is not None:
+            new = n['locked'] = not n.get('locked', False)
+            what = n['name']
+        else:
+            new = pic['locked'] = not pic.get('locked', False)
+            what = 'picture'
+        self.msg = '%s %s.' % ('Locked' if new else 'Unlocked', what)
         self.changed()
 
     def wall_click(self, wid, shift):
@@ -2416,32 +3214,38 @@ class Editor(object):
         return Image, ImageTk
 
     def pic_source(self, pic, reduce=1):
-        """Loaded RGBA image (cached, max 2048 px), or None."""
-        key = (pic.get('path'), reduce)
+        """Loaded + adjusted RGBA image (cached, max 2048 px), or None."""
+        key = (pic.get('path'), reduce, pic_edits_key(pic))
         if key in self._pic_src:
             return self._pic_src[key]
         img = None
         lib = self.pil()
-        if lib and pic.get('path'):
+        path = pic.get('path')
+        if lib and path:
             Image = lib[0]
             try:
                 if reduce == 1:
-                    im = Image.open(pic['path'])
-                    im.load()
-                    im = im.convert('RGBA')
-                    m = max(im.size)
-                    if m > 2048:
-                        k = 2048.0 / m
-                        im = im.resize((max(1, int(im.size[0] * k)),
-                                        max(1, int(im.size[1] * k))),
-                                       Image.LANCZOS)
-                    img = im
+                    raw = self._pic_raw.get(path)
+                    if raw is None:
+                        im = Image.open(path)
+                        im.load()
+                        im = im.convert('RGBA')
+                        m = max(im.size)
+                        if m > 2048:
+                            k = 2048.0 / m
+                            im = im.resize((max(1, int(im.size[0] * k)),
+                                            max(1, int(im.size[1] * k))),
+                                           Image.LANCZOS)
+                        raw = self._pic_raw[path] = im
+                    img = apply_pic_edits(raw, pic)
                 else:
                     base = self.pic_source(pic, 1)
                     if base is not None:
                         img = base.reduce(reduce)
             except Exception:
                 img = None
+        if len(self._pic_src) > 60:
+            self._pic_src.clear()
         self._pic_src[key] = img
         return img
 
@@ -2513,6 +3317,8 @@ class Editor(object):
 
     def changed(self, src=None):
         """Call after every model change."""
+        if self.tree is not None and self.tree.alive:
+            self.root.after_idle(self.tree.refresh)
         self.dirty = True
         self.update_title()
         self.sync_slider()
@@ -2577,13 +3383,14 @@ class Editor(object):
                 self.slider.set(r)
                 self.range_name.config(text='%s  (%s)' % (
                     n['name'], KIND_LABEL[n['kind']]), fg=C['text'])
-                self.range_val.config(text='%s m' % fmt_num(r))
+                if self.root.focus_get() is not self.range_entry:
+                    self.range_var.set(fmt_num(r))
             else:
                 self.slider.set(0)
                 self.slider.config(state='disabled')
                 self.range_name.config(text='select an AP, station or car',
                                        fg=C['muted'])
-                self.range_val.config(text='')
+                self.range_var.set('')
         finally:
             self._lock = False
 
@@ -2598,7 +3405,7 @@ class Editor(object):
             return
         self.push_undo(('slider', n['id']))
         n['p']['range'] = v
-        self.range_val.config(text='%s m' % fmt_num(v))
+        self.range_var.set(fmt_num(v))
         self.dirty = True
         self.update_title()
         if self.inspector:
@@ -2695,9 +3502,11 @@ class Editor(object):
             self.fit()
 
     # ----------------------------------------------------------- mouse ----
-    def node_at(self, x, y):
+    def node_at(self, x, y, include_locked=False):
         best, bd = None, self.HIT
         for nid, sx, sy in self.hits:
+            if not include_locked and self.nodes[nid].get('locked'):
+                continue
             d = math.hypot(sx - x, sy - y)
             if d <= bd:
                 best, bd = nid, d
@@ -2768,7 +3577,13 @@ class Editor(object):
                          'moved': False, 'snap': p if snapped else None,
                          'snap0': snapped, 'blocked': False}
             return
-        if self.tool != 'link' and self.sel_node():
+        n = self.sel_node()
+        if n and self.tool == 'select' and not n.get('locked') and \
+                self.range_hit and math.hypot(
+                    e.x - self.range_hit[0], e.y - self.range_hit[1]) <= 9:
+            self.drag = {'mode': 'range', 'id': n['id'], 'moved': False}
+            return
+        if self.tool != 'link' and n and not n.get('locked'):
             h = self.axis_at(e.x, e.y)
             if h:
                 axis, x1, y1, x2, y2, L = h
@@ -2779,7 +3594,7 @@ class Editor(object):
                              'v': ((x2 - o[0]) / L, (y2 - o[1]) / L),
                              'moved': False}
                 return
-        nid = self.node_at(e.x, e.y)
+        nid = self.node_at(e.x, e.y, include_locked=self.tool == 'link')
         if self.tool == 'link':
             if nid:
                 self.drag = {'mode': 'link', 'from': nid, 'to': (e.x, e.y)}
@@ -2863,6 +3678,25 @@ class Editor(object):
         elif d['mode'] == 'link':
             d['to'] = (e.x, e.y)
             self.hover = self.node_at(e.x, e.y)
+        elif d['mode'] == 'range':
+            n = self.nodes.get(d['id'])
+            if n is None:
+                return
+            if not d['moved']:
+                if not far:
+                    return
+                d['moved'] = True
+                self.push_undo()
+            mx, my = self.unproject(e.x, e.y, n['xyz'][2])
+            r = math.hypot(mx - n['xyz'][0], my - n['xyz'][1])
+            if self.v_snap.get():
+                r = self.snap(r)
+            n['p']['range'] = round(max(r, 0.5), 1)
+            self.dirty = True
+            self.update_title()
+            self.sync_slider()
+            if self.inspector:
+                self.inspector.refresh()
         elif d['mode'] == 'wall_draw':
             x, y = self.unproject(e.x, e.y, 0.0)
             zr = self.zone_zrange()
@@ -3004,7 +3838,16 @@ class Editor(object):
                 d['xyz'] = [x, y, z]
                 xyz = [self.snap(x), self.snap(y), self.snap(z) if
                        e.state & 0x0001 and self.v_snap.get() else z]
-            n['xyz'] = [round(v, 2) for v in xyz]
+            new = [round(v, 2) for v in xyz]
+            if self.point_in_wall(new):              # never inside a wall
+                old = list(n['xyz'])
+                for cand in ([new[0], old[1], new[2]],
+                             [old[0], new[1], new[2]], old):
+                    if not self.point_in_wall(cand):
+                        new = cand
+                        break
+                self.msg = '!  Devices cannot be placed inside walls.'
+            n['xyz'] = new
             self.dirty = True
             self.update_title()
             if self.inspector:
@@ -3034,13 +3877,13 @@ class Editor(object):
             if to and to != d['from']:
                 self.add_link(d['from'], to)
                 return
-        if d['mode'] in ('node', 'axis') and d['moved']:
+        if d['mode'] in ('node', 'axis', 'range') and d['moved']:
             self.changed()
             return
         self.redraw()
 
     def on_double(self, e):
-        nid = self.node_at(e.x, e.y)
+        nid = self.node_at(e.x, e.y, include_locked=True)
         lid = None if nid else self.link_at(e.x, e.y)
         if nid:
             self.select(('node', nid))
@@ -3090,17 +3933,22 @@ class Editor(object):
         self.mouse = (e.x, e.y)
         h = self.axis_at(e.x, e.y) if self.tool != 'link' else None
         axis = h[0] if h else None
-        node = None if h else self.node_at(e.x, e.y)
+        node = None if h else self.node_at(e.x, e.y, include_locked=True)
+        near_r = self.range_hit and self.tool == 'select' and math.hypot(
+            e.x - self.range_hit[0], e.y - self.range_hit[1]) <= 9
         ph = (self.pic_handle_at(e.x, e.y) or self.wall_handle_at(e.x, e.y)) \
             if self.tool == 'select' else None
-        if ph:
+        if near_r:
+            self.canvas.config(cursor='sb_h_double_arrow')
+        elif ph:
             self.canvas.config(cursor='exchange' if ph[0] == 'rot'
                                else 'sizing')
         elif axis is not None:
             self.canvas.config(cursor='hand2')
         elif node:
-            self.canvas.config(cursor='fleur' if self.tool != 'link'
-                               else 'crosshair')
+            self.canvas.config(cursor='crosshair' if self.tool == 'link' else
+                               ('' if self.nodes[node].get('locked')
+                                else 'fleur'))
         else:
             self.canvas.config(cursor='' if self.tool == 'select'
                                else 'crosshair')
@@ -3129,6 +3977,8 @@ class Editor(object):
             self.insert_picture()
         elif k in ('w', 'W'):
             self.set_tool('wall')
+        elif k in ('d', 'D'):
+            self.open_tree()
         elif k in ('t', 'T'):
             self.view_top()
         elif k == '3':
@@ -3279,7 +4129,7 @@ class Editor(object):
                                   outline=col, width=2)
                 cv.create_oval(mx - 1.5, my + 1.5, mx + 1.5, my + 4.5,
                                fill=col, outline='')
-                txt = 'Wi-Fi  %d dBm%s%s' % (
+                txt = 'Wi-Fi  est. %d dBm%s%s' % (
                     round(rssi), ('  (-%s dB walls)' % fmt_num(wl)) if whit
                     else '', '' if ok else '  NO SIGNAL')
                 if labels:
@@ -3369,8 +4219,11 @@ class Editor(object):
 
         # local axes of the selected device
         self.axis_hits = []
-        if sel_node in self.nodes:
+        self.range_hit = None
+        if sel_node in self.nodes and not self.nodes[sel_node].get('locked'):
             self.draw_axes(self.nodes[sel_node])
+            if self.tool == 'select':
+                self.draw_range_handle(self.nodes[sel_node])
         self.pic_hits = []
         if sel_pic in self.pics:
             self.draw_pic_handles(self.pics[sel_pic])
@@ -3595,7 +4448,7 @@ class Editor(object):
         coef = (by / det, -bx / det, (by * dx - bx * dy) / det,
                 -ay / det, ax / det, (-ay * dx + ax * dy) / det)
         op = max(0, min(100, int(round(float(pic.get('opacity', 100))))))
-        key = (pic.get('path'), k, x1 - x0, y1 - y0, op,
+        key = (pic.get('path'), pic_edits_key(pic), k, x1 - x0, y1 - y0, op,
                tuple(round(c, 6) for c in coef))
         cached = self._pic_tk.get(pic['id'])
         if cached and cached[0] == key:
@@ -3683,6 +4536,10 @@ class Editor(object):
                            font=('TkDefaultFont', 9, 'bold'))
 
     def sub_label(self, n):
+        txt = self._sub_label(n)
+        return (txt + '  · locked') if n.get('locked') else txt
+
+    def _sub_label(self, n):
         p, kind = n['p'], n['kind']
         ip = str(p.get('ip') or '').split('/')[0]
         r = self.rng(n)
@@ -3706,7 +4563,7 @@ class Editor(object):
         if selected:
             cv.create_oval(x - 19, y - 19, x + 19, y + 19, fill='',
                            outline=C['select'], dash=(2, 3))
-        draw_icon(cv, n['kind'], x, y, ow=C['select'] if hl else 'white')
+        draw_icon(cv, n['kind'], x, y, ow=C['select'] if hl else C['outline'])
         if n['kind'] == 'ap' and self.v_clients.get():
             cnt = len(getattr(self, '_assoc', {}).get(nid, []))
             bx, by = x + 15, y - 13
@@ -3723,6 +4580,24 @@ class Editor(object):
                 cv.create_text(x, y + 33, text=sub, fill=C['muted'],
                                font=('TkDefaultFont', 8))
         self.hits.append((nid, x, y))
+
+    def draw_range_handle(self, n):
+        """Grab point on the range circle: drag it to change the range."""
+        r = self.rng(n)
+        if n['kind'] not in WIRELESS_KINDS:
+            return
+        x, y, z = n['xyz']
+        ux, uy = math.cos(self.yaw), -math.sin(self.yaw)   # screen right
+        hx, hy, _ = self.project(x + ux * r, y + uy * r, z)
+        cx, cy, _ = self.project(x, y, z)
+        cv = self.canvas
+        cv.create_line(cx, cy, hx, hy, fill=C['ap'], dash=(2, 4))
+        cv.create_polygon(hx, hy - 8, hx + 8, hy, hx, hy + 8, hx - 8, hy,
+                          fill=C['btn'], outline=C['ap'], width=2)
+        cv.create_text(hx + 12, hy - 10, anchor='w',
+                       text='r = %s m' % fmt_num(round(r, 1)),
+                       fill=C['ap'], font=('TkDefaultFont', 9, 'bold'))
+        self.range_hit = (hx, hy)
 
     def draw_axes(self, n):
         """Local X / Y / Z arrows on the selected device (draggable)."""
@@ -3941,7 +4816,8 @@ class Editor(object):
 
     def to_doc(self):
         nodes = [{'kind': n['kind'], 'name': n['name'],
-                  'xyz': list(n['xyz']), 'p': copy.deepcopy(n['p'])}
+                  'xyz': list(n['xyz']), 'p': copy.deepcopy(n['p']),
+                  'locked': bool(n.get('locked'))}
                  for _, n in sorted(self.nodes.items())]
         links = [{'kind': l['kind'], 'a': self.nodes[l['a']]['name'],
                   'b': self.nodes[l['b']]['name'], 'p': copy.deepcopy(l['p'])}
@@ -3965,7 +4841,7 @@ class Editor(object):
             p.update(n['p'])
             self.nodes[nid] = {'id': nid, 'kind': n['kind'],
                                'name': n['name'], 'xyz': list(n['xyz']),
-                               'p': p}
+                               'p': p, 'locked': bool(n.get('locked'))}
             ids[n['name']] = nid
         for l in doc['links']:
             if l['a'] in ids and l['b'] in ids:
@@ -4111,7 +4987,7 @@ class Editor(object):
                 ('normalized', 'Normalized',
                  'Parameters are exactly the Mininet-WiFi keyword arguments\n'
                  '(net.addStation(name, **params) ...). Ready to run:\n'
-                 'sudo -E python3 wifi_edit.py --run file.json'),
+                 'sudo -E python3 custom_edit.py --run file.json'),
                 ('custom', 'Custom',
                  'Grouped by topic (radio, addressing, security, openflow...),\n'
                  'typed values, every field present (null when unset).\n'
@@ -4132,7 +5008,7 @@ class Editor(object):
         tk.Button(bf, text='Save', command=ok, relief='flat', bg=C['ap'],
                   fg='white', padx=14).pack(side='right', padx=4)
         tk.Button(bf, text='Cancel', command=top.destroy, relief='flat',
-                  bg='white', padx=10).pack(side='right', padx=4)
+                  bg=C['btn'], padx=10).pack(side='right', padx=4)
         top.bind('<Return>', ok)
         top.bind('<Escape>', lambda e: top.destroy())
         try:
@@ -4204,7 +5080,7 @@ class WallDialog(object):
                 w[key], str) else w[key])
             self.v[key] = var
             return tk.Entry(body, textvariable=var, width=width, relief='flat',
-                            bg='white', highlightthickness=1,
+                            bg=C['btn'], highlightthickness=1,
                             highlightbackground=C['grid_major'],
                             highlightcolor=C['ap'])
 
@@ -4230,20 +5106,21 @@ class WallDialog(object):
                                bd=1)
         self.swatch.pack(side='left')
         self.b_color = tk.Button(cf, text='Pick color...', relief='flat',
-                                 bg='white', command=self.pick_color)
+                                 bg=C['btn'], command=self.pick_color)
         self.b_color.pack(side='left', padx=6)
         row('Color', cf, 'editable when the material is custom')
         hf = tk.Frame(body, bg=C['bg'])
         self.v['height'] = tk.StringVar(value=fmt_num(w['height']))
-        tk.Scale(hf, from_=0, to=20, resolution=0.1, orient='horizontal',
+        tk.Scale(hf, from_=0, to=max(20, float(w['height']) * 1.5),
+                 resolution=0.1, orient='horizontal',
                  showvalue=0, length=150, bg=C['ap_ring'], bd=1,
-                 highlightthickness=0, troughcolor='white',
+                 highlightthickness=0, troughcolor=C['btn'],
                  sliderrelief='flat', sliderlength=14, width=11,
                  variable=tk.DoubleVar(value=float(w['height'])),
                  command=lambda v: self.v['height'].set(fmt_num(float(v)))
                  ).pack(side='left')
         tk.Entry(hf, textvariable=self.v['height'], width=6, relief='flat',
-                 bg='white', highlightthickness=1,
+                 bg=C['btn'], highlightthickness=1,
                  highlightbackground=C['grid_major']).pack(side='left',
                                                            padx=(6, 0))
         row('Height (m)', hf, '0 = flat 2D wall (blocks every crossing path);'
@@ -4264,7 +5141,7 @@ class WallDialog(object):
         tk.Button(bf, text='Create wall', relief='flat', bg=C['ap'],
                   fg='white', padx=12, command=self.ok).pack(side='right',
                                                              padx=4)
-        tk.Button(bf, text='Cancel', relief='flat', bg='white', padx=10,
+        tk.Button(bf, text='Cancel', relief='flat', bg=C['btn'], padx=10,
                   command=top.destroy).pack(side='right', padx=4)
         top.bind('<Return>', lambda e: self.ok())
         top.bind('<Escape>', lambda e: top.destroy())
@@ -4370,10 +5247,10 @@ class Inspector(object):
         foot = tk.Frame(top, bg=C['bar'], padx=6, pady=6)
         foot.pack(side='bottom', fill='x')
         self.b_net = tk.Button(foot, text='Network settings', relief='flat',
-                               bg='white', padx=8,
+                               bg=C['btn'], padx=8,
                                command=lambda: ed.select(None))
         self.b_net.pack(side='left', padx=3)
-        self.b_del = tk.Button(foot, text='Delete', relief='flat', bg='white',
+        self.b_del = tk.Button(foot, text='Delete', relief='flat', bg=C['btn'],
                                fg=C['warn'], padx=8,
                                command=ed.delete_selection)
         self.b_del.pack(side='left', padx=3)
@@ -4400,6 +5277,7 @@ class Inspector(object):
 
         self.target = None
         self.fields = {}
+        self._prog = {}              # values put in sliders by the program
         self.loading = False
         self.build()
 
@@ -4471,7 +5349,7 @@ class Inspector(object):
             for text, cmd in (('Group', self.ed.group_walls),
                               ('Ungroup', self.ed.ungroup_walls),
                               ('Lock / unlock all', self.ed.toggle_lock)):
-                tk.Button(bf, text=text, relief='flat', bg='white', padx=8,
+                tk.Button(bf, text=text, relief='flat', bg=C['btn'], padx=8,
                           command=cmd).pack(side='left', padx=(0, 6))
             self.note('Grouping only affects selection and moving: each wall '
                       'keeps its own material, loss and geometry. '
@@ -4506,6 +5384,9 @@ class Inspector(object):
             schema = SCHEMA[n['kind']]
             self.section('general')
             self.add_field(F('__name', 'Name', 'name', 'general'))
+            self.add_field(F('__locked', 'Locked', 'bool', 'general',
+                             hint='cannot be clicked or moved on the canvas '
+                                  '(double-click to inspect)'))
             for f in schema:
                 if f['group'] == 'general':
                     self.add_field(f)
@@ -4696,7 +5577,7 @@ class Inspector(object):
         self.row += 1
 
     def _entry(self, parent, var, width=None):
-        e = self.tk.Entry(parent, textvariable=var, relief='flat', bg='white',
+        e = self.tk.Entry(parent, textvariable=var, relief='flat', bg=C['btn'],
                           fg=C['text'], highlightthickness=1,
                           highlightbackground=C['grid_major'],
                           highlightcolor=C['ap'], insertbackground=C['text'])
@@ -4729,7 +5610,7 @@ class Inspector(object):
             w.grid(row=self.row, column=1, sticky='ew', pady=2)
             e = self._entry(w, var)
             e.pack(side='left', fill='x', expand=True)
-            tk.Button(w, text='Browse...', relief='flat', bg='white', padx=6,
+            tk.Button(w, text='Browse...', relief='flat', bg=C['btn'], padx=6,
                       command=lambda k=key: self.browse(k)).pack(
                 side='left', padx=(4, 0))
             rec['entry'] = e
@@ -4742,7 +5623,7 @@ class Inspector(object):
             sw.pack(side='left')
             e = self._entry(w, var, width=9)
             e.pack(side='left', padx=4)
-            b = tk.Button(w, text='Pick...', relief='flat', bg='white',
+            b = tk.Button(w, text='Pick...', relief='flat', bg=C['btn'],
                           padx=6, command=lambda k=key: self.pick_color(k))
             b.pack(side='left')
             rec['entry'], rec['swatch'], rec['button'] = e, sw, b
@@ -4754,7 +5635,7 @@ class Inspector(object):
             w.grid(row=self.row, column=1, sticky='ew')
             sc = tk.Scale(w, from_=lo, to=hi, orient='horizontal',
                           resolution=res, showvalue=0, bg=C['ap_ring'], bd=1,
-                          highlightthickness=0, troughcolor='white',
+                          highlightthickness=0, troughcolor=C['btn'],
                           sliderrelief='flat', activebackground=C['ap'],
                           sliderlength=14, width=12,
                           command=lambda v, k=key: self.on_scale(k, v))
@@ -4766,7 +5647,7 @@ class Inspector(object):
         elif t == 'text':
             var = None
             w = tk.Text(self.body, height=4, width=26, relief='flat',
-                        bg='white', fg=C['text'], highlightthickness=1,
+                        bg=C['btn'], fg=C['text'], highlightthickness=1,
                         highlightbackground=C['grid_major'],
                         highlightcolor=C['ap'], font=('TkFixedFont', 9),
                         insertbackground=C['text'])
@@ -4809,8 +5690,8 @@ class Inspector(object):
         if f['type'] == 'range':
             return max(300, math.ceil(v * 1.5 / 50) * 50)
         hi = f['opts'][1]
-        if f['key'] in ('width', 'length'):
-            return max(hi, math.ceil(v * 1.5 / 50) * 50)
+        if f['key'] in ('width', 'length', 'thickness', 'height'):
+            return max(hi, v * 1.5)          # never clamp what you typed
         return hi
 
     # ----------------------------------------------------------- values ----
@@ -4824,6 +5705,8 @@ class Inspector(object):
                 return o['name']
             if key in ('__x', '__y', '__z'):
                 return o['xyz']['xyz'.index(key[2])]
+            if key == '__locked':
+                return bool(o.get('locked'))
             return o['p'].get(key)
         if kind == 'link':
             return o['p'].get(key)
@@ -4850,6 +5733,8 @@ class Inspector(object):
                 o['name'] = val
             elif key in ('__x', '__y', '__z'):
                 o['xyz']['xyz'.index(key[2])] = val
+            elif key == '__locked':
+                o['locked'] = bool(val)
             else:
                 o['p'][key] = val
         elif kind == 'link':
@@ -4884,7 +5769,7 @@ class Inspector(object):
                     if w.get('1.0', 'end-1c') != txt:
                         w.delete('1.0', 'end')
                         w.insert('1.0', txt)
-                    w.config(bg='white')
+                    w.config(bg=C['btn'])
                 else:
                     s = fmt_num(v) if isinstance(v, (int, float)) and \
                         not isinstance(v, bool) else ('' if v is None
@@ -4892,10 +5777,25 @@ class Inspector(object):
                     if rec['var'].get() != s:
                         rec['var'].set(s)
                     if rec['entry'] is not None:
-                        rec['entry'].config(bg='white')
+                        rec['entry'].config(bg=C['btn'])
                     if rec['scale'] is not None:
                         rec['scale'].config(to=self.scale_to(rec['f'], v))
                         rec['scale'].set(float(v or 0))
+                        self._prog[key] = float(rec['scale'].get())
+            if self.target[0] == 'node':
+                locked = bool(self.get_model('__locked'))
+                for key, rec in self.fields.items():
+                    if key == '__locked':
+                        continue
+                    st = 'disabled' if locked else 'normal'
+                    for part in ('entry', 'scale', 'button'):
+                        if rec.get(part) is not None:
+                            rec[part].config(state=st)
+                    if rec['f']['type'] in ('choice', 'mode', 'channel'):
+                        rec['w'].config(state='disabled' if locked
+                                        else 'readonly')
+                    elif rec['f']['type'] == 'bool':
+                        rec['w'].config(state=st)
             if self.target[0] == 'wall':
                 custom = self.get_model('material') == 'custom'
                 locked = bool(self.get_model('locked'))
@@ -4974,6 +5874,8 @@ class Inspector(object):
             elif f['key'] == 'height':
                 if v < 0:
                     return False, None
+            elif f['key'] in PIC_EDIT_KEYS:
+                v = max(f['opts'][0], min(f['opts'][1], v))
             elif v <= 0:
                 return False, None
             return True, round(v, 2)
@@ -5018,7 +5920,9 @@ class Inspector(object):
         return True, raw
 
     def on_scale(self, key, v):
-        if self.loading:
+        # Tk runs a Scale's command later, also after a programmatic set():
+        # ignore those echoes so a value never snaps to the slider's limits
+        if self.loading or abs(float(v) - self._prog.get(key, -1e18)) < 1e-9:
             return
         self.fields[key]['var'].set(fmt_num(float(v)))   # -> on_edit
 
@@ -5034,9 +5938,19 @@ class Inspector(object):
             raw = rec['var'].get()
         ok, val = self.parse(f, raw)
         if rec['entry'] is not None:
-            rec['entry'].config(bg='white' if ok else C['bad_entry'])
+            rec['entry'].config(bg=C['btn'] if ok else C['bad_entry'])
         if not ok or val == self.get_model(key):
             return
+        if self.target[0] == 'node' and key in ('__x', '__y', '__z'):
+            test = list(self.obj()['xyz'])
+            test['xyz'.index(key[2])] = val
+            w = self.ed.point_in_wall(test)
+            if w is not None:
+                if rec['entry'] is not None:
+                    rec['entry'].config(bg=C['bad_entry'])
+                self.ed.msg = '!  That is inside %s.' % w['name']
+                self.ed.redraw()
+                return
         if self.target[0] == 'wall' and key in ('x', 'y', 'z', 'length',
                                                  'thickness', 'rotation',
                                                  'height'):
@@ -5056,6 +5970,7 @@ class Inspector(object):
             try:
                 rec['scale'].config(to=self.scale_to(f, val))
                 rec['scale'].set(val)
+                self._prog[key] = float(rec['scale'].get())
             finally:
                 self.loading = False
         if key == 'band':
@@ -5067,7 +5982,7 @@ class Inspector(object):
                         self.get_model(k) not in opts:
                     self.fields[k]['var'].set(opts[0])     # -> on_edit
         self.ed.changed('inspector')
-        if key in ('__name', 'material', 'locked'):
+        if key in ('__name', 'material', 'locked', '__locked'):
             self.load_values()   # ssid followed / presets / lock state
         self.update_header()
 
@@ -5080,14 +5995,14 @@ def main(argv):
     if '--run' in argv:
         files = [a for a in argv if not a.startswith('--')]
         if not files:
-            sys.exit('usage: sudo -E python3 wifi_edit.py --run topo.json '
+            sys.exit('usage: sudo -E python3 custom_edit.py --run topo.json '
                      '[--gui]')
         run_topology(files[0], gui='--gui' in argv)
         return
     if '--export' in argv:
         files = [a for a in argv if not a.startswith('--')]
         if len(files) != 2:
-            sys.exit('usage: python3 wifi_edit.py --export topo.json out.py')
+            sys.exit('usage: python3 custom_edit.py --export topo.json out.py')
         doc, _ = read_doc(files[0])
         write_doc(doc, files[1], 'script')
         print('wrote %s' % files[1])
@@ -5096,7 +6011,7 @@ def main(argv):
     try:
         ed = Editor(files[0] if files else None)
     except Exception as e:
-        sys.exit('*** wifi_edit: could not open the window (%s)\n'
+        sys.exit('*** custom_edit: could not open the window (%s)\n'
                  '*** Install Tkinter: sudo apt install python3-tk' % e)
     ed.run()
 

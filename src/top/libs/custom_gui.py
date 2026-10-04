@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """
-custom_gui.py  -  interactive 3D viewer for Mininet-WiFi  (version 3)
+custom_gui.py  -  interactive 3D viewer for Mininet-WiFi  (version 4)
 
 No matplotlib. Pure Tkinter (comes with Python: sudo apt install python3-tk).
 Pictures need Pillow (sudo apt install python3-pil python3-pil.imagetk).
 
 What you get
   - 3D view you can rotate, pan and zoom, plus a flat top view
-  - Drag any node with the mouse to move it, and Mininet-WiFi moves it too
-    (hold Shift while dragging to change its height)
+  - Word-like ribbon (View / Show / Packets / Tools), collapsible
+    (button on the right, double-click a tab, or Ctrl+F1), dark mode
+  - Drag any device to move it, and Mininet-WiFi moves it too (Shift +
+    drag: height). Devices can never be dragged inside a wall
   - Every device of the editor: access points, stations, cars, hosts,
-    switches, controllers
-  - Range sphere / circle for every wireless node (or outlines only)
-  - Wireless connections drawn as animated radio waves (colour = RSSI),
-    ad-hoc / mesh groups as dashed green links, wired links as cables,
-    controllers with a dashed control link to the APs they manage
-  - Walls and pictures (floor plans) from a custom_edit.py file, with the
-    same camera modes as the editor (front walls transparent / cut down...)
-  - Hover a node to see its details; the bar at the bottom lists who is
-    connected to whom, through which walls, and warns about problems
+    switches, controllers; AP badges with the number of connected devices
+  - Wireless connections as animated radio waves (colour = RSSI simulated
+    by Mininet-WiFi), ad-hoc / mesh groups, cables, control links
+  - Live packets: dots travel along the links at the rate the interfaces
+    really send (read from /proc, no shell commands), with speed
+    (real time ... 0.05x, paused) and multiplier settings
+  - Walls and pictures from a custom_edit.py file (camera modes, picture
+    adjustments). Locked walls / pictures are fixed; unlocked ones can be
+    dragged (moving a wall updates the simulated wall losses)
+  - Tooltips: basic or advanced (everything the editor shows: radio,
+    addressing, walls on the path, traffic...), and wall tooltips with
+    the connections that cross each wall
+  - Devices list in a git-graph style: go to a device, see its details,
+    change the AP of a station, open its terminal (xterm)
 
 Bridge with custom_edit.py
   The editor saves a JSON file (normalized or custom format). Devices are
@@ -45,28 +52,19 @@ Bridge with custom_edit.py
   load_layout(dict) does the same from data already in memory
   ({'walls': [...], 'pictures': [...]}), used by scripts the editor exports.
 
+  WifiGUI(net, theme=None)   theme 'light' / 'dark' (None = last used)
+
 Mouse & keys
   drag empty space ......... rotate          right-drag ....... pan
   mouse wheel .............. zoom            double-click ..... fit to screen
-  drag a node .............. move it         Shift + drag ..... change height
+  drag a device ............ move it         Shift + drag ..... change height
+  drag an unlocked wall / picture .......... move it
   keys: T = top view, 3 = 3D view, F = fit, A = animation on/off,
-        S = sphere on/off, W = walls on/off, P = pictures on/off
+        S = sphere on/off, W = walls on/off, P = pictures on/off,
+        K = packets on/off, D = devices list, Ctrl+F1 = ribbon
 
-How it works with Mininet-WiFi
-  Your script                                Window process
-  -----------                                --------------
-  gui = WifiGUI(net)
-  gui.load_json('topo.json')  --- layout -->  (walls, pictures)
-  net.build(); gui.start()   ------>  opens the window
-  background thread, every 0.3 s:
-      reads positions, ranges,
-      associations, links      ---- data --->  redraws the scene
-  applies moves  <--- "move sta1 to x,y,z" ---  you drag a node
-  CLI(net)   <- you keep typing commands as usual
-  gui.stop(); net.stop()
-
-  The window lives in its own process, so it never freezes while the CLI
-  waits for input, and a crash in the GUI can't take your network down.
+Terminals and "change AP" (devices list) run in your Mininet process:
+use them while the CLI is waiting at its prompt.
 
   Run with:  sudo -E python3 your_script.py     (-E lets root open a window)
   Don't also call net.plotGraph(): use one viewer or the other.
@@ -169,6 +167,56 @@ def wall_loss(walls, a, b):
     return total, hit
 
 
+def wall_contains_point(w, p, eps=1e-6):
+    """True when point p (x, y, z) is inside the wall's volume
+    (flat 2D walls: inside the footprint, any height)."""
+    a = math.radians(float(w['rotation']))
+    dx, dy = p[0] - w['x'], p[1] - w['y']
+    lx = dx * math.cos(a) + dy * math.sin(a)
+    ly = -dx * math.sin(a) + dy * math.cos(a)
+    if abs(lx) >= float(w['length']) / 2 - eps or \
+            abs(ly) >= float(w['thickness']) / 2 - eps:
+        return False
+    h = float(w.get('height') or 0)
+    if h <= 0:
+        return True
+    z0 = float(w.get('z') or 0)
+    return z0 - eps <= p[2] <= z0 + h + eps
+
+
+def wall_zrange(w):
+    h = float(w.get('height') or 0)
+    if h <= 0:
+        return (-1e9, 1e9)
+    z = float(w.get('z') or 0)
+    return (z, z + h)
+
+
+def _poly_overlap(A, B, eps=0.005):
+    """Convex polygons overlap by more than eps (touching is fine)."""
+    for P in (A, B):
+        for i in range(len(P)):
+            x1, y1 = P[i]
+            x2, y2 = P[(i + 1) % len(P)]
+            nx, ny = y1 - y2, x2 - x1
+            L = math.hypot(nx, ny)
+            if L < 1e-12:
+                continue
+            nx, ny = nx / L, ny / L
+            pa = [x * nx + y * ny for x, y in A]
+            pb = [x * nx + y * ny for x, y in B]
+            if min(max(pa), max(pb)) - max(min(pa), min(pb)) <= eps:
+                return False
+    return True
+
+
+def walls_overlap(w1, w2, eps=0.005):
+    za, zb = wall_zrange(w1), wall_zrange(w2)
+    if min(za[1], zb[1]) - max(za[0], zb[0]) <= eps:
+        return False
+    return _poly_overlap(wall_corners(w1), wall_corners(w2), eps)
+
+
 def apply_walls(walls):
     """Make Mininet-WiFi subtract wall losses from its RSSI (wraps
     PropagationModel.__init__). Calling it again replaces the walls."""
@@ -205,7 +253,12 @@ _WALL_DEFAULTS = {'name': 'wall', 'material': 'custom', 'loss': 0.0,
                   'length': 1.0, 'thickness': 0.2, 'rotation': 0.0,
                   'x': 0.0, 'y': 0.0, 'locked': False, 'group': ''}
 _PIC_DEFAULTS = {'path': '', 'x': 0.0, 'y': 0.0, 'z': 0.0, 'width': 100.0,
-                 'rotation': 0.0, 'opacity': 100.0, 'visible': True}
+                 'rotation': 0.0, 'opacity': 100.0, 'visible': True,
+                 'locked': False, 'crop_l': 0.0, 'crop_t': 0.0,
+                 'crop_r': 0.0, 'crop_b': 0.0, 'brightness': 100.0,
+                 'contrast': 100.0, 'saturation': 100.0, 'grayscale': False,
+                 'invert': False, 'flip_h': False, 'flip_v': False,
+                 'rot90': '0', 'key_white': False, 'key_level': 235.0}
 _KIND_OF_LIST = {'accessPoints': 'ap', 'stations': 'sta', 'cars': 'car',
                  'hosts': 'host', 'switches': 'switch', 'controllers': 'ctrl'}
 _KIND_OF_NAME = {'access_point': 'ap', 'station': 'sta', 'car': 'car',
@@ -263,11 +316,11 @@ def _norm_pic(p, base):
 def read_layout(path):
     """Parse a custom_edit.py file (normalized or custom schema).
     -> {'walls': [...], 'pictures': [...], 'devices': {name: (kind, xyz)},
-        'source': path}"""
+        'locked_devices': [...], 'source': path}"""
     with open(path) as fh:
         d = json.load(fh)
     base = os.path.dirname(os.path.abspath(path))
-    devices = {}
+    devices, locked = {}, []
     if d.get('schema') == 'custom':
         walls = d.get('walls') or []
         pics = d.get('pictures') or []
@@ -275,6 +328,8 @@ def read_layout(path):
             devices[dev['name']] = (_KIND_OF_NAME.get(dev.get('kind'),
                                                       dev.get('kind')),
                                     _xyz_of(dev.get('position')))
+            if dev.get('locked'):
+                locked.append(dev['name'])
     else:
         walls = d.get('walls') or []
         pics = (d.get('editor') or {}).get('pictures') or []
@@ -282,9 +337,12 @@ def read_layout(path):
             for e in d.get(key) or []:
                 devices[e['name']] = (kind, _xyz_of(
                     (e.get('params') or {}).get('position')))
+                if e.get('locked'):
+                    locked.append(e['name'])
     return {'walls': [_norm_wall(w) for w in walls],
             'pictures': [_norm_pic(p, base) for p in pics],
-            'devices': devices, 'source': os.path.abspath(path)}
+            'devices': devices, 'locked_devices': locked,
+            'source': os.path.abspath(path)}
 
 
 # ==========================================================================
@@ -356,6 +414,66 @@ def _peer_mode(intf):
     return None
 
 
+def _plain(v):
+    """Something safe to send to the window process."""
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _info(node, kind):
+    """Static details for the advanced tooltip."""
+    d = {}
+    for k in ('failMode', 'dpid', 'protocols'):
+        v = getattr(node, k, None) or getattr(node, 'params', {}).get(k)
+        if v:
+            d[k] = _plain(v)
+    if kind == 'ctrl':
+        for k in ('ip', 'port', 'protocol'):
+            if getattr(node, k, None) is not None:
+                d[k] = _plain(getattr(node, k))
+        d['class'] = type(node).__name__
+    intfs = []
+    for intf in getattr(node, 'wintfs', {}).values():
+        e = {'name': getattr(intf, 'name', '?')}
+        for k in ('mode', 'ssid', 'channel', 'freq', 'txpower',
+                  'antennaGain', 'antennaHeight', 'range', 'ip', 'mac'):
+            v = getattr(intf, k, None)
+            if v not in (None, ''):
+                e[k] = _plain(v)
+        a = getattr(intf, 'associatedTo', None)
+        if isinstance(a, str):
+            e['assoc'] = a
+        elif a is not None and getattr(a, 'node', None) is not None:
+            e['assoc'] = a.node.name
+        pm = _peer_mode(intf)
+        if pm:
+            e['peer'] = pm
+        intfs.append(e)
+    d['wintfs'] = intfs
+    wired = []
+    try:
+        for intf in node.intfList():
+            n = str(intf.name)
+            if 'wlan' in n or n == 'lo':
+                continue
+            wired.append({'name': n, 'ip': _plain(getattr(intf, 'ip', None)),
+                          'mac': _plain(getattr(intf, 'mac', None))})
+    except Exception:
+        pass
+    d['intfs'] = wired
+    if kind in ('host', 'sta', 'car'):
+        try:
+            d['ip'] = _plain(node.IP())
+        except Exception:
+            pass
+    d['class'] = d.get('class') or type(node).__name__
+    return d
+
+
 def snapshot(net, overrides=None, fallback=None):
     """Everything the window needs, as plain data (dicts/lists/tuples)."""
     overrides = overrides or {}
@@ -372,7 +490,8 @@ def snapshot(net, overrides=None, fallback=None):
                     'xyz': _xyz(node, overrides, fallback),
                     'range': _range(node),
                     'ap': _associated_ap(node) if client else None,
-                    'rssi': _rssi(node) if client else None}
+                    'rssi': _rssi(node) if client else None,
+                    'info': _info(node, kind)}
             by_name[node.name] = node
             nodes.append(item)
 
@@ -391,18 +510,10 @@ def snapshot(net, overrides=None, fallback=None):
             links.append((n1.name, n2.name, 'wired'))
 
     # ad-hoc / mesh: nodes sharing a mode + ssid talk to each other
-    peers = {}
-    for name, node in by_name.items():
-        for intf in getattr(node, 'wintfs', {}).values():
-            mode = _peer_mode(intf)
-            if mode:
-                key = (mode, str(getattr(intf, 'ssid', None) or ''))
-                if name not in peers.setdefault(key, []):
-                    peers[key].append(name)
-    for (mode, ssid), names in peers.items():
+    for (mode, ssid), names in _peer_groups(by_name).items():
         for i in range(len(names)):
             for j in range(i + 1, len(names)):
-                links.append((names[i], names[j], mode, ssid))
+                links.append((names[i][0], names[j][0], mode, ssid))
 
     # control links: controller -> every AP/switch that isn't standalone
     ctrls = [n['name'] for n in nodes if n['kind'] == 'ctrl']
@@ -417,18 +528,139 @@ def snapshot(net, overrides=None, fallback=None):
     return {'nodes': nodes, 'links': links}
 
 
+def _peer_groups(by_name):
+    """(mode, ssid) -> [(node name, interface)] for ad-hoc / mesh."""
+    peers = {}
+    for name, node in by_name.items():
+        for intf in getattr(node, 'wintfs', {}).values():
+            mode = _peer_mode(intf)
+            if mode:
+                key = (mode, str(getattr(intf, 'ssid', None) or ''))
+                peers.setdefault(key, []).append((name, intf))
+    return peers
+
+
+def _read_netdev(path):
+    """iface -> (rx_bytes, rx_packets, tx_bytes, tx_packets)."""
+    out = {}
+    try:
+        with open(path) as fh:
+            for line in fh.readlines()[2:]:
+                if ':' not in line:
+                    continue
+                name, rest = line.split(':', 1)
+                f = rest.split()
+                out[name.strip()] = (int(f[0]), int(f[1]), int(f[8]),
+                                     int(f[9]))
+    except (OSError, ValueError, IndexError):
+        pass
+    return out
+
+
+class TrafficMeter(object):
+    """Packet / byte rates on every link, from the interface counters of
+    each node's network namespace (/proc/<pid>/net/dev). No shell command
+    is sent to the nodes, so it never disturbs the CLI."""
+
+    def __init__(self, net):
+        self.net = net
+        self.prev = {}
+        self.t = None
+
+    def _stats(self, node, cache):
+        pid = getattr(node, 'pid', None)
+        path = '/proc/%d/net/dev' % pid if pid and \
+            getattr(node, 'inNamespace', True) else '/proc/net/dev'
+        if path not in cache:
+            cache[path] = _read_netdev(path)
+        return cache[path]
+
+    def rates(self):
+        """[(src, dst, kind, packets/s, bytes/s)] for active links."""
+        now = time.time()
+        dt = (now - self.t) if self.t else None
+        self.t = now
+        cache, flows, cur = {}, {}, {}
+
+        def delta(key, node, ifname):
+            c = self._stats(node, cache).get(ifname)
+            if c is None:
+                return None
+            cur[key] = c
+            p = self.prev.get(key)
+            if p is None or not dt or dt <= 0:
+                return None
+            return tuple(max(c[i] - p[i], 0) / dt for i in range(4))
+
+        def flow(a, b, kind, pk, by):
+            if pk > 0:
+                f = flows.setdefault((a, b, kind), [0.0, 0.0])
+                f[0] += pk
+                f[1] += by
+
+        by_name = {}
+        for attr in ('aps', 'stations', 'cars', 'hosts', 'switches'):
+            for node in getattr(self.net, attr, None) or []:
+                by_name[node.name] = node
+        aps = set(n.name for n in getattr(self.net, 'aps', None) or [])
+        try:
+            for node in list(by_name.values()):            # Wi-Fi clients
+                if node.name in aps:
+                    continue
+                for intf in getattr(node, 'wintfs', {}).values():
+                    ap = getattr(intf, 'associatedTo', None)
+                    apn = None if isinstance(ap, str) else \
+                        getattr(ap, 'node', None)
+                    if apn is None:
+                        continue
+                    d = delta((node.name, intf.name), node, intf.name)
+                    if d:
+                        flow(node.name, apn.name, 'wifi', d[3], d[2])
+                        flow(apn.name, node.name, 'wifi', d[1], d[0])
+            for link in getattr(self.net, 'links', None) or []:  # cables
+                try:
+                    i1, i2 = link.intf1, link.intf2
+                    n1, n2 = i1.node, i2.node
+                except AttributeError:
+                    continue
+                names = (str(i1.name) + str(i2.name)).lower()
+                cls = type(link).__name__.lower()
+                if any(w in cls for w in WIRELESS_LINK_WORDS) or \
+                        'wlan' in names:
+                    continue
+                d = delta((n1.name, str(i1.name)), n1, str(i1.name))
+                if d:
+                    flow(n1.name, n2.name, 'wired', d[3], d[2])
+                    flow(n2.name, n1.name, 'wired', d[1], d[0])
+            for (mode, ssid), members in _peer_groups(by_name).items():
+                for name, intf in members:                 # ad-hoc / mesh
+                    others = [o for o, _ in members if o != name]
+                    d = delta((name, intf.name), by_name[name], intf.name)
+                    if d and others:
+                        for o in others:
+                            flow(name, o, mode, d[3] / len(others),
+                                 d[2] / len(others))
+        except Exception:
+            pass
+        self.prev = cur
+        return [(a, b, kind, round(v[0], 2), round(v[1], 1))
+                for (a, b, kind), v in sorted(flows.items())]
+
+
 class WifiGUI(object):
     """Interactive window showing the Mininet-WiFi network."""
 
-    def __init__(self, net, refresh=0.3, size=(1000, 760),
-                 title='Mininet-WiFi 3D View', allow_move=True):
+    def __init__(self, net, refresh=0.3, size=(1100, 780),
+                 title='Mininet-WiFi 3D View', allow_move=True, theme=None):
         self.net = net
         self.refresh = refresh
         self.allow_move = allow_move
-        self.cfg = {'size': size, 'title': title, 'allow_move': allow_move}
+        self.cfg = {'size': size, 'title': title, 'allow_move': allow_move,
+                    'theme': theme}
         self.overrides = {}          # positions for nodes without setPosition
         self.fallback = {}           # positions from the editor's file
         self.layout = None           # walls + pictures
+        self.meter = TrafficMeter(net)
         self._to_win = None
         self._from_win = None
         self._proc = None
@@ -480,6 +712,8 @@ class WifiGUI(object):
                 warnings.append('Picture not found: %s' % p['path'])
         self.layout = {'type': 'layout', 'walls': walls, 'pictures': pics,
                        'warnings': warnings,
+                       'locked_devices': list(layout.get('locked_devices')
+                                              or []),
                        'source': layout.get('source', '')}
         if self._to_win is not None:
             self._to_win.put(self.layout)
@@ -491,7 +725,7 @@ class WifiGUI(object):
         self._to_win, self._from_win = ctx.Queue(), ctx.Queue()
         if self.layout:
             self._to_win.put(self.layout)
-        self._to_win.put(snapshot(self.net, self.overrides, self.fallback))
+        self._to_win.put(self._data())
         self._proc = ctx.Process(target=_window_main,
                                  args=(self._to_win, self._from_win, self.cfg),
                                  daemon=True)
@@ -500,8 +734,26 @@ class WifiGUI(object):
         self._thread.start()
         return self
 
+    def _data(self):
+        data = snapshot(self.net, self.overrides, self.fallback)
+        try:
+            data['traffic'] = self.meter.rates()
+        except Exception:
+            data['traffic'] = []
+        return data
+
+    def _notice(self, text):
+        print('\n*** custom_gui: %s' % text)
+        try:
+            self._to_win.put({'type': 'notice', 'text': text})
+        except Exception:
+            pass
+
+    def _node(self, name):
+        return getattr(self.net, 'nameToNode', {}).get(name)
+
     def _apply_move(self, name, x, y, z):
-        node = getattr(self.net, 'nameToNode', {}).get(name)
+        node = self._node(name)
         if node is None:
             return
         pos = '%.2f,%.2f,%.2f' % (x, y, z)
@@ -514,15 +766,73 @@ class WifiGUI(object):
                 print('\n*** custom_gui: could not move %s (%s)' % (name, e))
         self.overrides[name] = (x, y, z)       # controllers, wired hosts...
 
+    def _term(self, name):
+        node = self._node(name)
+        if node is None:
+            return self._notice('no device called %s' % name)
+        try:
+            from mininet.term import makeTerm
+            makeTerm(node, title='%s - custom_gui' % name)
+            self._notice('terminal opened for %s' % name)
+        except Exception as e:
+            self._notice('could not open a terminal for %s (%s) - is xterm '
+                         'installed?' % (name, e))
+
+    def _assoc(self, sta, ap):
+        node, apn = self._node(sta), self._node(ap)
+        if node is None or apn is None:
+            return self._notice('unknown device %s / %s' % (sta, ap))
+        try:
+            intf = list(node.wintfs.values())[0]
+        except Exception:
+            return self._notice('%s has no wireless interface' % sta)
+        try:
+            node.setAssociation(apn, intf=intf.name)
+            self._notice('%s associated with %s' % (sta, ap))
+        except Exception as e:
+            try:
+                ssid = list(apn.wintfs.values())[0].ssid
+                node.cmd('iw dev %s connect %s' % (intf.name, ssid))
+                self._notice('%s: iw connect %s sent' % (sta, ssid))
+            except Exception as e2:
+                self._notice('could not associate %s with %s (%s / %s)'
+                             % (sta, ap, e, e2))
+
+    def _disassoc(self, sta):
+        node = self._node(sta)
+        try:
+            intf = list(node.wintfs.values())[0]
+            node.cmd('iw dev %s disconnect' % intf.name)
+            self._notice('%s disconnected' % sta)
+        except Exception as e:
+            self._notice('could not disconnect %s (%s)' % (sta, e))
+
+    def _handle(self, msg):
+        kind = msg[0]
+        if kind == 'move' and self.allow_move:
+            self._apply_move(*msg[1:])
+        elif kind == 'wall_move' and self.layout:
+            i, x, y = msg[1:]
+            if 0 <= i < len(self.layout['walls']):
+                self.layout['walls'][i].update(x=x, y=y)  # used by RSSI hook
+        elif kind == 'pic_move' and self.layout:
+            i, x, y = msg[1:]
+            if 0 <= i < len(self.layout['pictures']):
+                self.layout['pictures'][i].update(x=x, y=y)
+        elif kind == 'term':
+            self._term(msg[1])
+        elif kind == 'assoc':
+            self._assoc(msg[1], msg[2])
+        elif kind == 'disassoc':
+            self._disassoc(msg[1])
+
     def _loop(self):
         last = None
         while not self._stop.is_set():
-            # 1) moves requested by the window
+            # 1) requests from the window
             try:
                 while True:
-                    msg = self._from_win.get_nowait()
-                    if msg[0] == 'move' and self.allow_move:
-                        self._apply_move(*msg[1:])
+                    self._handle(self._from_win.get_nowait())
             except queue.Empty:
                 pass
             except Exception:
@@ -531,7 +841,7 @@ class WifiGUI(object):
             if not self._proc.is_alive():
                 return                         # window was closed
             try:
-                data = snapshot(self.net, self.overrides, self.fallback)
+                data = self._data()
                 if data != last:
                     self._to_win.put(data)
                     last = data
@@ -552,18 +862,483 @@ class WifiGUI(object):
 # Part 4 - the window (separate process, Tkinter only)
 # ==========================================================================
 
-C = {
-    'bg': '#f6f6f3', 'grid': '#dedfd9', 'grid_major': '#c9cbc3',
-    'axis': '#8a8b85', 'text': '#26272a', 'muted': '#6d6e69',
-    'ap': '#2563c9', 'ap_fill': '#e1eafa', 'ap_ring': '#7fa3e3',
-    'sta': '#e0761a', 'sta_ring': '#eaa66a', 'car': '#b9461a',
-    'ctrl': '#7b3fc4', 'switch': '#4a4d55', 'host': '#6b6e74',
-    'rf': '#16a05a', 'rf_glow': '#cdebd9', 'rf_bad': '#cc3a2f',
-    'wired': '#4a4d55', 'control': '#7b3fc4', 'peer': '#16a05a',
-    'shadow': '#d4d5cf', 'select': '#111111', 'warn': '#b3261e',
-    'tip_bg': '#26272a', 'tip_fg': '#ffffff', 'bar': '#ebebe7',
-    'wall': '#b4583d',
+# ==========================================================================
+# Shared UI toolkit (same code in custom_edit.py and custom_gui.py):
+# themes (light / dark), Word-like collapsible ribbon, git-graph device
+# tree, picture adjustments.
+# ==========================================================================
+
+THEMES = {
+    'light': {
+        'bg': '#f6f6f3', 'grid': '#dedfd9', 'grid_major': '#c9cbc3',
+        'axis': '#8a8b85', 'text': '#26272a', 'muted': '#6d6e69',
+        'ap': '#2563c9', 'ap_fill': '#e1eafa', 'ap_ring': '#7fa3e3',
+        'sta': '#e0761a', 'sta_ring': '#eaa66a', 'car': '#b9461a',
+        'ctrl': '#7b3fc4', 'switch': '#4a4d55', 'host': '#6b6e74',
+        'rf': '#16a05a', 'rf_glow': '#cdebd9', 'rf_bad': '#cc3a2f',
+        'wired': '#4a4d55', 'control': '#7b3fc4', 'peer': '#0f9b8e',
+        'shadow': '#d4d5cf', 'select': '#111111', 'warn': '#b3261e',
+        'tip_bg': '#26272a', 'tip_fg': '#ffffff', 'bar': '#ebebe7',
+        'halo': '#a9c1ee', 'bad_entry': '#fbe3e0', 'btn': 'white',
+        'tabs': '#dcdcd6', 'x': '#c0392b', 'y': '#1e8449', 'z': '#2457a6',
+        'pkt_wifi': '#11a85a', 'pkt_wired': '#2563c9', 'pkt_peer': '#0f9b8e',
+        'wall': '#b4583d', 'outline': 'white',
+    },
+    'dark': {
+        'bg': '#1d1e21', 'grid': '#2c2e33', 'grid_major': '#3a3d43',
+        'axis': '#7e818a', 'text': '#e4e4e0', 'muted': '#9a9ca3',
+        'ap': '#4f86f0', 'ap_fill': '#1c2740', 'ap_ring': '#335a9e',
+        'sta': '#f28c3a', 'sta_ring': '#8a5226', 'car': '#e0602a',
+        'ctrl': '#9a63e0', 'switch': '#a3a7b0', 'host': '#8e9299',
+        'rf': '#2ec472', 'rf_glow': '#1c3b2b', 'rf_bad': '#ff5a4d',
+        'wired': '#a3a7b0', 'control': '#9a63e0', 'peer': '#2ec4a0',
+        'shadow': '#2a2b2f', 'select': '#f2f2f2', 'warn': '#ff6b5e',
+        'tip_bg': '#eeeeea', 'tip_fg': '#1d1e21', 'bar': '#26282c',
+        'halo': '#3d5a8f', 'bad_entry': '#5b2b2b', 'btn': '#34373d',
+        'tabs': '#18191c', 'x': '#e05a4a', 'y': '#3cbf6a', 'z': '#5a8de0',
+        'pkt_wifi': '#3ee08a', 'pkt_wired': '#6fa0ff', 'pkt_peer': '#3ee0c0',
+        'wall': '#c96a4f', 'outline': '#1d1e21',
+    },
 }
+C = dict(THEMES['light'])
+_BG_KEYS = ('bg', 'bar', 'btn', 'tabs', 'grid', 'grid_major', 'ap', 'ap_ring',
+            'halo', 'bad_entry', 'select', 'tip_bg', 'axis')
+_FG_KEYS = ('text', 'muted', 'warn', 'ap', 'tip_fg')
+_BG_OPTS = ('background', 'activebackground', 'highlightbackground',
+            'troughcolor', 'selectcolor', 'disabledbackground',
+            'readonlybackground', 'selectbackground')
+_FG_OPTS = ('foreground', 'activeforeground', 'insertbackground',
+            'disabledforeground', 'highlightcolor', 'selectforeground')
+PREFS_PATH = os.path.expanduser('~/.config/mininet_custom_ui.json')
+
+
+def load_prefs():
+    try:
+        with open(PREFS_PATH) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def save_prefs(**kw):
+    p = load_prefs()
+    p.update(kw)
+    try:
+        os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
+        with open(PREFS_PATH, 'w') as fh:
+            json.dump(p, fh, indent=2)
+    except Exception:
+        pass
+
+
+def _norm_col(root, c):
+    try:
+        r, g, b = root.winfo_rgb(c)
+        return '#%02x%02x%02x' % (r // 256, g // 256, b // 256)
+    except Exception:
+        return str(c).lower()
+
+
+def style_ttk(root):
+    """ttk widgets (comboboxes) follow the palette."""
+    from tkinter import ttk
+    st = ttk.Style(root)
+    try:
+        st.theme_use('clam')
+    except Exception:
+        pass
+    st.configure('TCombobox', fieldbackground=C['btn'], background=C['bar'],
+                 foreground=C['text'], arrowcolor=C['text'],
+                 bordercolor=C['grid_major'], lightcolor=C['bar'],
+                 darkcolor=C['bar'], selectbackground=C['ap'],
+                 selectforeground='white')
+    st.map('TCombobox',
+           fieldbackground=[('readonly', C['btn']), ('disabled', C['bar'])],
+           foreground=[('readonly', C['text']), ('disabled', C['muted'])],
+           background=[('readonly', C['bar'])])
+    root.option_add('*TCombobox*Listbox.background', C['btn'])
+    root.option_add('*TCombobox*Listbox.foreground', C['text'])
+    root.option_add('*TCombobox*Listbox.selectBackground', C['ap'])
+    return st
+
+
+def apply_theme(root, name):
+    """Switch palette and recolour every Tk widget already on screen."""
+    old = dict(C)
+    C.clear()
+    C.update(THEMES[name])
+    bgmap, fgmap = {}, {}
+    for keys, m in ((_BG_KEYS, bgmap), (_FG_KEYS, fgmap)):
+        for k in keys:
+            m[_norm_col(root, old[k])] = C[k]
+
+    def walk(w):
+        for opts, m in ((_BG_OPTS, bgmap), (_FG_OPTS, fgmap)):
+            for o in opts:
+                try:
+                    v = w.cget(o)
+                except Exception:
+                    continue
+                if not v:
+                    continue
+                nv = m.get(_norm_col(root, v))
+                if nv:
+                    try:
+                        w.configure(**{o: nv})
+                    except Exception:
+                        pass
+        for ch in w.winfo_children():
+            walk(ch)
+    walk(root)
+    style_ttk(root)
+
+
+class _FlowBar(object):
+    """A frame whose child groups flow left-to-right and wrap to new rows."""
+
+    def __init__(self, tk, parent, bg, gap=10, vgap=4):
+        self.tk, self.bg, self.gap, self.vgap = tk, bg, gap, vgap
+        self.frame = tk.Frame(parent, bg=bg, height=40)
+        self.groups = []
+        self.frame.bind('<Configure>', lambda e: self.layout())
+        self.frame.after_idle(self.layout)
+
+    def group(self):
+        g = self.tk.Frame(self.frame, bg=self.bg)
+        self.groups.append(g)
+        return g
+
+    def layout(self):
+        W = self.frame.winfo_width()
+        if W <= 1:
+            W = self.frame.winfo_toplevel().winfo_width()
+        x, y, row_h = 6, self.vgap, 0
+        for g in self.groups:
+            w, h = g.winfo_reqwidth(), g.winfo_reqheight()
+            if x > 6 and x + w > W - 6:            # wrap to a new row
+                x, y, row_h = 6, y + row_h + self.vgap, 0
+            g.place(x=x, y=y)
+            x += w + self.gap
+            row_h = max(row_h, h)
+        total = y + row_h + self.vgap
+        if int(self.frame.cget('height')) != total:
+            self.frame.config(height=total)
+
+
+class _Ribbon(object):
+    """Word-like ribbon: tabs (categories) with captioned groups.
+    Collapse with the button on the right, double-click on a tab, or
+    Ctrl+F1; clicking a tab while collapsed opens it again."""
+
+    def __init__(self, tk, parent):
+        self.tk = tk
+        self.frame = tk.Frame(parent, bg=C['bar'])
+        self.head = tk.Frame(self.frame, bg=C['tabs'])
+        self.head.pack(fill='x')
+        self.body = tk.Frame(self.frame, bg=C['bar'])
+        self.body.pack(fill='x')
+        self.tabs, self.current, self.collapsed = {}, None, False
+        self.btn = tk.Label(self.head, text='Collapse ribbon', bg=C['tabs'],
+                            fg=C['muted'], cursor='hand2',
+                            font=('TkDefaultFont', 8))
+        self.btn.pack(side='right', padx=10)
+        self.btn.bind('<Button-1>', lambda e: self.toggle())
+        self.extra = tk.Frame(self.head, bg=C['tabs'])  # right side widgets
+        self.extra.pack(side='right')
+
+    def tab(self, name):
+        tk = self.tk
+        lb = tk.Label(self.head, text=name, padx=14, pady=4, bg=C['tabs'],
+                      fg=C['muted'], cursor='hand2',
+                      font=('TkDefaultFont', 9, 'bold'))
+        lb.pack(side='left')
+        lb.bind('<Button-1>', lambda e, n=name: self.select(n))
+        lb.bind('<Double-Button-1>', lambda e: self.toggle())
+        page = _FlowBar(tk, self.body, C['bar'])
+        self.tabs[name] = (lb, page)
+        if self.current is None:
+            self.select(name)
+        return page
+
+    def group(self, page, caption):
+        """Captioned group inside a tab page (caption under it, like Word)."""
+        tk = self.tk
+        outer = page.group()
+        tk.Frame(outer, width=1, bg=C['grid_major']).pack(side='right',
+                                                          fill='y', padx=(8, 0))
+        col = tk.Frame(outer, bg=C['bar'])
+        col.pack(side='left', fill='y')
+        tk.Label(col, text=caption, bg=C['bar'], fg=C['muted'],
+                 font=('TkDefaultFont', 7, 'bold')).pack(side='bottom')
+        body = tk.Frame(col, bg=C['bar'])
+        body.pack(side='top', expand=True)
+        return body
+
+    def select(self, name):
+        if self.collapsed:
+            self.toggle()
+        for n, (lb, page) in self.tabs.items():
+            if n == name:
+                lb.config(bg=C['bar'], fg=C['ap'])
+                page.frame.pack(fill='x')
+                page.frame.after_idle(page.layout)
+            else:
+                lb.config(bg=C['tabs'], fg=C['muted'])
+                page.frame.pack_forget()
+        self.current = name
+
+    def toggle(self):
+        self.collapsed = not self.collapsed
+        if self.collapsed:
+            self.body.pack_forget()
+            self.btn.config(text='Expand ribbon')
+        else:
+            self.body.pack(fill='x')
+            self.btn.config(text='Collapse ribbon')
+
+
+LANE_COL = {'wifi': 'rf', 'auto': 'rf', 'wired': 'wired',
+            'control': 'control', 'adhoc': 'peer', 'mesh': 'peer'}
+KIND_RANK = {'ctrl': 0, 'switch': 1, 'ap': 2, 'host': 3, 'sta': 3, 'car': 3}
+
+
+def build_tree(nodes, edges):
+    """Turn devices + links into git-graph rows.
+    nodes: [(name, kind)]; edges: [(a, b, link_type, text)].
+    Each device appears once; parents are higher in the hierarchy
+    (controller > switch > AP > host / station). Extra links of an already
+    placed device are listed in its 'also' field."""
+    kind = dict(nodes)
+    kids, also = {}, {}
+    for a, b, lt, txt in edges:
+        if a not in kind or b not in kind:
+            continue
+        ra, rb = KIND_RANK.get(kind[a], 9), KIND_RANK.get(kind[b], 9)
+        if (rb, b) < (ra, a):
+            a, b = b, a
+        kids.setdefault(a, []).append((b, lt, txt))
+    order = sorted(kind, key=lambda n: (KIND_RANK.get(kind[n], 9), n))
+    rows, placed = [], {}
+
+    def visit(n, depth, parent, lt, txt):
+        placed[n] = len(rows)
+        rows.append({'name': n, 'kind': kind[n], 'depth': depth,
+                     'parent': parent, 'link': lt, 'link_text': txt,
+                     'also': []})
+        me = placed[n]
+        for c, clt, ctxt in sorted(kids.get(n, []),
+                                   key=lambda k: (KIND_RANK.get(kind[k[0]], 9),
+                                                  k[0])):
+            if c in placed:
+                rows[placed[c]]['also'].append('%s %s' % (clt, n))
+                rows[me]['also'].append('%s %s' % (clt, c))
+                continue
+            visit(c, depth + 1, me, clt, ctxt)
+    for n in order:
+        if n not in placed:
+            visit(n, 0, None, None, '')
+    return rows
+
+
+class _TreePanel(object):
+    """Device / connection list drawn like `git log --graph`.
+    provider must offer: tree_rows() -> rows (see build_tree, plus
+    optional 'detail'), tree_menu(menu, row), tree_activate(row),
+    tree_select(row), draw_kind_icon(canvas, kind, x, y)."""
+    ROW = 30
+
+    def __init__(self, tk, root, provider, title='Devices & connections'):
+        self.tk, self.p = tk, provider
+        top = self.top = tk.Toplevel(root)
+        top.title(title)
+        top.configure(bg=C['bg'])
+        top.geometry('460x620')
+        head = tk.Frame(top, bg=C['bar'], padx=8, pady=6)
+        head.pack(fill='x')
+        tk.Label(head, text=title, bg=C['bar'], fg=C['text'],
+                 font=('TkDefaultFont', 11, 'bold')).pack(side='left')
+        self.filter = tk.StringVar()
+        e = tk.Entry(head, textvariable=self.filter, width=14, relief='flat',
+                     bg=C['btn'], fg=C['text'], insertbackground=C['text'],
+                     highlightthickness=1, highlightbackground=C['grid_major'])
+        e.pack(side='right')
+        tk.Label(head, text='filter', bg=C['bar'], fg=C['muted']).pack(
+            side='right', padx=4)
+        self.filter.trace_add('write', lambda *a: self.refresh())
+        tk.Label(top, text='click: select   double-click: go to + inspect   '
+                 'right-click: actions', bg=C['bg'], fg=C['muted'],
+                 font=('TkDefaultFont', 8)).pack(fill='x')
+        wrap = tk.Frame(top, bg=C['bg'])
+        wrap.pack(fill='both', expand=True)
+        self.cv = tk.Canvas(wrap, bg=C['bg'], highlightthickness=0)
+        sb = tk.Scrollbar(wrap, orient='vertical', command=self.cv.yview)
+        self.cv.configure(yscrollcommand=sb.set)
+        sb.pack(side='right', fill='y')
+        self.cv.pack(side='left', fill='both', expand=True)
+        self.cv.bind('<Button-1>', self.on_click)
+        self.cv.bind('<Double-Button-1>', self.on_double)
+        self.cv.bind('<Button-3>', self.on_menu)
+        for ev, d in (('<Button-4>', -1), ('<Button-5>', 1)):
+            self.cv.bind(ev, lambda e, d=d: self.cv.yview_scroll(d * 2, 'units'))
+        self.cv.bind('<MouseWheel>', lambda e: self.cv.yview_scroll(
+            -1 if e.delta > 0 else 1, 'units'))
+        top.protocol('WM_DELETE_WINDOW', self.close)
+        self.rows, self.sel = [], None
+        self.alive = True
+        self.refresh()
+
+    def close(self):
+        self.alive = False
+        self.top.destroy()
+
+    def row_at(self, y):
+        i = int(self.cv.canvasy(y) // self.ROW)
+        return self.rows[i] if 0 <= i < len(self.rows) else None
+
+    def on_click(self, e):
+        r = self.row_at(e.y)
+        if r:
+            self.sel = r['name']
+            self.p.tree_select(r)
+            self.refresh()
+
+    def on_double(self, e):
+        r = self.row_at(e.y)
+        if r:
+            self.p.tree_activate(r)
+
+    def on_menu(self, e):
+        r = self.row_at(e.y)
+        if not r:
+            return
+        self.sel = r['name']
+        self.refresh()
+        m = self.tk.Menu(self.top, tearoff=0, bg=C['btn'], fg=C['text'],
+                         activebackground=C['ap'], activeforeground='white')
+        self.p.tree_menu(m, r)
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def refresh(self):
+        if not self.alive or not self.top.winfo_exists():
+            return
+        rows = self.p.tree_rows()
+        f = self.filter.get().strip().lower()
+        if f:
+            keep = set()
+            for i, r in enumerate(rows):
+                if f in (r['name'] + ' ' + r.get('detail', '')).lower():
+                    j = i
+                    while j is not None:               # keep the branch
+                        keep.add(j)
+                        j = rows[j]['parent']
+            remap, out = {}, []
+            for i, r in enumerate(rows):
+                if i in keep:
+                    remap[i] = len(out)
+                    out.append(dict(r))
+            for r in out:
+                r['parent'] = remap.get(r['parent'])
+            rows = out
+        self.rows = rows
+        cv, R = self.cv, self.ROW
+        cv.delete('all')
+        cv.configure(bg=C['bg'])
+        maxd = max([r['depth'] for r in rows] or [0])
+        tx = 22 + (maxd + 1) * 22
+        for i, r in enumerate(rows):
+            y = i * R + R / 2
+            if r['name'] == self.sel:
+                cv.create_rectangle(0, i * R + 1, 2000, (i + 1) * R - 1,
+                                    fill=C['halo'], outline='')
+        for i, r in enumerate(rows):                       # branches
+            if r['parent'] is None:
+                continue
+            p = r['parent']
+            px, py = 18 + rows[p]['depth'] * 22, p * R + R / 2
+            cx, cy = 18 + r['depth'] * 22, i * R + R / 2
+            col = C.get(LANE_COL.get(r['link'] or '', ''), C['axis'])
+            cv.create_line(px, py + 7, px, cy - 12, px, cy - 2, px + 4, cy,
+                           cx - 7, cy, fill=col, width=2.5, smooth=True,
+                           dash=(4, 3) if r['link'] in ('control', 'auto',
+                                                        'adhoc', 'mesh')
+                           else None)
+        for i, r in enumerate(rows):                       # dots + text
+            x, y = 18 + r['depth'] * 22, i * R + R / 2
+            self.p.draw_kind_icon(cv, r['kind'], x, y)
+            cv.create_text(tx, y - 6, anchor='w', text=r['name'],
+                           fill=C['text'], font=('TkDefaultFont', 10, 'bold'))
+            sub = r.get('detail', '')
+            if r['link']:
+                sub = ('%s %s' % (r['link'], r.get('link_text') or '')).strip() \
+                    + ('  ·  ' + sub if sub else '')
+            if r['also']:
+                sub += '  ·  also: ' + ', '.join(r['also'])
+            cv.create_text(tx, y + 8, anchor='w', text=sub, fill=C['muted'],
+                           font=('TkDefaultFont', 8))
+        cv.configure(scrollregion=(0, 0, 600, max(len(rows) * R, 10)))
+
+
+PIC_EDIT_KEYS = ('crop_l', 'crop_t', 'crop_r', 'crop_b', 'brightness',
+                 'contrast', 'saturation', 'grayscale', 'invert', 'flip_h',
+                 'flip_v', 'rot90', 'key_white', 'key_level')
+PIC_EDIT_DEFAULTS = {'crop_l': 0.0, 'crop_t': 0.0, 'crop_r': 0.0,
+                     'crop_b': 0.0, 'brightness': 100.0, 'contrast': 100.0,
+                     'saturation': 100.0, 'grayscale': False, 'invert': False,
+                     'flip_h': False, 'flip_v': False, 'rot90': '0',
+                     'key_white': False, 'key_level': 235.0}
+
+
+def pic_edits_key(p):
+    return tuple(p.get(k, PIC_EDIT_DEFAULTS[k]) for k in PIC_EDIT_KEYS)
+
+
+def apply_pic_edits(img, p):
+    """Non-destructive picture adjustments (RGBA in, RGBA out):
+    rotate (clockwise), flips, crop (% of each side), grayscale,
+    brightness / contrast / saturation (%), invert, white -> transparent."""
+    from PIL import Image, ImageChops, ImageEnhance, ImageOps
+    g = lambda k: p.get(k, PIC_EDIT_DEFAULTS[k])
+    rot = str(g('rot90'))
+    if rot == '90':
+        img = img.transpose(Image.ROTATE_270)
+    elif rot == '180':
+        img = img.transpose(Image.ROTATE_180)
+    elif rot == '270':
+        img = img.transpose(Image.ROTATE_90)
+    if g('flip_h'):
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    if g('flip_v'):
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    w, h = img.size  # crop what you see (after rotate / flip)
+    l, t = float(g('crop_l')) / 100.0, float(g('crop_t')) / 100.0
+    r, b = float(g('crop_r')) / 100.0, float(g('crop_b')) / 100.0
+    if (l or t or r or b) and l + r < 0.98 and t + b < 0.98:
+        img = img.crop((int(w * l), int(h * t), max(int(w * (1 - r)),
+                                                     int(w * l) + 1),
+                        max(int(h * (1 - b)), int(h * t) + 1)))
+    alpha = img.getchannel('A')
+    rgb = img.convert('RGB')
+    if g('grayscale'):
+        rgb = ImageOps.grayscale(rgb).convert('RGB')
+    for key, enh in (('brightness', ImageEnhance.Brightness),
+                     ('contrast', ImageEnhance.Contrast),
+                     ('saturation', ImageEnhance.Color)):
+        v = float(g(key))
+        if abs(v - 100.0) > 1e-6:
+            rgb = enh(rgb).enhance(max(v, 0.0) / 100.0)
+    if g('invert'):
+        rgb = ImageOps.invert(rgb)
+    if g('key_white'):
+        lvl = int(float(g('key_level')))
+        mask = rgb.convert('L').point(lambda v: 0 if v >= lvl else 255)
+        alpha = ImageChops.multiply(alpha, mask)
+    out = rgb.convert('RGBA')
+    out.putalpha(alpha)
+    return out
+
 
 KIND_LABEL = {'ap': 'access point', 'sta': 'station', 'car': 'car',
               'ctrl': 'controller', 'switch': 'switch', 'host': 'host'}
@@ -572,6 +1347,14 @@ WALL_MODES = [('solid', 'Walls always visible'),
               ('fade', 'Front walls transparent'),
               ('cutaway', 'Front walls cut down'),
               ('outline', 'Walls as outlines')]
+PKT_SPEEDS = [('Real time (1x)', 1.0), ('Slowed 0.5x', 0.5),
+              ('Slowed 0.25x', 0.25), ('Slowed 0.1x', 0.1),
+              ('Slowed 0.05x', 0.05), ('Paused', 0.0)]
+PKT_MULTS = [('x0.01', 0.01), ('x0.1', 0.1), ('x0.25', 0.25), ('x0.5', 0.5),
+             ('x1', 1.0), ('x2', 2.0), ('x5', 5.0), ('x10', 10.0)]
+PKT_TRAVEL = 0.45          # seconds of "real time" a dot takes on a link
+PKT_MAX_RATE = 40.0        # dots per second per link, at most
+PKT_MAX = 900              # dots on screen, at most
 
 
 def _mix(c1, c2, t):
@@ -613,26 +1396,110 @@ def _safe_color(c, default='#999999'):
     return default
 
 
+def _g(v):
+    try:
+        return '%g' % round(float(v), 2)
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _rate(pps, bps):
+    if bps >= 1e6:
+        b = '%.1f MB/s' % (bps / 1e6)
+    elif bps >= 1e3:
+        b = '%.1f kB/s' % (bps / 1e3)
+    else:
+        b = '%d B/s' % bps
+    return '%s pkt/s, %s' % (_g(pps), b)
+
+
+def draw_icon(cv, kind, x, y, ow='white', s=1.0):
+    """Device icons, same shapes as custom_edit.py."""
+    k = s
+    if kind == 'ap':
+        cv.create_rectangle(x - 10 * k, y - 7 * k, x + 10 * k, y + 7 * k,
+                            fill=C['ap'], outline=ow, width=2)
+        cv.create_line(x + 6 * k, y - 7 * k, x + 6 * k, y - 15 * k,
+                       fill=C['ap'], width=2)
+        for r in (5 * k, 9 * k):                         # wifi arcs
+            cv.create_arc(x + 6 * k - r, y - 15 * k - r, x + 6 * k + r,
+                          y - 15 * k + r, start=45, extent=90, style='arc',
+                          outline=C['ap'], width=1.5)
+        for i in (-5, 0):                                # leds
+            cv.create_oval(x + i * k - 1.5, y - 1.5, x + i * k + 1.5, y + 1.5,
+                           fill='#9ff0b8', outline='')
+    elif kind == 'sta':
+        cv.create_oval(x - 8 * k, y - 8 * k, x + 8 * k, y + 8 * k,
+                       fill=C['sta'], outline=ow, width=2)
+        cv.create_oval(x - 2.5 * k, y - 2.5 * k, x + 2.5 * k, y + 2.5 * k,
+                       fill='white', outline='')
+    elif kind == 'car':
+        cv.create_polygon(x - 7 * k, y - 4 * k, x - 3 * k, y - 10 * k,
+                          x + 5 * k, y - 10 * k, x + 8 * k, y - 4 * k,
+                          fill=C['car'], outline=ow, width=1.5)
+        cv.create_rectangle(x - 1 * k, y - 8.5 * k, x + 4.5 * k, y - 5 * k,
+                            fill='#f3e3d8', outline='')
+        cv.create_rectangle(x - 12 * k, y - 4 * k, x + 12 * k, y + 4 * k,
+                            fill=C['car'], outline=ow, width=2)
+        for wx in (-6, 6):
+            cv.create_oval(x + (wx - 3.5) * k, y + 0.5 * k,
+                           x + (wx + 3.5) * k, y + 7.5 * k,
+                           fill='#26272a', outline=ow, width=1)
+    elif kind == 'ctrl':
+        pts = []
+        for i in range(6):
+            a = math.pi / 6 + i * math.pi / 3
+            pts += [x + 12 * k * math.cos(a), y + 12 * k * math.sin(a)]
+        cv.create_polygon(pts, fill=C['ctrl'], outline=ow, width=2)
+        cv.create_text(x, y, text='C', fill='white',
+                       font=('TkDefaultFont', max(int(9 * k), 6), 'bold'))
+    elif kind == 'switch':
+        cv.create_rectangle(x - 12 * k, y - 6 * k, x + 12 * k, y + 6 * k,
+                            fill=C['switch'], outline=ow, width=2)
+        cv.create_line(x - 7 * k, y - 2 * k, x + 7 * k, y - 2 * k,
+                       fill='white', arrow='last', arrowshape=(3, 4, 2))
+        cv.create_line(x + 7 * k, y + 2 * k, x - 7 * k, y + 2 * k,
+                       fill='white', arrow='last', arrowshape=(3, 4, 2))
+    else:                                                # host
+        cv.create_rectangle(x - 8 * k, y - 8 * k, x + 8 * k, y + 8 * k,
+                            fill=C['host'], outline=ow, width=2)
+        cv.create_rectangle(x - 4.5 * k, y - 4.5 * k, x + 4.5 * k, y + 1 * k,
+                            fill='#c4c6cb', outline='')
+
+
 class _Window(object):
     HIT = 16           # px radius for clicking a node
 
     def __init__(self, inq, outq, cfg):
         import tkinter as tk
         from tkinter import ttk
-        self.tk = tk
+        self.tk, self.ttk = tk, ttk
         self.inq, self.outq, self.cfg = inq, outq, cfg
-        self.data = {'nodes': [], 'links': []}
-        self.layout = {'walls': [], 'pictures': [], 'warnings': []}
+        theme = cfg.get('theme') or load_prefs().get('theme') or 'light'
+        if theme not in THEMES:
+            theme = 'light'
+        C.clear()
+        C.update(THEMES[theme])
+        self.data = {'nodes': [], 'links': [], 'traffic': []}
+        self.layout = {'walls': [], 'pictures': [], 'warnings': [],
+                       'locked_devices': []}
         self.local = {}            # name -> (xyz, until_time) while dragging
         self.auto_pos = {}         # auto-placed controllers
-        self.hits = []
-        self.hover = None
+        self.hits, self.wall_hits = [], []
+        self.hover = self.hover_wall = None
         self.mouse = (0, 0)
         self.drag = None
         self.t0 = time.time()
         self.fitted = False
         self.user_view = False     # becomes True once you rotate/pan/zoom
-        self.pic_src, self.pic_tk = {}, {}
+        self.pic_src, self.pic_tk, self.pic_raw = {}, {}, {}
+        self.selected = None       # device chosen in the devices list
+        self.sel_item = None       # ('wall' | 'pic', index)
+        self.dots, self.acc = [], {}
+        self.sim_t, self.last_frame = 0.0, time.time()
+        self.notice = ('', 0)
+        self.tree, self.details = None, {}
+        self._tree_t = 0
 
         # camera
         self.yaw, self.pitch = math.radians(-30), math.radians(55)
@@ -641,45 +1508,26 @@ class _Window(object):
 
         root = self.root = tk.Tk()
         root.title(cfg['title'])
+        root.configure(bg=C['bar'])
+        style_ttk(root)
         w, h = cfg['size']
-
-        bar = tk.Frame(root, bg=C['bar'], padx=6, pady=4)
-        bar.pack(fill='x')
-        for text, cmd in (('3D view', self.view_3d), ('Top view', self.view_top),
-                          ('Fit', self.fit)):
-            tk.Button(bar, text=text, command=cmd, relief='flat', bg='white',
-                      padx=10).pack(side='left', padx=3)
-        self.v_ranges = tk.BooleanVar(value=True)
-        self.v_outline = tk.BooleanVar(value=False)
-        self.v_sphere = tk.BooleanVar(value=True)
-        self.v_anim = tk.BooleanVar(value=True)
-        self.v_labels = tk.BooleanVar(value=True)
-        self.v_walls = tk.BooleanVar(value=True)
-        self.v_pics = tk.BooleanVar(value=True)
+        V = tk.BooleanVar
+        self.v_ranges, self.v_outline = V(value=True), V(value=False)
+        self.v_sphere, self.v_anim = V(value=True), V(value=True)
+        self.v_labels, self.v_walls = V(value=True), V(value=True)
+        self.v_pics, self.v_badges = V(value=True), V(value=True)
+        self.v_pkts, self.v_rates = V(value=True), V(value=False)
+        self.v_locks = V(value=False)
+        self.v_dark = V(value=theme == 'dark')
         self.wall_mode_label = tk.StringVar(value=WALL_MODES[1][1])
-        self.checks = {}
-        for text, var in (('Ranges', self.v_ranges),
-                          ('outline only', self.v_outline),
-                          ('Sphere', self.v_sphere),
-                          ('Animation', self.v_anim), ('Labels', self.v_labels),
-                          ('Walls', self.v_walls), ('Pictures', self.v_pics)):
-            cb = tk.Checkbutton(bar, text=text, variable=var, bg=C['bar'],
-                                activebackground=C['bar'],
-                                command=self.on_toggle)
-            cb.pack(side='left', padx=4)
-            self.checks[text] = cb
-        tk.Label(bar, text='camera:', bg=C['bar'], fg=C['muted']).pack(
-            side='left', padx=(8, 2))
-        self.cb_mode = ttk.Combobox(bar, textvariable=self.wall_mode_label,
-                                    values=[l for _, l in WALL_MODES],
-                                    state='readonly', width=22)
-        self.cb_mode.pack(side='left')
-        self.cb_mode.bind('<<ComboboxSelected>>', lambda e: (
-            self.redraw(), self.canvas.focus_set()))
+        self.pkt_speed = tk.StringVar(value=PKT_SPEEDS[0][0])
+        self.pkt_mult = tk.StringVar(value='x1')
+        self.tip_mode = tk.StringVar(value='basic')
+        self.build_ribbon()
 
         self.status = tk.Label(root, anchor='nw', justify='left', padx=10,
-                               pady=6, bg=C['bar'], fg=C['text'],
-                               font=('TkDefaultFont', 10))
+                               pady=4, bg=C['bar'], fg=C['text'], height=6,
+                               font=('TkDefaultFont', 9))
         self.status.pack(side='bottom', fill='x')
         self.canvas = tk.Canvas(root, width=w, height=h, bg=C['bg'],
                                 highlightthickness=0)
@@ -695,28 +1543,138 @@ class _Window(object):
         cv.bind('<ButtonPress-2>', self.on_pan_start)
         cv.bind('<B2-Motion>', self.on_pan)
         cv.bind('<Motion>', self.on_motion)
-        cv.bind('<Double-Button-1>', lambda e: self.fit())
+        cv.bind('<Leave>', lambda e: self.set_hover(None, None))
+        cv.bind('<Double-Button-1>', self.on_double)
         cv.bind('<MouseWheel>', lambda e: self.zoom(e, 1 if e.delta > 0 else -1))
         cv.bind('<Button-4>', lambda e: self.zoom(e, 1))
         cv.bind('<Button-5>', lambda e: self.zoom(e, -1))
         for key, fn in (('t', self.view_top), ('3', self.view_3d),
-                        ('f', self.fit)):
+                        ('f', self.fit), ('d', self.open_tree)):
             root.bind('<Key-%s>' % key, lambda e, f=fn: f())
         for key, var in (('s', self.v_sphere), ('a', self.v_anim),
-                         ('w', self.v_walls), ('p', self.v_pics)):
+                         ('w', self.v_walls), ('p', self.v_pics),
+                         ('k', self.v_pkts)):
             root.bind('<Key-%s>' % key, lambda e, v=var: (v.set(not v.get()),
                                                           self.on_toggle()))
+        root.bind('<Control-F1>', lambda e: self.ribbon.toggle())
         self.on_toggle()
         root.after(50, self.tick)
 
+    # ---------------------------------------------------------- ribbon ----
+    def _btn(self, parent, text, cmd, width=None, side='left', accent=False):
+        b = self.tk.Button(parent, text=text, command=cmd, relief='flat',
+                           bg=C['ap'] if accent else C['btn'],
+                           fg='white' if accent else C['text'],
+                           activebackground=C['grid'],
+                           activeforeground=C['text'], highlightthickness=0,
+                           padx=6, pady=1)
+        if width:
+            b.config(width=width)
+        b.pack(side=side, padx=2, pady=1)
+        return b
+
+    def _check(self, parent, text, var, cmd=None, side='left'):
+        c = self.tk.Checkbutton(parent, text=text, variable=var, bg=C['bar'],
+                                fg=C['text'], selectcolor=C['btn'],
+                                activebackground=C['bar'],
+                                activeforeground=C['text'],
+                                highlightthickness=0,
+                                font=('TkDefaultFont', 9),
+                                command=cmd or self.on_toggle)
+        c.pack(side=side, padx=2, anchor='w')
+        return c
+
+    def build_ribbon(self):
+        tk, ttk = self.tk, self.ttk
+        rb = self.ribbon = _Ribbon(tk, self.root)
+        rb.frame.pack(fill='x')
+
+        def rows(g):
+            r1, r2 = tk.Frame(g, bg=C['bar']), tk.Frame(g, bg=C['bar'])
+            r1.pack(anchor='w')
+            r2.pack(anchor='w')
+            return r1, r2
+
+        def combo(parent, var, values, width):
+            cb = ttk.Combobox(parent, textvariable=var, values=values,
+                              state='readonly', width=width)
+            cb.pack(side='left', padx=2)
+            cb.bind('<<ComboboxSelected>>', lambda e: (
+                self.on_toggle(), self.canvas.focus_set()))
+            return cb
+
+        vt = rb.tab('View')
+        g = rb.group(vt, 'CAMERA')
+        r1, r2 = rows(g)
+        self._btn(r1, '3D view', self.view_3d, width=8)
+        self._btn(r1, 'Top view', self.view_top, width=8)
+        self._btn(r2, 'Fit', self.fit, width=8)
+        g = rb.group(vt, 'WALLS IN FRONT OF THE CAMERA')
+        self.cb_mode = combo(g, self.wall_mode_label,
+                             [l for _, l in WALL_MODES], 24)
+        g = rb.group(vt, 'THEME')
+        self._check(g, 'Dark mode', self.v_dark, self.toggle_theme)
+
+        st = rb.tab('Show')
+        g = rb.group(st, 'RANGES')
+        r1, r2 = rows(g)
+        self.cb_ranges = self._check(r1, 'Ranges', self.v_ranges)
+        self.cb_outline = self._check(r1, 'outline only', self.v_outline)
+        self._check(r2, 'Sphere', self.v_sphere)
+        g = rb.group(st, 'SCENE')
+        r1, r2 = rows(g)
+        self._check(r1, 'Labels', self.v_labels)
+        self._check(r1, 'Walls', self.v_walls)
+        self._check(r2, 'Pictures', self.v_pics)
+        self._check(r2, 'Animation', self.v_anim)
+        g = rb.group(st, 'ACCESS POINTS')
+        self._check(g, 'Connected devices badge', self.v_badges)
+
+        pt = rb.tab('Packets')
+        g = rb.group(pt, 'LIVE TRAFFIC  (K)')
+        r1, r2 = rows(g)
+        self._check(r1, 'Show packets', self.v_pkts)
+        self._check(r2, 'Rates on links', self.v_rates)
+        g = rb.group(pt, 'SPEED')
+        combo(g, self.pkt_speed, [l for l, _ in PKT_SPEEDS], 14)
+        g = rb.group(pt, 'MULTIPLIER  (dots per packet)')
+        combo(g, self.pkt_mult, [l for l, _ in PKT_MULTS], 7)
+        g = rb.group(pt, 'NOW')
+        self.lbl_rate = tk.Label(g, text='no traffic', bg=C['bar'],
+                                 fg=C['muted'], width=30, anchor='w',
+                                 font=('TkDefaultFont', 9))
+        self.lbl_rate.pack()
+
+        tt = rb.tab('Tools')
+        g = rb.group(tt, 'DEVICES  (D)')
+        self._btn(g, 'Devices list', self.open_tree, width=12, accent=True)
+        g = rb.group(tt, 'TOOLTIPS')
+        for val, text in (('basic', 'Basic'), ('advanced', 'Advanced')):
+            tk.Radiobutton(g, text=text, value=val, variable=self.tip_mode,
+                           bg=C['bar'], fg=C['text'], selectcolor=C['btn'],
+                           activebackground=C['bar'],
+                           activeforeground=C['text'], highlightthickness=0,
+                           command=self.redraw).pack(side='left', padx=2)
+        g = rb.group(tt, 'LOCKS')
+        self._check(g, 'Respect device locks of the file', self.v_locks)
+
     def on_toggle(self):
-        cb = self.checks['outline only']
         if self.v_ranges.get():
-            cb.pack(side='left', padx=4, after=self.checks['Ranges'])
+            self.cb_outline.pack(side='left', after=self.cb_ranges)
         else:
-            cb.pack_forget()
+            self.cb_outline.pack_forget()
         self.cb_mode.config(state='readonly' if self.v_walls.get()
                             else 'disabled')
+        if not self.v_pkts.get():
+            self.dots = []
+        self.redraw()
+
+    def toggle_theme(self):
+        name = 'dark' if self.v_dark.get() else 'light'
+        apply_theme(self.root, name)
+        save_prefs(theme=name)
+        if self.tree and self.tree.alive:
+            self.tree.refresh()
         self.redraw()
 
     def wall_mode(self):
@@ -746,19 +1704,36 @@ class _Window(object):
                     self.pic_src, self.pic_tk = {}, {}
                     if not self.user_view:
                         self.fitted = False
+                elif isinstance(item, dict) and item.get('type') == 'notice':
+                    self.notice = (item.get('text', ''), time.time() + 8)
                 else:
                     self.data = item
+                    self.data.setdefault('traffic', [])
+                    self.update_rate_label()
                 changed = True
         except queue.Empty:
             pass
         except (EOFError, OSError):
             pass
+        now = time.time()
+        dt, self.last_frame = min(now - self.last_frame, 0.5), now
+        self.update_packets(dt)
         if changed and not self.fitted and self.placed():
             self.fit()
             self.fitted = True
-        if changed or self.v_anim.get() or self.drag:
+        if changed or self.v_anim.get() or self.drag or self.dots:
             self.redraw()
+        if changed and self.tree and self.tree.alive and \
+                now - self._tree_t > 1.0:
+            self._tree_t = now
+            self.tree.refresh()
         self.root.after(40, self.tick)          # ~25 frames per second
+
+    def node(self, name):
+        for n in self.data['nodes']:
+            if n['name'] == name:
+                return n
+        return None
 
     def positions(self):
         """name -> xyz for every drawable node (incl. auto/local ones)."""
@@ -792,6 +1767,16 @@ class _Window(object):
 
     def walls(self):
         return self.layout.get('walls') or []
+
+    def in_wall(self, p):
+        for w in self.walls():
+            if wall_contains_point(w, p):
+                return w
+        return None
+
+    def clients_of(self, ap):
+        return [n for n in self.data['nodes']
+                if n['kind'] in CLIENT_KINDS and n.get('ap') == ap]
 
     # ---------------------------------------------------------- camera ----
     def project(self, x, y, z):
@@ -862,6 +1847,16 @@ class _Window(object):
         self.yaw, self.pitch = math.radians(-30), math.radians(55)
         self.fit()
 
+    def go_to(self, name):
+        p = self.positions().get(name)
+        if p is None:
+            return
+        self.target = tuple(p)
+        self.pan = [0.0, 0.0]
+        self.user_view = True
+        self.selected = name
+        self.redraw()
+
     # ----------------------------------------------------------- mouse ----
     def node_at(self, x, y):
         best, bd = None, self.HIT
@@ -871,26 +1866,93 @@ class _Window(object):
                 best, bd = name, d
         return best
 
+    def wall_at(self, x, y, unlocked=False):
+        for i, pts in reversed(self.wall_hits):
+            if _in_poly(x, y, pts) and not (
+                    unlocked and self.walls()[i].get('locked')):
+                return i
+        return None
+
+    def pic_at(self, x, y, unlocked=True):
+        if not self.v_pics.get():
+            return None
+        pics = self.layout.get('pictures') or []
+        for i in range(len(pics) - 1, -1, -1):
+            p = pics[i]
+            if not p.get('visible', True) or (unlocked and p.get('locked')):
+                continue
+            if _in_poly(x, y, [self.project(*c)[:2]
+                               for c in self.pic_corners(p)]):
+                return i
+        return None
+
+    def movable(self, name):
+        return self.cfg.get('allow_move', True) and not (
+            self.v_locks.get() and
+            name in (self.layout.get('locked_devices') or []))
+
     def on_press(self, e):
+        self.press = (e.x, e.y)
         name = self.node_at(e.x, e.y)
-        if name and self.cfg.get('allow_move', True):
+        if name and self.movable(name):
             xyz = self.positions()[name]
             self.drag = {'mode': 'node', 'name': name, 'xyz': xyz,
                          'start': (e.x, e.y), 'sent': 0}
-        else:
-            self.drag = {'mode': 'rotate', 'last': (e.x, e.y)}
+            return
+        if name:
+            self.notice = ('%s is locked in the file (Tools tab: '
+                           '"Respect device locks")' % name, time.time() + 4)
+        i = self.wall_at(e.x, e.y, unlocked=True) if self.v_walls.get() \
+            else None
+        if i is not None:
+            w = self.walls()[i]
+            mx, my = self.unproject(e.x, e.y, w['z'])
+            self.sel_item = ('wall', i)
+            self.drag = {'mode': 'wall', 'i': i, 'moved': False,
+                         'off': (w['x'] - mx, w['y'] - my)}
+            return
+        i = self.pic_at(e.x, e.y)
+        if i is not None:
+            p = self.layout['pictures'][i]
+            mx, my = self.unproject(e.x, e.y, p['z'])
+            self.sel_item = ('pic', i)
+            self.drag = {'mode': 'pic', 'i': i, 'moved': False,
+                         'off': (p['x'] - mx, p['y'] - my)}
+            return
+        self.drag = {'mode': 'rotate', 'last': (e.x, e.y), 'moved': False}
 
     def on_drag(self, e):
         d = self.drag
         if not d:
             return
+        self.mouse = (e.x, e.y)
         if d['mode'] == 'rotate':
+            d['moved'] = d['moved'] or math.hypot(
+                e.x - self.press[0], e.y - self.press[1]) > 3
             self.user_view = True
             lx, ly = d['last']
             self.yaw += (e.x - lx) * 0.01
             self.pitch = min(max(self.pitch + (e.y - ly) * 0.01, 0.0),
                              math.radians(85))
             d['last'] = (e.x, e.y)
+        elif d['mode'] in ('wall', 'pic'):
+            d['moved'] = True
+            obj = (self.walls() if d['mode'] == 'wall'
+                   else self.layout['pictures'])[d['i']]
+            mx, my = self.unproject(e.x, e.y, obj['z'])
+            nx, ny = mx + d['off'][0], my + d['off'][1]
+            if d['mode'] == 'wall':
+                test = dict(obj, x=nx, y=ny)
+                pos = self.positions()
+                bad = any(walls_overlap(test, o) for j, o in
+                          enumerate(self.walls()) if j != d['i']) or \
+                    any(wall_contains_point(test, p) for p in pos.values())
+                if bad:
+                    self.notice = ('walls cannot overlap other walls or '
+                                   'devices', time.time() + 2)
+                    self.redraw()
+                    return
+            obj['x'], obj['y'] = round(nx, 3), round(ny, 3)
         else:
             x, y, z = d['xyz']
             if e.state & 0x0001:                       # Shift: change height
@@ -899,10 +1961,19 @@ class _Window(object):
                 d['start'] = (e.x, e.y)
             else:
                 x, y = self.unproject(e.x, e.y, z)
-            d['xyz'] = (x, y, z)
-            self.local[d['name']] = ((x, y, z), time.time() + 2.0)
+            new = (x, y, z)
+            if self.in_wall(new):                      # never inside a wall
+                ox, oy, oz = d['xyz']
+                for cand in ((x, oy, z), (ox, y, z), d['xyz']):
+                    if not self.in_wall(cand):
+                        new = cand
+                        break
+                self.notice = ('devices cannot go inside walls',
+                               time.time() + 2)
+            d['xyz'] = new
+            self.local[d['name']] = (new, time.time() + 2.0)
             if time.time() - d['sent'] > 0.15:         # don't flood Mininet
-                self.send_move(d['name'], (x, y, z))
+                self.send_move(d['name'], new)
                 d['sent'] = time.time()
         self.redraw()
 
@@ -911,13 +1982,30 @@ class _Window(object):
         if d and d['mode'] == 'node':
             self.send_move(d['name'], d['xyz'])
             self.local[d['name']] = (d['xyz'], time.time() + 2.0)
+        elif d and d['mode'] in ('wall', 'pic') and d['moved']:
+            obj = (self.walls() if d['mode'] == 'wall'
+                   else self.layout['pictures'])[d['i']]
+            self.send(('%s_move' % d['mode'], d['i'], obj['x'], obj['y']))
+        elif d and d['mode'] == 'rotate' and not d['moved']:
+            self.sel_item = None
+            self.selected = None
         self.redraw()
 
-    def send_move(self, name, xyz):
+    def on_double(self, e):
+        name = self.node_at(e.x, e.y)
+        if name:
+            self.open_details(name)
+        else:
+            self.fit()
+
+    def send(self, msg):
         try:
-            self.outq.put(('move', name) + tuple(round(v, 2) for v in xyz))
+            self.outq.put(msg)
         except Exception:
             pass
+
+    def send_move(self, name, xyz):
+        self.send(('move', name) + tuple(round(v, 2) for v in xyz))
 
     def on_pan_start(self, e):
         self.pan_last = (e.x, e.y)
@@ -940,17 +2028,102 @@ class _Window(object):
         self.scale *= k
         self.redraw()
 
+    def set_hover(self, node, wall):
+        if (node, wall) != (self.hover, self.hover_wall):
+            self.hover, self.hover_wall = node, wall
+            if not self.v_anim.get():
+                self.redraw()
+
     def on_motion(self, e):
         self.mouse = (e.x, e.y)
         h = self.node_at(e.x, e.y)
-        if h != self.hover:
-            self.hover = h
-            self.canvas.config(cursor='fleur' if h else '')
+        wl = None
+        if h is None and self.v_walls.get():
+            wl = self.wall_at(e.x, e.y)
+        movable_item = (wl is not None and not self.walls()[wl].get('locked')) \
+            or (h is None and wl is None and self.pic_at(e.x, e.y) is not None)
+        self.canvas.config(cursor='fleur' if (h and self.movable(h)) or
+                           movable_item else '')
+        if (h, wl) != (self.hover, self.hover_wall) or h or wl is not None:
+            self.hover, self.hover_wall = h, wl
             if not self.v_anim.get():
                 self.redraw()
-        elif h:
-            if not self.v_anim.get():
-                self.redraw()
+
+    # --------------------------------------------------------- packets ----
+    def speed(self):
+        return dict(PKT_SPEEDS).get(self.pkt_speed.get(), 1.0)
+
+    def mult(self):
+        return dict(PKT_MULTS).get(self.pkt_mult.get(), 1.0)
+
+    def update_rate_label(self):
+        tr = self.data.get('traffic') or []
+        if not tr:
+            self.lbl_rate.config(text='no traffic')
+            return
+        pps = sum(t[3] for t in tr)
+        bps = sum(t[4] for t in tr)
+        self.lbl_rate.config(text='%d active link directions, %s' % (
+            len(tr), _rate(pps, bps)))
+
+    def update_packets(self, dt):
+        """Spawn and move the packet dots (simulation clock = real time x
+        speed, so 'slowed' also slows the rate at which dots appear)."""
+        sp = self.speed()
+        self.sim_t += dt * sp
+        if not self.v_pkts.get():
+            return
+        if sp > 0:
+            m = self.mult()
+            for a, b, kind, pps, bps in self.data.get('traffic') or []:
+                key = (a, b, kind)
+                rate = min(pps * m * sp, PKT_MAX_RATE)
+                acc = self.acc.get(key, 0.0) + rate * dt
+                n = int(acc)
+                self.acc[key] = acc - n
+                size = bps / pps if pps else 100.0
+                for i in range(n):
+                    if len(self.dots) >= PKT_MAX:
+                        break
+                    self.dots.append((a, b, kind,
+                                      self.sim_t - dt * sp * i / max(n, 1),
+                                      size))
+        self.dots = [d for d in self.dots
+                     if self.sim_t - d[3] <= PKT_TRAVEL]
+
+    def draw_packets(self, pos):
+        cv = self.canvas
+        col = {'wifi': C['pkt_wifi'], 'wired': C['pkt_wired'],
+               'adhoc': C['pkt_peer'], 'mesh': C['pkt_peer']}
+        for a, b, kind, t0, size in self.dots:
+            if a not in pos or b not in pos:
+                continue
+            f = max(0.0, min(1.0, (self.sim_t - t0) / PKT_TRAVEL))
+            x1, y1, _ = self.project(*pos[a])
+            x2, y2, _ = self.project(*pos[b])
+            # lanes: each direction slightly offset so both are visible
+            L = math.hypot(x2 - x1, y2 - y1) or 1
+            ox, oy = -(y2 - y1) / L * 3, (x2 - x1) / L * 3
+            x, y = x1 + (x2 - x1) * f + ox, y1 + (y2 - y1) * f + oy
+            r = 2.5 if size < 200 else (3.5 if size < 1000 else 4.5)
+            cv.create_oval(x - r, y - r, x + r, y + r,
+                           fill=col.get(kind, C['pkt_wired']),
+                           outline=C['bg'])
+
+    def draw_rates(self, pos):
+        pairs = {}
+        for a, b, kind, pps, bps in self.data.get('traffic') or []:
+            if a in pos and b in pos:
+                k = tuple(sorted((a, b)))
+                v = pairs.setdefault(k, [0.0, 0.0])
+                v[0] += pps
+                v[1] += bps
+        for (a, b), (pps, bps) in pairs.items():
+            x1, y1, _ = self.project(*pos[a])
+            x2, y2, _ = self.project(*pos[b])
+            self.canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2 + 13,
+                                    text=_rate(pps, bps), fill=C['ap'],
+                                    font=('TkDefaultFont', 8, 'bold'))
 
     # --------------------------------------------------------- drawing ----
     def circle_pts(self, x, y, z, r, n=56):
@@ -996,11 +2169,13 @@ class _Window(object):
             return
         cv = self.canvas
         cv.delete('all')
+        cv.configure(bg=C['bg'])
         t = time.time() - self.t0
         anim = self.v_anim.get()
         pos = self.positions()
         nodes = {n['name']: n for n in self.data['nodes']}
 
+        self.pic_hits = []
         if self.v_pics.get():                      # pictures under all
             for i, pic in enumerate(self.layout.get('pictures') or []):
                 self.draw_picture(i, pic)
@@ -1102,6 +2277,10 @@ class _Window(object):
                 wl, hit = wall_loss(self.walls(), pos[name], pos[n['ap']])
                 self.draw_rf(pos[name], pos[n['ap']], t if anim else 0, ok,
                              n.get('rssi'), len(hit), wl)
+        if self.v_pkts.get():
+            self.draw_packets(pos)
+        if self.v_rates.get():
+            self.draw_rates(pos)
 
         # nodes and 3D wall faces, far ones first (painter's algorithm)
         self.hits = []
@@ -1115,11 +2294,32 @@ class _Window(object):
                 self.draw_node(nodes[it[2]], it[3], it[4])
             else:
                 it[2]()
+                self.wall_hits.append((it[3], it[4]))
         for fn in self._wall_late:                  # labels, ghost tops
             fn()
+        self.draw_selection()
 
         self.draw_overlay()
         self.update_status(pos, nodes)
+
+    def draw_selection(self):
+        if not self.sel_item:
+            return
+        kind, i = self.sel_item
+        cv = self.canvas
+        try:
+            if kind == 'wall':
+                w = self.walls()[i]
+                pts = [self.project(x, y, w['z'] + max(float(w['height']), 0))
+                       [:2] for x, y in wall_corners(w)]
+            else:
+                pts = [self.project(*c)[:2] for c in
+                       self.pic_corners(self.layout['pictures'][i])]
+        except (IndexError, KeyError):
+            self.sel_item = None
+            return
+        cv.create_polygon([v for q in pts for v in q], fill='',
+                          outline=C['ap'], width=2, dash=(6, 3))
 
     # ------------------------------------------------------------ walls ----
     def view_grad(self):
@@ -1151,7 +2351,7 @@ class _Window(object):
         Camera modes: solid, fade (walls in front of the camera become
         see-through), cutaway (lowered to a stub), outline."""
         cv = self.canvas
-        self._wall_late = []
+        self._wall_late, self.wall_hits = [], []
         items = []
         walls = self.walls()
         if not self.v_walls.get() or not walls:
@@ -1163,7 +2363,7 @@ class _Window(object):
         labels = self.v_labels.get()
         node_scr = [self.project(*p) for p in pos.values()]
         tilted = self.pitch > math.radians(8)
-        for w in walls:
+        for wi, w in enumerate(walls):
             col = _safe_color(w.get('color'))
             dark = _mix(col, '#000000', 0.4)
             glass = w.get('material') == 'glass'
@@ -1174,6 +2374,7 @@ class _Window(object):
                 cv.create_polygon([v for q in pts for v in q],
                                   fill='' if mode == 'outline' else col,
                                   stipple='gray50', outline=dark, width=1.2)
+                self.wall_hits.append((wi, pts))
                 if labels:
                     cx = sum(q[0] for q in pts) / 4
                     cy = sum(q[1] for q in pts) / 4
@@ -1225,7 +2426,8 @@ class _Window(object):
                     stipple, dash = 'gray12', (3, 3)
                 elif glass:
                     stipple = 'gray50'
-                flat = [v for q in sp for v in q[:2]]
+                pts = [q[:2] for q in sp]
+                flat = [v for q in pts for v in q]
                 depth = sum(q[2] for q in sp) / len(sp)
 
                 def draw(flat=flat, fill=fill, stipple=stipple, dash=dash,
@@ -1233,40 +2435,62 @@ class _Window(object):
                     kw = {'stipple': stipple} if stipple and fill else {}
                     self.canvas.create_polygon(flat, fill=fill, outline=dark,
                                                width=1, dash=dash, **kw)
-                items.append((depth, 'face', draw))
+                items.append((depth, 'face', draw, wi, pts))
             if labels:
                 lx, ly, _ = self.project(w['x'], w['y'], z0 + top_h)
-                self._wall_label_item(w, lx, ly - 9, dark)
+                self._wall_late.append(lambda lx=lx, ly=ly, w=w, d=dark:
+                                       self.wall_label(w, lx, ly - 9, d))
         return items
-
-    def _wall_label_item(self, w, x, y, col):
-        self._wall_late.append(lambda: self.wall_label(w, x, y, col))
 
     def wall_label(self, w, x, y, col):
         self.canvas.create_text(
-            x, y, text='%s · %s %s dB' % (w['name'], w['material'],
-                                          '%g' % round(wall_db(w), 1)),
-            fill=col, font=('TkDefaultFont', 8, 'bold'))
+            x, y, text='%s · %s %s dB%s' % (
+                w['name'], w['material'], _g(wall_db(w)),
+                '' if w.get('locked') else '  (movable)'),
+            fill=col if not self.v_dark.get() else _mix(col, '#ffffff', 0.5),
+            font=('TkDefaultFont', 8, 'bold'))
+
+    def wall_connections(self, w):
+        """Connections (Wi-Fi associations, ad-hoc / mesh) crossing w."""
+        pos = self.positions()
+        out = []
+        for n in self.data['nodes']:
+            if n['kind'] in CLIENT_KINDS and n.get('ap') in pos and \
+                    n['name'] in pos:
+                if wall_crossed(w, pos[n['name']], pos[n['ap']]):
+                    out.append('%s -> %s%s' % (
+                        n['name'], n['ap'],
+                        ('  (RSSI %.1f dBm)' % n['rssi'])
+                        if n.get('rssi') is not None else ''))
+        for link in self.data['links']:
+            if link[2] in ('adhoc', 'mesh') and link[0] in pos and \
+                    link[1] in pos and wall_crossed(w, pos[link[0]],
+                                                    pos[link[1]]):
+                out.append('%s <-> %s  (%s)' % (link[0], link[1], link[2]))
+        return out
 
     # --------------------------------------------------------- pictures ----
     def pic_source(self, pic, reduce=1):
-        key = (pic.get('path'), reduce)
+        key = (pic.get('path'), reduce, pic_edits_key(pic))
         if key in self.pic_src:
             return self.pic_src[key]
         img = None
         try:
             from PIL import Image
             if reduce == 1:
-                im = Image.open(pic['path'])
-                im.load()
-                im = im.convert('RGBA')
-                m = max(im.size)
-                if m > 2048:
-                    k = 2048.0 / m
-                    im = im.resize((max(1, int(im.size[0] * k)),
-                                    max(1, int(im.size[1] * k))),
-                                   Image.LANCZOS)
-                img = im
+                raw = self.pic_raw.get(pic['path'])
+                if raw is None:
+                    im = Image.open(pic['path'])
+                    im.load()
+                    im = im.convert('RGBA')
+                    m = max(im.size)
+                    if m > 2048:
+                        k = 2048.0 / m
+                        im = im.resize((max(1, int(im.size[0] * k)),
+                                        max(1, int(im.size[1] * k))),
+                                       Image.LANCZOS)
+                    raw = self.pic_raw[pic['path']] = im
+                img = apply_pic_edits(raw, pic)
             else:
                 base = self.pic_source(pic, 1)
                 img = base.reduce(reduce) if base is not None else None
@@ -1326,7 +2550,8 @@ class _Window(object):
         coef = (by / det, -bx / det, (by * dx - bx * dy) / det,
                 -ay / det, ax / det, (-ay * dx + ax * dy) / det)
         op = max(0, min(100, int(round(float(pic.get('opacity', 100))))))
-        key = (k, x1 - x0, y1 - y0, op, tuple(round(c, 6) for c in coef))
+        key = (pic_edits_key(pic), k, x1 - x0, y1 - y0, op,
+               tuple(round(c, 6) for c in coef))
         cached = self.pic_tk.get(idx)
         if cached and cached[0] == key:
             img = cached[1]
@@ -1380,8 +2605,8 @@ class _Window(object):
         ex = self.project(gx0 + step, gy0, 0)
         ey = self.project(gx0, gy0 + step, 0)
         ez = self.project(gx0, gy0, step)
-        for end, label, col in ((ex, 'x', '#c0392b'), (ey, 'y', '#1e8449'),
-                                (ez, 'z', '#2457a6')):
+        for end, label, col in ((ex, 'x', C['x']), (ey, 'y', C['y']),
+                                (ez, 'z', C['z'])):
             cv.create_line(o[0], o[1], end[0], end[1], fill=col, width=2,
                            arrow='last')
             cv.create_text(end[0] + 8, end[1] - 6, text=label, fill=col,
@@ -1397,29 +2622,20 @@ class _Window(object):
             return
         ux, uy = (x2 - x1) / L, (y2 - y1) / L
         nx, ny = -uy, ux
+        dark = self.v_dark.get()
 
         if not ok:
-            color = '#cc3a2f'
-            glow = '#f3d0cc'
-        elif rssi is None:
-            color = '#16a05a'
-            glow = '#cdebd9'
-        elif rssi >= -50:
-            # Excellent
-            color = '#16a05a'
-            glow = '#cdebd9'
+            color, glow = '#cc3a2f', '#f3d0cc'
+        elif rssi is None or rssi >= -50:
+            color, glow = '#16a05a', '#cdebd9'          # excellent
         elif rssi >= -65:
-            # Bon
-            color = '#7cb342'
-            glow = '#dcedc8'
+            color, glow = '#7cb342', '#dcedc8'          # good
         elif rssi >= -75:
-            # Moyen
-            color = '#f39c12'
-            glow = '#fdebd0'
+            color, glow = '#f39c12', '#fdebd0'          # fair
         else:
-            # Mauvais
-            color = '#cc3a2f'
-            glow = '#f3d0cc'
+            color, glow = '#cc3a2f', '#f3d0cc'          # poor
+        if dark:
+            glow = _mix(glow, C['bg'], 0.8)
 
         cv.create_line(x1, y1, x2, y2, fill=glow,
                        width=8, capstyle='round')
@@ -1432,8 +2648,8 @@ class _Window(object):
             off = amp * env * math.sin(2 * math.pi * (d - speed * t) / wl_)
             pts += [x1 + ux * d + nx * off, y1 + uy * d + ny * off]
         cv.create_line(*pts, fill=color, width=3, smooth=True)
-        walls_txt = ('  %d wall%s -%g dB' % (nwalls, '' if nwalls == 1 else 's',
-                                             round(wl, 1))) if nwalls else ''
+        walls_txt = ('  %d wall%s -%s dB' % (nwalls, '' if nwalls == 1 else 's',
+                                             _g(wl))) if nwalls else ''
         if rssi is not None:
             text = '%.1f dBm%s' % (rssi, walls_txt)
             cv.create_text((x1 + x2) / 2, (y1 + y2) / 2 - 15, text=text,
@@ -1447,63 +2663,22 @@ class _Window(object):
                            text=walls_txt.strip(), fill=color,
                            font=('TkDefaultFont', 8, 'bold'))
 
-    def draw_icon(self, kind, x, y, ow='white', s=1.0):
-        cv, k = self.canvas, s
-        if kind == 'ap':
-            cv.create_rectangle(x - 10 * k, y - 7 * k, x + 10 * k, y + 7 * k,
-                                fill=C['ap'], outline=ow, width=2)
-            cv.create_line(x + 6 * k, y - 7 * k, x + 6 * k, y - 15 * k,
-                           fill=C['ap'], width=2)
-            for r in (5 * k, 9 * k):                     # wifi arcs
-                cv.create_arc(x + 6 * k - r, y - 15 * k - r, x + 6 * k + r,
-                              y - 15 * k + r, start=45, extent=90,
-                              style='arc', outline=C['ap'], width=1.5)
-            for i in (-5, 0):                            # leds
-                cv.create_oval(x + i * k - 1.5, y - 1.5, x + i * k + 1.5,
-                               y + 1.5, fill='#9ff0b8', outline='')
-        elif kind == 'sta':
-            cv.create_oval(x - 8 * k, y - 8 * k, x + 8 * k, y + 8 * k,
-                           fill=C['sta'], outline=ow, width=2)
-            cv.create_oval(x - 2.5 * k, y - 2.5 * k, x + 2.5 * k, y + 2.5 * k,
-                           fill='white', outline='')
-        elif kind == 'car':
-            cv.create_polygon(x - 7 * k, y - 4 * k, x - 3 * k, y - 10 * k,
-                              x + 5 * k, y - 10 * k, x + 8 * k, y - 4 * k,
-                              fill=C['car'], outline=ow, width=1.5)
-            cv.create_rectangle(x - 1 * k, y - 8.5 * k, x + 4.5 * k,
-                                y - 5 * k, fill='#f3e3d8', outline='')
-            cv.create_rectangle(x - 12 * k, y - 4 * k, x + 12 * k, y + 4 * k,
-                                fill=C['car'], outline=ow, width=2)
-            for wx in (-6, 6):
-                cv.create_oval(x + (wx - 3.5) * k, y + 0.5 * k,
-                               x + (wx + 3.5) * k, y + 7.5 * k,
-                               fill=C['text'], outline=ow, width=1)
-        elif kind == 'ctrl':
-            pts = []
-            for i in range(6):
-                a = math.pi / 6 + i * math.pi / 3
-                pts += [x + 12 * k * math.cos(a), y + 12 * k * math.sin(a)]
-            cv.create_polygon(pts, fill=C['ctrl'], outline=ow, width=2)
-            cv.create_text(x, y, text='C', fill='white',
-                           font=('TkDefaultFont', max(int(9 * k), 6), 'bold'))
-        elif kind == 'switch':
-            cv.create_rectangle(x - 12 * k, y - 6 * k, x + 12 * k, y + 6 * k,
-                                fill=C['switch'], outline=ow, width=2)
-            cv.create_line(x - 7 * k, y - 2 * k, x + 7 * k, y - 2 * k,
-                           fill='white', arrow='last', arrowshape=(3, 4, 2))
-            cv.create_line(x + 7 * k, y + 2 * k, x - 7 * k, y + 2 * k,
-                           fill='white', arrow='last', arrowshape=(3, 4, 2))
-        else:                                            # host
-            cv.create_rectangle(x - 8 * k, y - 8 * k, x + 8 * k, y + 8 * k,
-                                fill=C['host'], outline=ow, width=2)
-            cv.create_rectangle(x - 4.5 * k, y - 4.5 * k, x + 4.5 * k,
-                                y + 1 * k, fill='#c4c6cb', outline='')
-
     def draw_node(self, n, x, y):
         cv = self.canvas
         kind, name = n['kind'], n['name']
         hl = (self.hover == name) or (self.drag and self.drag.get('name') == name)
-        self.draw_icon(kind, x, y, ow=C['select'] if hl else 'white')
+        if name == self.selected:
+            cv.create_oval(x - 19, y - 19, x + 19, y + 19, fill='',
+                           outline=C['select'], dash=(2, 3))
+        draw_icon(cv, kind, x, y, ow=C['select'] if hl else C['outline'])
+        if kind == 'ap' and self.v_badges.get():
+            cnt = len(self.clients_of(name))
+            bx, by = x + 15, y - 13
+            cv.create_oval(bx - 8, by - 8, bx + 8, by + 8,
+                           fill=C['rf'] if cnt else C['axis'],
+                           outline=C['outline'], width=1.5)
+            cv.create_text(bx, by, text=str(cnt), fill='white',
+                           font=('TkDefaultFont', 8, 'bold'))
         if self.v_labels.get():
             label = name + (' (auto)' if kind == 'ctrl' and self.is_auto(name) else '')
             cv.create_text(x, y + 20, text=label, fill=C['text'],
@@ -1524,8 +2699,8 @@ class _Window(object):
         for kind, text in (('ap', 'Access point'), ('sta', 'Station'),
                            ('car', 'Car'), ('host', 'Host'),
                            ('switch', 'Switch'), ('ctrl', 'Controller')):
-            self.draw_icon(kind, x + 7, y + (3 if kind == 'ap' else 0),
-                           s=0.55)
+            draw_icon(cv, kind, x + 7, y + (3 if kind == 'ap' else 0),
+                      ow=C['outline'], s=0.55)
             cv.create_text(x + 18, y, text=text, anchor='w', fill=C['text'],
                            font=('TkDefaultFont', 9))
             x += 26 + 7 * len(text)
@@ -1534,12 +2709,18 @@ class _Window(object):
                 ('peer', 'Ad-hoc / mesh', (6, 4), C['peer'], 2),
                 ('wired', 'Cable', None, C['wired'], 3),
                 ('control', 'Control', (6, 4), C['control'], 2),
-                ('wall', 'Wall', None, C['wall'], 6)):
+                ('wall', 'Wall', None, C['wall'], 6),
+                ('pkt', 'Packet', None, C['pkt_wifi'], 0)):
             if kind == 'rf':
                 pts = []
                 for i in range(13):
                     pts += [x + i * 2, y + 3 * math.sin(i * 1.1)]
                 cv.create_line(*pts, fill=col, width=wd, smooth=True)
+            elif kind == 'pkt':
+                for i, c in enumerate((C['pkt_wifi'], C['pkt_wired'],
+                                       C['pkt_peer'])):
+                    cv.create_oval(x + i * 8, y - 3, x + i * 8 + 6, y + 3,
+                                   fill=c, outline='')
             else:
                 cv.create_line(x, y, x + 24, y, fill=col, width=wd, dash=dash)
             cv.create_text(x + 30, y, text=text, anchor='w', fill=C['text'],
@@ -1549,51 +2730,143 @@ class _Window(object):
         cv.create_text(12, h - 12, anchor='sw', fill=C['muted'],
                        font=('TkDefaultFont', 8),
                        text='drag: rotate   right-drag: pan   wheel: zoom   '
-                            'drag node: move   Shift+drag node: height   '
-                            'T/3/F: top/3D/fit   W/P: walls/pictures')
+                            'drag device: move   Shift+drag: height   '
+                            'double-click device: details   D: devices list'
+                            '   T/3/F: top/3D/fit')
         # tooltip
-        if self.hover and not (self.drag and self.drag.get('mode') == 'rotate'):
-            self.draw_tip()
+        if not (self.drag and self.drag.get('mode') == 'rotate'):
+            if self.hover:
+                self.draw_tip(self.node_tip(self.hover))
+            elif self.hover_wall is not None:
+                self.draw_tip(self.wall_tip(self.hover_wall))
 
-    def draw_tip(self):
-        cv = self.canvas
-        n = next((n for n in self.data['nodes'] if n['name'] == self.hover), None)
+    def node_tip(self, name, advanced=None):
+        """Tooltip lines. Basic: who / where / connection. Advanced: every
+        detail the editor shows, with the values Mininet-WiFi simulates."""
+        if advanced is None:
+            advanced = self.tip_mode.get() == 'advanced'
+        n = self.node(name)
         pos = self.positions()
-        p = pos.get(self.hover)
+        p = pos.get(name)
         if not n or not p:
-            return
-        lines = ['%s  (%s)' % (n['name'], KIND_LABEL.get(n['kind'], n['kind'])),
-                 'position: %.1f, %.1f, %.1f' % p]
-        if n['range'] > 0:
-            lines.append('range: %g m' % n['range'])
+            return []
+        info = n.get('info') or {}
+        L = ['%s  (%s)' % (n['name'], KIND_LABEL.get(n['kind'], n['kind'])),
+             'position: %.1f, %.1f, %.1f' % tuple(p)]
         if n['kind'] in CLIENT_KINDS:
-            lines.append('connected to: %s' % (n['ap'] or 'nothing'))
-            rssi = n.get('rssi')
-            lines.append('RSSI: %.1f dBm' % rssi if rssi is not None
-                         else 'RSSI: unavailable')
-            if n['ap'] in pos:
-                wl, hit = wall_loss(self.walls(), p, pos[n['ap']])
-                if hit:
-                    lines.append('walls to %s: %s  (-%g dB)' % (
-                        n['ap'], ', '.join(w['name'] for w in hit),
-                        round(wl, 1)))
+            L.append('connected to: %s' % (n['ap'] or 'nothing'))
+            L.append('RSSI (simulated): %.1f dBm' % n['rssi']
+                     if n.get('rssi') is not None else 'RSSI: unavailable')
         if n['kind'] == 'ap':
-            clients = [m['name'] for m in self.data['nodes']
-                       if m.get('ap') == n['name']]
-            lines.append('connected devices: %d%s' % (
-                len(clients), ('  (%s)' % ', '.join(clients)) if clients else ''))
-        if n['kind'] == 'ctrl' and self.is_auto(n['name']):
-            lines.append('(placed automatically, drag to move)')
+            cl = self.clients_of(name)
+            L.append('connected devices: %d%s' % (
+                len(cl), ('  (%s)' % ', '.join(c['name'] for c in cl))
+                if cl else ''))
+        if info.get('ip') and not advanced:
+            L.append('ip: %s' % info['ip'])
+        if not advanced:
+            return L
+        L.append('class: %s' % info.get('class', '?'))
+        if n['range'] > 0:
+            L.append('range: %s m' % _g(n['range']))
+        for e in info.get('wintfs') or []:
+            bits = [e['name']]
+            for k, lab in (('mode', 'mode'), ('ssid', 'ssid'),
+                           ('channel', 'ch'), ('freq', 'freq'),
+                           ('txpower', 'txpower'), ('antennaGain', 'gain'),
+                           ('ip', 'ip'), ('mac', 'mac')):
+                if e.get(k) not in (None, ''):
+                    bits.append('%s=%s' % (lab, _g(e[k])))
+            if e.get('assoc'):
+                bits.append('-> %s' % e['assoc'])
+            L.append('  ' + '  '.join(bits))
+        for e in info.get('intfs') or []:
+            L.append('  %s  ip=%s  mac=%s' % (e['name'], e.get('ip') or '-',
+                                              e.get('mac') or '-'))
+        for k in ('dpid', 'failMode', 'protocols'):
+            if info.get(k):
+                L.append('%s: %s' % (k, info[k]))
+        if n['kind'] == 'ctrl' and info.get('ip'):
+            L.append('controller: %s:%s %s' % (info['ip'], _g(info.get(
+                'port', '')), info.get('protocol', '')))
+        if n['kind'] in CLIENT_KINDS and n.get('ap') in pos:
+            ap = self.node(n['ap'])
+            d = math.dist(p, pos[n['ap']])
+            L.append('distance to %s: %s m  (AP range %s m)' % (
+                n['ap'], _g(d), _g(ap['range'] if ap else 0)))
+            wl, hit = wall_loss(self.walls(), p, pos[n['ap']])
+            L.append('walls on the path: %s' % (
+                '%s  (-%s dB)' % (', '.join(w['name'] for w in hit), _g(wl))
+                if hit else 'none'))
+        if n['kind'] == 'ap':
+            for c in self.clients_of(name):
+                if c['name'] in pos:
+                    wl, hit = wall_loss(self.walls(), pos[c['name']], p)
+                    L.append('  %s  %s m  RSSI %s%s' % (
+                        c['name'], _g(math.dist(pos[c['name']], p)),
+                        ('%.1f dBm' % c['rssi']) if c.get('rssi') is not None
+                        else '?', ('  %d wall(s) -%s dB' % (len(hit), _g(wl)))
+                        if hit else ''))
+        out = [t for t in self.data.get('traffic') or [] if t[0] == name]
+        inn = [t for t in self.data.get('traffic') or [] if t[1] == name]
+        if out or inn:
+            L.append('traffic out: %s' % _rate(sum(t[3] for t in out),
+                                               sum(t[4] for t in out)))
+            L.append('traffic in:  %s' % _rate(sum(t[3] for t in inn),
+                                               sum(t[4] for t in inn)))
+        if name in (self.layout.get('locked_devices') or []):
+            L.append('locked in the editor file')
+        return L
+
+    def wall_tip(self, i):
+        try:
+            w = self.walls()[i]
+        except IndexError:
+            return []
+        cr = self.wall_connections(w)
+        L = ['%s  (wall, %s)' % (w['name'], w['material']),
+             'loss: %s dB%s' % (_g(wall_db(w)), (
+                 '  (base %s dB, thickness x%s)' % (_g(w['loss']),
+                                                    _g(w['thick_mult'])))
+                 if w.get('thick_mult') and w['material'] != 'custom' else ''),
+             '%s x %s m, %s' % (_g(w['length']), _g(w['thickness']),
+                                ('%s m high from z=%s' % (_g(w['height']),
+                                                         _g(w['z'])))
+                                if float(w['height']) > 0 else 'flat 2D wall'),
+             'connections through it: %d' % len(cr)]
+        L += ['  ' + c for c in cr[:12]]
+        if len(cr) > 12:
+            L.append('  ... %d more' % (len(cr) - 12))
+        L.append('locked (fixed)' if w.get('locked') else
+                 'unlocked: drag to move it')
+        if w.get('group'):
+            L.append('group: %s' % w['group'])
+        return L
+
+    def draw_tip(self, lines):
+        if not lines:
+            return
+        cv = self.canvas
         mx, my = self.mouse
-        tid = cv.create_text(mx + 16, my - 12, text='\n'.join(lines), anchor='sw',
-                             fill=C['tip_fg'], font=('TkDefaultFont', 9))
+        tid = cv.create_text(mx + 16, my - 12, text='\n'.join(lines),
+                             anchor='sw', fill=C['tip_fg'],
+                             font=('TkDefaultFont', 9))
         b = cv.bbox(tid)
+        W, H = self.size()
+        dx = min(0, W - 6 - b[2])                  # keep it on screen
+        dy = max(0, 6 - b[1])
+        if dx or dy:
+            cv.move(tid, dx, dy)
+            b = cv.bbox(tid)
         bg = cv.create_rectangle(b[0] - 7, b[1] - 5, b[2] + 7, b[3] + 5,
                                  fill=C['tip_bg'], outline='')
         cv.tag_raise(tid, bg)
 
     def update_status(self, pos, nodes):
         lines, warn = [], False
+        txt, until = self.notice
+        if txt and until > time.time():
+            lines.append('>  ' + txt)
         for wtxt in self.layout.get('warnings') or []:
             warn = True
             lines.append('!  ' + wtxt)
@@ -1611,9 +2884,9 @@ class _Window(object):
                     wl, hit = wall_loss(self.walls(), pos[n['name']], pos[ap])
                     lines.append('%s  ->  %s    %.0f m   (%s, AP range %g m)%s'
                                  % (n['name'], ap, d, state, rng,
-                                    ('   through %s (-%g dB)' % (
+                                    ('   through %s (-%s dB)' % (
                                         ', '.join(w['name'] for w in hit),
-                                        round(wl, 1))) if hit else ''))
+                                        _g(wl))) if hit else ''))
                 else:
                     lines.append('%s  ->  not connected' % n['name'])
         walls, pics = self.walls(), self.layout.get('pictures') or []
@@ -1624,9 +2897,125 @@ class _Window(object):
                 '' if len(pics) == 1 else 's'))
         if not self.data['nodes']:
             lines.append('Waiting for network data...')
-        text = '\n'.join(lines[:12]) or ' '
+        text = '\n'.join(lines[:6]) or ' '
         if text != self.status.cget('text'):
             self.status.config(text=text, fg=C['warn'] if warn else C['text'])
+
+    # ---------------------------------------------------- devices list ----
+    def open_tree(self):
+        if self.tree and self.tree.alive:
+            self.tree.top.lift()
+            self.tree.refresh()
+        else:
+            self.tree = _TreePanel(self.tk, self.root, self)
+
+    def draw_kind_icon(self, cv, kind, x, y):
+        draw_icon(cv, kind, x, y + (3 if kind == 'ap' else 0), s=0.6,
+                  ow=C['outline'])
+
+    def tree_rows(self):
+        nodes = [(n['name'], n['kind']) for n in self.data['nodes']]
+        edges = []
+        for link in self.data['links']:
+            edges.append((link[0], link[1], link[2],
+                          link[3] if len(link) > 3 else ''))
+        for n in self.data['nodes']:
+            if n['kind'] in CLIENT_KINDS and n.get('ap'):
+                edges.append((n['ap'], n['name'], 'wifi',
+                              ('%.1f dBm' % n['rssi'])
+                              if n.get('rssi') is not None else ''))
+        rows = build_tree(nodes, edges)
+        tr = self.data.get('traffic') or []
+        for r in rows:
+            n = self.node(r['name'])
+            info = n.get('info') or {}
+            bits = [KIND_LABEL.get(n['kind'], n['kind'])]
+            if info.get('ip'):
+                bits.append(str(info['ip']))
+            if n['kind'] == 'ap':
+                bits.append('%d clients' % len(self.clients_of(n['name'])))
+            if n['kind'] in CLIENT_KINDS and not n.get('ap') and \
+                    not any(l[2] in ('adhoc', 'mesh') and n['name'] in l[:2]
+                            for l in self.data['links']):
+                bits.append('not connected')
+            pk = sum(t[3] for t in tr if r['name'] in t[:2])
+            if pk:
+                bits.append('%s pkt/s' % _g(pk))
+            r['detail'] = '  '.join(bits)
+        return rows
+
+    def tree_select(self, row):
+        self.selected = row['name']
+        self.redraw()
+
+    def tree_activate(self, row):
+        self.go_to(row['name'])
+        self.open_details(row['name'])
+
+    def tree_menu(self, m, row):
+        name = row['name']
+        n = self.node(name)
+        m.add_command(label='Go to %s' % name, command=lambda: self.go_to(name))
+        m.add_command(label='Details...', command=lambda: self.open_details(
+            name))
+        if n and n['kind'] in CLIENT_KINDS:
+            m.add_separator()
+            sub = self.tk.Menu(m, tearoff=0, bg=C['btn'], fg=C['text'],
+                               activebackground=C['ap'],
+                               activeforeground='white')
+            for ap in (x for x in self.data['nodes'] if x['kind'] == 'ap'):
+                sub.add_command(label=ap['name'] + (
+                    '  (current)' if ap['name'] == n.get('ap') else ''),
+                    command=lambda a=ap['name']: self.request(
+                        ('assoc', name, a),
+                        'asking %s to associate with %s...' % (name, a)))
+            m.add_cascade(label='Associate with', menu=sub)
+            m.add_command(label='Disconnect', command=lambda: self.request(
+                ('disassoc', name), 'disconnecting %s...' % name))
+        m.add_separator()
+        m.add_command(label='Open terminal', command=lambda: self.request(
+            ('term', name), 'opening a terminal for %s...' % name))
+
+    def request(self, msg, text):
+        self.notice = (text, time.time() + 6)
+        self.send(msg)
+        self.redraw()
+
+    def open_details(self, name):
+        """Live details window (advanced tooltip) for one device."""
+        old = self.details.get(name)
+        if old is not None and old.winfo_exists():
+            old.lift()
+            return
+        tk = self.tk
+        top = tk.Toplevel(self.root)
+        top.title('%s - details' % name)
+        top.configure(bg=C['bg'])
+        top.geometry('430x420')
+        txt = tk.Text(top, bg=C['btn'], fg=C['text'], relief='flat',
+                      font=('TkFixedFont', 9), highlightthickness=0,
+                      padx=8, pady=6, wrap='none')
+        bar = tk.Frame(top, bg=C['bar'], padx=6, pady=6)
+        bar.pack(side='bottom', fill='x')
+        txt.pack(fill='both', expand=True)
+        self._btn(bar, 'Go to', lambda: self.go_to(name))
+        self._btn(bar, 'Terminal', lambda: self.request(
+            ('term', name), 'opening a terminal for %s...' % name))
+        self._btn(bar, 'Close', top.destroy, side='right')
+        self.details[name] = top
+
+        def refresh():
+            if not top.winfo_exists():
+                return
+            lines = self.node_tip(name, advanced=True) or ['(gone)']
+            body = '\n'.join(lines)
+            if txt.get('1.0', 'end-1c') != body:
+                txt.config(state='normal')
+                txt.delete('1.0', 'end')
+                txt.insert('1.0', body)
+                txt.config(state='disabled')
+            top.after(500, refresh)
+        refresh()
 
     def run(self):
         self.root.mainloop()
