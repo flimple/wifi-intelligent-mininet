@@ -11,6 +11,8 @@ def topology():
 
     net.configureNodes()
     net.addLink(sta1, ap1)
+
+    net.setPropagationModel(model='LogDistance', exponent=3)
     
     net.plotGraph(max_x=300, max_y=300)
     net.build()
