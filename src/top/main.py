@@ -12,6 +12,8 @@ def topology():
     net.configureNodes()
     net.addLink(sta1, ap1)
 
+    net.setPropagationModel("logDistance", exp=3)
+
     net.build()
     c0.start()
     ap1.start([c0])
