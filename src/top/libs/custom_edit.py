@@ -298,6 +298,11 @@ WALL_MATERIALS = {
     'metal': (20.0, '#6e7c88'),
     'custom': (10.0, '#8c6bb1'),
 }
+# reference thickness (m) of each preset: with a thickness multiplier k,
+#   loss = preset dB * (1 + k * (thickness / reference - 1))
+# k = 0 (default): thickness is ignored. k = 1: loss proportional to it.
+WALL_REF = {'concrete': 0.20, 'brick': 0.20, 'wood': 0.05, 'drywall': 0.10,
+            'glass': 0.01, 'metal': 0.01, 'custom': 0.20}
 MATERIAL_ORDER = ['concrete', 'brick', 'wood', 'drywall', 'glass', 'metal',
                   'custom']
 WALL_MODES = [('solid', 'Walls always visible'),
@@ -309,7 +314,9 @@ WALL_SCHEMA = [
     F('name', 'Name', 'wallname', 'general', ''),
     F('material', 'Material', 'choice', 'wall', 'concrete', MATERIAL_ORDER),
     F('loss', 'Attenuation (dB)', 'float', 'wall', 12.0,
-      hint='subtracted from the RSSI of every path crossing the wall'),
+      hint='preset value, or your own for custom walls'),
+    F('thick_mult', 'Thickness multiplier', 'float', 'wall', 0.0,
+      hint='presets only: 0 = thickness ignored, 1 = loss grows with it'),
     F('color', 'Color', 'color', 'wall', '#9c9a94',
       hint='editable for custom walls'),
     F('height', 'Height (m)', 'slider', 'geometry', 3.0, opts=(0, 20, 0.1),
@@ -323,15 +330,71 @@ WALL_SCHEMA = [
       opts=(-180, 180, 1)),
     F('x', 'Center X (m)', 'pos', 'placement', 0.0),
     F('y', 'Center Y (m)', 'pos', 'placement', 0.0),
+    F('locked', 'Locked', 'bool', 'general', False,
+      hint='cannot be clicked, moved or rotated (double-click to inspect)'),
 ]
-WALL_KEYS = [f['key'] for f in WALL_SCHEMA]
+WALL_HIDDEN = {'group': '', 'ref_thickness': 0.20}   # saved, not edited here
+WALL_KEYS = [f['key'] for f in WALL_SCHEMA] + list(WALL_HIDDEN)
 
 
 def default_wall(material='concrete'):
     w = dict((f['key'], f['default']) for f in WALL_SCHEMA)
-    w['material'] = material
-    w['loss'], w['color'] = WALL_MATERIALS[material]
+    w.update(WALL_HIDDEN)
+    set_material(w, material)
     return w
+
+
+def set_material(w, material):
+    """Apply a material: presets set loss, color and reference thickness."""
+    w['material'] = material
+    if material != 'custom':
+        w['loss'], w['color'] = WALL_MATERIALS[material]
+    w['ref_thickness'] = WALL_REF.get(material, 0.20)
+
+
+def wall_db(w):
+    """Attenuation of one wall (dB), thickness multiplier included."""
+    loss = float(w.get('loss') or 0)
+    if w.get('material', 'custom') == 'custom':
+        return loss
+    k = float(w.get('thick_mult') or 0)
+    ref = float(w.get('ref_thickness') or 0)
+    if not k or ref <= 0:
+        return loss
+    return max(0.0, loss * (1 + k * (float(w['thickness']) / ref - 1)))
+
+
+def wall_zrange(w):
+    h = float(w.get('height') or 0)
+    if h <= 0:                                   # flat 2D wall: any height
+        return (-1e9, 1e9)
+    z = float(w.get('z') or 0)
+    return (z, z + h)
+
+
+def _poly_overlap(A, B, eps=0.005):
+    """Convex polygons overlap by more than eps (touching is fine)."""
+    for P in (A, B):
+        for i in range(len(P)):
+            x1, y1 = P[i]
+            x2, y2 = P[(i + 1) % len(P)]
+            nx, ny = y1 - y2, x2 - x1
+            L = math.hypot(nx, ny)
+            if L < 1e-12:
+                continue
+            nx, ny = nx / L, ny / L
+            pa = [x * nx + y * ny for x, y in A]
+            pb = [x * nx + y * ny for x, y in B]
+            if min(max(pa), max(pb)) - max(min(pa), min(pb)) <= eps:
+                return False
+    return True
+
+
+def walls_overlap(w1, w2, eps=0.005):
+    za, zb = wall_zrange(w1), wall_zrange(w2)
+    if min(za[1], zb[1]) - max(za[0], zb[0]) <= eps:
+        return False
+    return _poly_overlap(wall_corners(w1), wall_corners(w2), eps)
 
 
 def wall_corners(w):
@@ -344,8 +407,9 @@ def wall_corners(w):
 
 
 def wall_crossed(w, a, b):
-    """True when the segment a -> b (x, y, z) passes through the wall.
-    Height 0 = 2D wall (any height). Pure math, also used at run time."""
+    """(t0, t1) part of the segment a -> b (x, y, z) inside the wall, or
+    None. Height 0 = 2D wall (any height). Pure math, also used at run
+    time."""
     ang = math.radians(float(w['rotation']))
     ca, sa = math.cos(ang), math.sin(ang)
 
@@ -359,7 +423,7 @@ def wall_crossed(w, a, b):
     for p, q in ((-dx, ax + L), (dx, L - ax), (-dy, ay + T), (dy, T - ay)):
         if abs(p) < 1e-12:
             if q < 0:
-                return False
+                return None
             continue
         r = q / p
         if p < 0:
@@ -367,23 +431,42 @@ def wall_crossed(w, a, b):
         else:
             t1 = min(t1, r)
         if t0 > t1:
-            return False
+            return None
     h = float(w.get('height') or 0)
     if h <= 0:
-        return True
+        return (t0, t1)
     za = a[2] + (b[2] - a[2]) * t0
     zb = a[2] + (b[2] - a[2]) * t1
     base = float(w.get('z') or 0)
-    return max(za, zb) >= base and min(za, zb) <= base + h
+    if max(za, zb) >= base and min(za, zb) <= base + h:
+        return (t0, t1)
+    return None
 
 
 def wall_loss(walls, a, b):
-    """(total dB, walls crossed) between two points."""
-    total, hit = 0.0, []
+    """(total dB, walls counted) between two points. Walls that overlap
+    along the path (same stretch of the path inside both) are counted once,
+    with the highest loss, so overlapping walls never double the loss."""
+    segs = []
     for w in walls or []:
-        if wall_crossed(w, a, b):
-            total += float(w.get('loss') or 0)
-            hit.append(w)
+        iv = wall_crossed(w, a, b)
+        if iv:
+            segs.append((iv[0], iv[1], wall_db(w), w))
+    segs.sort(key=lambda s: s[0])
+    total, hit, cur = 0.0, [], None
+    for s in segs:
+        if cur is not None and s[0] < cur[1] - 1e-6:
+            cur[1] = max(cur[1], s[1])
+            if s[2] > cur[2]:
+                cur[2], cur[3] = s[2], s[3]
+            continue
+        if cur is not None:
+            total += cur[2]
+            hit.append(cur[3])
+        cur = [s[0], s[1], s[2], s[3]]
+    if cur is not None:
+        total += cur[2]
+        hit.append(cur[3])
     return total, hit
 
 
@@ -418,15 +501,28 @@ def apply_walls(walls):
 
 
 def _walls_in(lst):
+    fm = field_map(WALL_SCHEMA)
     out = []
     for w in lst or []:
-        d = default_wall(w.get('material') if w.get('material')
-                         in WALL_MATERIALS else 'custom')
-        for f in WALL_SCHEMA:
-            if f['key'] in w and w[f['key']] is not None:
-                v = w[f['key']]
-                d[f['key']] = str(v) if f['type'] in (
-                    'choice', 'color', 'wallname') else float(v)
+        mat = w.get('material') if w.get('material') in WALL_MATERIALS \
+            else 'custom'
+        d = default_wall(mat)
+        for k, v in w.items():
+            if v is None:
+                continue
+            f = fm.get(k)
+            if k == 'group':
+                d[k] = str(v)
+            elif k == 'ref_thickness':
+                d[k] = float(v)
+            elif f is None:
+                continue
+            elif f['type'] == 'bool':
+                d[k] = coerce(f, v)
+            elif f['type'] in ('choice', 'color', 'wallname'):
+                d[k] = str(v)
+            else:
+                d[k] = float(v)
         out.append(d)
     return out
 
@@ -687,7 +783,8 @@ def doc_to_normalized(doc):
                     l['b']: l['p'].get('intf2') or l['b'] + '-wlan0'}
             out['links'].append({'type': l['kind'], 'nodes': [l['a'], l['b']],
                                  'intf': intf, 'params': params})
-    out['walls'] = [dict((k, w[k]) for k in WALL_KEYS)
+    out['walls'] = [dict([(k, w[k]) for k in WALL_KEYS] +
+                         [('effective_loss', round(wall_db(w), 3))])
                     for w in doc.get('walls', [])]
     out['editor'] = {'pictures': [dict(pc) for pc in doc.get('pictures', [])]}
     return out
@@ -799,6 +896,11 @@ def doc_to_custom(doc):
     out['pictures'] = [dict(pc) for pc in doc.get('pictures', [])]
     out['walls'] = [{'name': w['name'], 'material': w['material'],
                      'loss_db': w['loss'], 'color': w['color'],
+                     'thickness_multiplier': w.get('thick_mult', 0.0),
+                     'ref_thickness': w.get('ref_thickness', 0.2),
+                     'effective_loss_db': round(wall_db(w), 3),
+                     'locked': bool(w.get('locked')),
+                     'group': w.get('group', ''),
                      'footprint': {'x': w['x'], 'y': w['y'],
                                    'length': w['length'],
                                    'thickness': w['thickness'],
@@ -860,7 +962,11 @@ def custom_to_doc(d):
                                      material=w.get('material'),
                                      loss=w.get('loss_db', w.get('loss')),
                                      color=w.get('color'), z=w.get('z'),
-                                     height=w.get('height'))
+                                     height=w.get('height'),
+                                     thick_mult=w.get('thickness_multiplier'),
+                                     ref_thickness=w.get('ref_thickness'),
+                                     locked=w.get('locked'),
+                                     group=w.get('group'))
                                 for w in d.get('walls') or []])}
 
 
@@ -976,7 +1082,7 @@ def script_from_normalized(nd):
         w('# SNR mode; not in wmediumd interference mode).')
         w('WALLS = %s' % json.dumps(walls, indent=4).replace(
             'true', 'True').replace('false', 'False').replace('null', 'None'))
-        for fn in (wall_crossed, wall_loss, apply_walls):
+        for fn in (wall_db, wall_crossed, wall_loss, apply_walls):
             w('')
             w('')
             L.extend(inspect.getsource(fn).rstrip().split('\n'))
@@ -1176,7 +1282,8 @@ HELP_TEXT = '''Mouse
   Link tool ............. drag from one device to another
   picture (selected) .... drag: move   corner squares: scale
                           round handle: rotate (Shift: 15 degree steps)
-  Wall tool ............. drag a zone on the ground, then set properties
+  Wall tool ............. drag a zone on the ground, then set properties;
+                          snaps to wall corners / edges, never crosses walls
   wall (selected) ....... drag: move   end squares: length
                           side dot: thickness   round: rotate
                           blue diamond (3D view): height
@@ -1188,6 +1295,8 @@ wmediumd SNR mode; not wmediumd interference mode).
 Keys
   Del delete    Esc select tool    I inspector    L link tool
   W wall tool (drag a zone)   Ctrl+D duplicate wall
+  Shift+click walls: multi-select   Ctrl+G group   Ctrl+Shift+G ungroup
+  Ctrl+L lock / unlock (locked walls: double-click to inspect)
   P insert picture    T top view    3 3D view    F fit
   Ctrl+Z / Ctrl+Y undo / redo    Ctrl+S save    Ctrl+O open
   Ctrl+N new    Ctrl+E export Python script
@@ -1226,6 +1335,15 @@ def _seg_dist(px, py, x1, y1, x2, y2):
         return math.hypot(px - x1, py - y1)
     t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / L2))
     return math.hypot(px - x1 - t * dx, py - y1 - t * dy)
+
+
+def _closest_on_seg(x, y, a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    L2 = dx * dx + dy * dy
+    if L2 < 1e-12:
+        return a
+    t = max(0.0, min(1.0, ((x - a[0]) * dx + (y - a[1]) * dy) / L2))
+    return (a[0] + t * dx, a[1] + t * dy)
 
 
 def _in_poly(x, y, pts):
@@ -1416,6 +1534,9 @@ class Editor(object):
                         ('<Control-e>', self.export_py),
                         ('<Control-z>', self.undo), ('<Control-y>', self.redo),
                         ('<Control-d>', self.duplicate_wall),
+                        ('<Control-g>', self.group_walls),
+                        ('<Control-G>', self.ungroup_walls),
+                        ('<Control-l>', self.toggle_lock),
                         ('<Control-Z>', self.redo)):
             root.bind(seq, lambda e, f=fn: (f(), 'break')[1])
         root.protocol('WM_DELETE_WINDOW', self.on_close)
@@ -1540,6 +1661,12 @@ class Editor(object):
                        accelerator='I')
         em.add_command(label='Duplicate wall', command=self.duplicate_wall,
                        accelerator='Ctrl+D')
+        em.add_command(label='Group selected walls', command=self.group_walls,
+                       accelerator='Ctrl+G')
+        em.add_command(label='Ungroup walls', command=self.ungroup_walls,
+                       accelerator='Ctrl+Shift+G')
+        em.add_command(label='Lock / unlock walls', command=self.toggle_lock,
+                       accelerator='Ctrl+L')
         em.add_command(label='Delete selection', command=self.delete_selection,
                        accelerator='Del')
         m.add_cascade(label='Edit', menu=em)
@@ -1672,8 +1799,16 @@ class Editor(object):
             text=LINK_HELP[self.link_kind.get()]))
         self.link_help.config(text=LINK_HELP['wired'])
 
-        g = self._group(top, 'BUILD')
+        g = self._group(top, 'BUILD  (Shift+click: multi-select)')
         self._tool(g, 'wall', 'Wall')
+        col = tk.Frame(g, bg=C['bar'])
+        col.pack(side='left', padx=2)
+        self._btn(col, 'Group', self.group_walls, side='top', width=7)
+        self._btn(col, 'Ungroup', self.ungroup_walls, side='top', width=7)
+        col = tk.Frame(g, bg=C['bar'])
+        col.pack(side='left', padx=2)
+        self._btn(col, 'Lock', self.toggle_lock, side='top', width=7)
+        self._btn(col, 'Duplicate', self.duplicate_wall, side='top', width=7)
         self._tool(g, 'picture', 'Picture', command=self.insert_picture)
 
         # ---- slim view bar
@@ -1881,9 +2016,18 @@ class Editor(object):
             del self.pics[oid]
             self._pic_tk.pop(oid, None)
             self.msg = 'Deleted picture.'
-        elif kind == 'wall' and oid in self.walls:
-            self.msg = 'Deleted wall %s.' % self.walls[oid]['name']
-            del self.walls[oid]
+        elif kind in ('wall', 'walls'):
+            ids = self.sel_wall_ids()
+            locked = [self.walls[i]['name'] for i in ids
+                      if self.walls[i].get('locked')]
+            if locked:
+                self.undo_stack.pop()
+                self.msg = '!  Unlock %s before deleting.' % ', '.join(locked)
+                return self.redraw()
+            for i in ids:
+                del self.walls[i]
+            self.msg = 'Deleted %d wall%s.' % (len(ids),
+                                               '' if len(ids) == 1 else 's')
         self.sel = None
         self.changed()
 
@@ -1969,6 +2113,28 @@ class Editor(object):
             return self.walls.get(self.sel[1])
         return None
 
+    def sel_wall_ids(self):
+        if self.sel and self.sel[0] == 'wall':
+            return [self.sel[1]] if self.sel[1] in self.walls else []
+        if self.sel and self.sel[0] == 'walls':
+            return [i for i in self.sel[1] if i in self.walls]
+        return []
+
+    def set_wall_selection(self, ids, quiet=False):
+        ids = sorted(set(ids))
+        if not ids:
+            self.select(None, quiet)
+        elif len(ids) == 1:
+            self.select(('wall', ids[0]), quiet)
+        else:
+            self.select(('walls', tuple(ids)), quiet)
+
+    def group_members(self, wid):
+        g = self.walls[wid].get('group')
+        if not g:
+            return [wid]
+        return [i for i, w in self.walls.items() if w.get('group') == g]
+
     def unique_wall_name(self):
         names = set(w['name'] for w in self.walls.values())
         i = 1
@@ -1976,63 +2142,168 @@ class Editor(object):
             i += 1
         return 'wall%d' % i
 
+    def overlapping_wall(self, w, ignore=()):
+        """First other wall that w would overlap (None = fine)."""
+        for i, o in self.walls.items():
+            if i in ignore or i == w.get('id'):
+                continue
+            if walls_overlap(w, o):
+                return o
+        return None
+
+    def check_wall(self, w):
+        o = self.overlapping_wall(w)
+        if o is not None:
+            return ('overlaps %s - change thickness, height or base Z'
+                    % o['name'])
+        return None
+
     def add_wall(self, w):
         self.push_undo()
         wid = self.next_id
         self.next_id += 1
         w['id'] = wid
         self.walls[wid] = w
-        self.msg = ('Added %s (%s, %s dB%s). Drag it to move; handles: ends '
-                    '= length, side = thickness, round = rotate, top = height.'
-                    % (w['name'], w['material'], fmt_num(w['loss']),
+        self.msg = ('Added %s (%s, %s dB%s). Keep drawing, or Esc / Select '
+                    'to move it and use its handles.'
+                    % (w['name'], w['material'], fmt_num(round(wall_db(w), 2)),
                        ', %s m high' % fmt_num(w['height'])
                        if float(w['height']) > 0 else ', flat 2D'))
         self.select(('wall', wid), quiet=True)
         self.changed()
 
+    # -------- drawing helpers: snapping and no-overlap clamping
+    def _blockers(self, zr, ignore=()):
+        out = []
+        for i, w in self.walls.items():
+            if i in ignore:
+                continue
+            o = wall_zrange(w)
+            if min(o[1], zr[1]) - max(o[0], zr[0]) > 0.005:
+                out.append(w)
+        return out
+
+    def snap_wall_point(self, x, y, zr, ignore=()):
+        """Snap to a nearby wall corner (first) or edge, and never inside a
+        wall. Returns ((x, y), snapped?)."""
+        tol = 12.0 / max(self.scale, 1e-9)
+        blockers = self._blockers(zr, ignore)
+        best, bd = None, tol * 1.4
+        for w in blockers:
+            for c in wall_corners(w):
+                d = math.hypot(c[0] - x, c[1] - y)
+                if d < bd:
+                    best, bd = c, d
+        if best is None:
+            bd = tol
+            for w in blockers:
+                cs = wall_corners(w)
+                for i in range(4):
+                    q = _closest_on_seg(x, y, cs[i], cs[(i + 1) % 4])
+                    d = math.hypot(q[0] - x, q[1] - y)
+                    if d < bd:
+                        best, bd = q, d
+        pt = best or (x, y)
+        for w in blockers:                       # pushed out of any wall
+            cs = wall_corners(w)
+            if _in_poly(pt[0], pt[1], cs):
+                cands = [_closest_on_seg(pt[0], pt[1], cs[i], cs[(i + 1) % 4])
+                         for i in range(4)]
+                pt = min(cands, key=lambda q: math.hypot(q[0] - pt[0],
+                                                         q[1] - pt[1]))
+                best = pt
+        return (round(pt[0], 3), round(pt[1], 3)), best is not None
+
+    def clamp_zone(self, p0, p1, zr):
+        """Largest zone from p0 toward p1 that crosses no other wall."""
+        blockers = [wall_corners(w) for w in self._blockers(zr)]
+
+        def ok(q):
+            rect = [(p0[0], p0[1]), (q[0], p0[1]), (q[0], q[1]), (p0[0], q[1])]
+            return not any(_poly_overlap(rect, b, eps=0.0) for b in blockers)
+        if ok(p1):
+            return p1, False
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        lo, hi = 0.0, 1.0
+        for _ in range(24):
+            mid = (lo + hi) / 2
+            if ok((p0[0] + mid * dx, p0[1] + mid * dy)):
+                lo = mid
+            else:
+                hi = mid
+        q = [p0[0] + lo * dx, p0[1] + lo * dy]
+        for ax in ((0, 1) if abs(dx) >= abs(dy) else (1, 0)):
+            lo2, hi2 = q[ax], p1[ax]
+            for _ in range(24):
+                mid = (lo2 + hi2) / 2
+                t = list(q)
+                t[ax] = mid
+                if ok(t):
+                    lo2 = mid
+                else:
+                    hi2 = mid
+            q[ax] = lo2
+        return (round(q[0], 3), round(q[1], 3)), True
+
+    def zone_zrange(self):
+        return wall_zrange(self.last_wall)
+
     def wall_from_zone(self, p0, p1):
         (x0, y0), (x1, y1) = p0, p1
         dx, dy = abs(x1 - x0), abs(y1 - y0)
         if max(dx, dy) < 0.3:
-            self.msg = 'Wall: press and drag on the ground to draw a zone.'
+            self.msg = ('Wall: press and drag on the ground to draw a zone '
+                        '(it stops at other walls).')
             return self.redraw()
         w = copy.deepcopy(self.last_wall)
         w.pop('id', None)
         w['name'] = self.unique_wall_name()
-        w['x'], w['y'] = round((x0 + x1) / 2, 2), round((y0 + y1) / 2, 2)
+        w['group'], w['locked'] = '', False
+        w['x'], w['y'] = round((x0 + x1) / 2, 3), round((y0 + y1) / 2, 3)
         if dx >= dy:
             w['length'], w['thickness'], w['rotation'] = dx, dy, 0.0
         else:
             w['length'], w['thickness'], w['rotation'] = dy, dx, 90.0
-        w['length'] = round(max(w['length'], 0.1), 2)
-        w['thickness'] = round(max(w['thickness'], 0.05), 2)
+        w['length'] = round(max(w['length'], 0.1), 3)
+        w['thickness'] = round(max(w['thickness'], 0.02), 3)
+        if self.overlapping_wall(w):          # tiny min-thickness overlap
+            w['thickness'] = round(max(dy if dx >= dy else dx, 0.001), 3)
         if self.wall_ask:
             res = WallDialog(self, w).result
             if res is None:
                 self.msg = 'Wall cancelled.'
                 return self.redraw()
             w = res
-        keep = dict((k, w[k]) for k in ('material', 'loss', 'color',
-                                         'height', 'z'))
+        elif self.check_wall(w):
+            self.msg = '!  Wall not created: %s.' % self.check_wall(w)
+            return self.redraw()
+        keep = dict((k, w[k]) for k in ('material', 'loss', 'color', 'height',
+                                         'z', 'thick_mult', 'ref_thickness'))
         self.last_wall.update(keep)
         self.add_wall(w)
 
     def duplicate_wall(self):
         w = self.sel_wall()
         if not w:
-            self.msg = 'Select a wall to duplicate it.'
+            self.msg = 'Select one wall to duplicate it.'
             return self.redraw()
         n = copy.deepcopy(w)
+        n.pop('id', None)
+        n['group'], n['locked'] = '', False
         a = math.radians(float(w['rotation']))
-        off = max(float(w['thickness']) * 2, 1.0)
-        n['x'] = round(w['x'] - math.sin(a) * off, 2)
-        n['y'] = round(w['y'] + math.cos(a) * off, 2)
+        step = max(float(w['thickness']) * 2, 1.0)
+        for k in range(1, 40):                # first free spot beside it
+            n['x'] = round(w['x'] - math.sin(a) * step * k, 3)
+            n['y'] = round(w['y'] + math.cos(a) * step * k, 3)
+            if not self.overlapping_wall(n):
+                break
         n['name'] = self.unique_wall_name()
         self.add_wall(n)
 
-    def wall_at(self, x, y):
+    def wall_at(self, x, y, include_locked=False):
         for wid, pts in reversed(self.wall_hits):
-            if _in_poly(x, y, pts):
+            if _in_poly(x, y, pts) and (include_locked or
+                                        not self.walls[wid].get('locked')):
                 return wid
         return None
 
@@ -2041,6 +2312,81 @@ class Editor(object):
             if math.hypot(h[1] - x, h[2] - y) <= 8:
                 return h
         return None
+
+    # -------- groups and locks
+    def group_walls(self):
+        ids = self.sel_wall_ids()
+        if len(ids) < 2:
+            self.msg = ('Shift+click walls to select several, then Group '
+                        '(Ctrl+G).')
+            return self.redraw()
+        names = set(w.get('group') for w in self.walls.values())
+        i = 1
+        while 'group%d' % i in names:
+            i += 1
+        self.push_undo()
+        for wid in ids:
+            self.walls[wid]['group'] = 'group%d' % i
+        self.msg = 'Grouped %d walls as group%d: click one to select and ' \
+                   'move them together.' % (len(ids), i)
+        self.changed()
+
+    def ungroup_walls(self):
+        ids = self.sel_wall_ids()
+        if not ids or not any(self.walls[i].get('group') for i in ids):
+            self.msg = 'Select a grouped wall to ungroup it.'
+            return self.redraw()
+        self.push_undo()
+        for wid in ids:
+            for m in self.group_members(wid):
+                self.walls[m]['group'] = ''
+        self.msg = 'Ungrouped.'
+        self.changed()
+
+    def toggle_lock(self):
+        ids = self.sel_wall_ids()
+        if not ids:
+            self.msg = 'Select a wall (double-click works on locked ones).'
+            return self.redraw()
+        self.push_undo()
+        new = not all(self.walls[i].get('locked') for i in ids)
+        for i in ids:
+            self.walls[i]['locked'] = new
+        self.msg = '%s %d wall%s.' % ('Locked' if new else 'Unlocked',
+                                      len(ids), '' if len(ids) == 1 else 's')
+        self.changed()
+
+    def wall_click(self, wid, shift):
+        """Select on click: whole group unless Shift adds / removes."""
+        ids = set(self.sel_wall_ids())
+        members = set(self.group_members(wid))
+        if shift:
+            ids = ids - members if wid in ids else ids | members
+        elif not (wid in ids and len(ids) > 1):
+            ids = members
+        self.set_wall_selection(ids)
+        return ids
+
+    def move_snap(self, moving, dx, dy):
+        """Adjust (dx, dy) so a moving corner docks onto a nearby wall."""
+        tol = 12.0 / max(self.scale, 1e-9)
+        ids = set(w['id'] for w in moving)
+        best, bd = (0.0, 0.0), tol
+        others = [o for i, o in self.walls.items() if i not in ids]
+        for w in moving:
+            zr = wall_zrange(w)
+            for c in wall_corners(dict(w, x=w['x'] + dx, y=w['y'] + dy)):
+                for o in others:
+                    oz = wall_zrange(o)
+                    if min(oz[1], zr[1]) - max(oz[0], zr[0]) <= 0.005:
+                        continue
+                    cs = wall_corners(o)
+                    for i in range(4):
+                        q = _closest_on_seg(c[0], c[1], cs[i], cs[(i + 1) % 4])
+                        d = math.hypot(q[0] - c[0], q[1] - c[1])
+                        if d < bd:
+                            best, bd = (q[0] - c[0], q[1] - c[1]), d
+        return dx + best[0], dy + best[1]
 
     def walls_crossing(self, w):
         """Station / car -> AP pairs (links or auto) that cross wall w."""
@@ -2200,7 +2546,11 @@ class Editor(object):
         self._undo_key = None
         pool = {'node': self.nodes, 'link': self.links, 'pic': self.pics,
                 'wall': self.walls}
-        if self.sel and self.sel[1] not in pool[self.sel[0]]:
+        if self.sel and self.sel[0] == 'walls':
+            ids = [i for i in self.sel[1] if i in self.walls]
+            self.sel = ('walls', tuple(ids)) if len(ids) > 1 else (
+                ('wall', ids[0]) if ids else None)
+        elif self.sel and self.sel[1] not in pool[self.sel[0]]:
             self.sel = None
         self.changed()
 
@@ -2398,7 +2748,7 @@ class Editor(object):
         self.canvas.focus_set()
         self.press = (e.x, e.y)
         w = self.sel_wall()
-        if w and self.tool in ('select', 'wall'):
+        if w and self.tool == 'select' and not w.get('locked'):
             h = self.wall_handle_at(e.x, e.y)
             if h:
                 c = self.project(w['x'], w['y'], w['z'])
@@ -2412,9 +2762,11 @@ class Editor(object):
                 return
         if self.tool == 'wall':
             x, y = self.unproject(e.x, e.y, 0.0)
-            p = (self.snap(x), self.snap(y))
+            p, snapped = self.snap_wall_point(self.snap(x), self.snap(y),
+                                              self.zone_zrange())
             self.drag = {'mode': 'wall_draw', 'p0': p, 'p1': p,
-                         'moved': False}
+                         'moved': False, 'snap': p if snapped else None,
+                         'snap0': snapped, 'blocked': False}
             return
         if self.tool != 'link' and self.sel_node():
             h = self.axis_at(e.x, e.y)
@@ -2464,12 +2816,22 @@ class Editor(object):
             return
         wid = self.wall_at(e.x, e.y) if self.tool == 'select' else None
         if wid is not None:
-            if self.sel != ('wall', wid):
-                self.select(('wall', wid))
-            w = self.walls[wid]
-            mx, my = self.unproject(e.x, e.y, w['z'])
-            self.drag = {'mode': 'wall_move', 'id': wid, 'moved': False,
-                         'off': (w['x'] - mx, w['y'] - my)}
+            ids = self.wall_click(wid, bool(e.state & 0x0001))
+            if e.state & 0x0001 or wid not in ids:   # Shift: just (de)select
+                self.drag = None
+                return
+            moving = [self.walls[i] for i in ids]
+            locked = [w['name'] for w in moving if w.get('locked')]
+            if locked:
+                self.msg = '!  Cannot move: %s locked.' % ', '.join(locked)
+                self.drag = None
+                return self.redraw()
+            z = self.walls[wid]['z']
+            mx, my = self.unproject(e.x, e.y, z)
+            self.drag = {'mode': 'walls_move', 'ids': sorted(ids),
+                         'moved': False, 'm0': (mx, my), 'z': z,
+                         'orig': dict((w['id'], (w['x'], w['y']))
+                                      for w in moving)}
             return
         pid = self.pic_at(e.x, e.y) if self.tool == 'select' else None
         if pid is not None and pic is not None and pid == pic['id'] and \
@@ -2503,8 +2865,45 @@ class Editor(object):
             self.hover = self.node_at(e.x, e.y)
         elif d['mode'] == 'wall_draw':
             x, y = self.unproject(e.x, e.y, 0.0)
-            d['p1'] = (self.snap(x), self.snap(y))
+            zr = self.zone_zrange()
+            p1, snapped = self.snap_wall_point(self.snap(x), self.snap(y), zr)
+            p1, blocked = self.clamp_zone(d['p0'], p1, zr)
+            d['p1'], d['blocked'] = p1, blocked
+            d['snap'] = p1 if (snapped or blocked) else None
             d['moved'] = d['moved'] or far
+        elif d['mode'] == 'walls_move':
+            if not d['moved']:
+                if not far:
+                    return
+                d['moved'] = True
+                self.push_undo()
+            mx, my = self.unproject(e.x, e.y, d['z'])
+            dx, dy = mx - d['m0'][0], my - d['m0'][1]
+            first = d['orig'][d['ids'][0]]
+            if self.v_snap.get():
+                dx = self.snap(first[0] + dx) - first[0]
+                dy = self.snap(first[1] + dy) - first[1]
+            moving = [self.walls[i] for i in d['ids'] if i in self.walls]
+            ids = set(d['ids'])
+            for w in moving:                     # snap from the start pose
+                w['x'], w['y'] = d['orig'][w['id']]
+            dx, dy = self.move_snap(moving, dx, dy)
+            last = d.get('last', (0.0, 0.0))
+
+            def place(ddx, ddy):
+                for w in moving:
+                    ox, oy = d['orig'][w['id']]
+                    w['x'], w['y'] = round(ox + ddx, 3), round(oy + ddy, 3)
+                return not any(self.overlapping_wall(w, ids) for w in moving)
+            # full move, else slide along the obstacle, else stay
+            for cand in ((dx, dy), (dx, last[1]), (last[0], dy), last):
+                if place(*cand):
+                    d['last'] = cand
+                    break
+            self.dirty = True
+            self.update_title()
+            if self.inspector:
+                self.inspector.refresh()
         elif d['mode'].startswith('wall_'):
             if not d['moved']:
                 if not far:
@@ -2515,10 +2914,8 @@ class Editor(object):
             if w is None:
                 return
             mx, my = self.unproject(e.x, e.y, w['z'])
-            if d['mode'] == 'wall_move':
-                w['x'] = round(self.snap(mx + d['off'][0]), 2)
-                w['y'] = round(self.snap(my + d['off'][1]), 2)
-            else:
+            prev = dict(w)
+            if True:
                 w0 = d['w0']
                 a = math.radians(float(w0['rotation']))
                 ux, uy = math.cos(a), math.sin(a)          # along the wall
@@ -2548,6 +2945,8 @@ class Editor(object):
                     h = max(float(w0['height']) + t, 0.0)
                     w['height'] = round(self.snap(h) if self.v_snap.get()
                                         else h, 2)
+                if self.overlapping_wall(w):     # would cross another wall
+                    w.update(prev)
             self.dirty = True
             self.update_title()
             if self.inspector:
@@ -2623,7 +3022,8 @@ class Editor(object):
         if d['mode'] == 'wall_draw':
             self.wall_from_zone(d['p0'], d['p1'])
             return
-        if d['mode'].startswith('wall_') and d['moved']:
+        if (d['mode'].startswith('wall_') or d['mode'] == 'walls_move') \
+                and d['moved']:
             self.changed()
             return
         if d['mode'].startswith('pic_') and d['moved']:
@@ -2648,8 +3048,10 @@ class Editor(object):
         elif lid:
             self.select(('link', lid))
             self.open_inspector()
-        elif self.tool == 'select' and self.wall_at(e.x, e.y) is not None:
-            self.select(('wall', self.wall_at(e.x, e.y)))
+        elif self.tool == 'select' and \
+                self.wall_at(e.x, e.y, include_locked=True) is not None:
+            # one wall, even if grouped or locked: inspect it
+            self.select(('wall', self.wall_at(e.x, e.y, include_locked=True)))
             self.open_inspector()
         elif self.tool == 'select' and self.pic_at(e.x, e.y) is not None:
             self.select(('pic', self.pic_at(e.x, e.y)))
@@ -2690,7 +3092,7 @@ class Editor(object):
         axis = h[0] if h else None
         node = None if h else self.node_at(e.x, e.y)
         ph = (self.pic_handle_at(e.x, e.y) or self.wall_handle_at(e.x, e.y)) \
-            if self.tool in ('select', 'wall') else None
+            if self.tool == 'select' else None
         if ph:
             self.canvas.config(cursor='exchange' if ph[0] == 'rot'
                                else 'sizing')
@@ -2783,6 +3185,7 @@ class Editor(object):
         sel_link = self.sel[1] if self.sel and self.sel[0] == 'link' else None
         sel_pic = self.sel[1] if self.sel and self.sel[0] == 'pic' else None
         sel_wall = self.sel[1] if self.sel and self.sel[0] == 'wall' else None
+        sel_walls = set(self.sel_wall_ids())
         self._assoc = assoc = self.associations()
 
         for pid in sorted(self.pics):                  # pictures under all
@@ -2823,7 +3226,7 @@ class Editor(object):
                                           dash=(4, 4))
 
         # walls: flat ones are drawn now, 3D faces are depth-sorted below
-        wall_items = self.wall_items(pos, sel_wall)
+        wall_items = self.wall_items(pos, sel_walls)
 
         # height stems + ground shadows
         for nid, p in pos.items():
@@ -2948,11 +3351,20 @@ class Editor(object):
                               dash=(4, 3), width=1.5)
             cx = sum(q[0] for q in pts) / 4
             cy = sum(q[1] for q in pts) / 4
-            cv.create_text(cx, cy, text='%s x %s m' % (
-                fmt_num(abs(x1 - x0)), fmt_num(abs(y1 - y0))),
-                fill=C['text'], font=('TkDefaultFont', 9, 'bold'))
+            cv.create_text(cx, cy, text='%s x %s m%s' % (
+                fmt_num(round(abs(x1 - x0), 2)),
+                fmt_num(round(abs(y1 - y0), 2)),
+                '  (stopped at a wall)' if d.get('blocked') else ''),
+                fill=C['warn'] if d.get('blocked') else C['text'],
+                font=('TkDefaultFont', 9, 'bold'))
+            for q in (d['p0'] if d.get('snap0') else None, d.get('snap')):
+                if q:
+                    sx, sy, _ = self.project(q[0], q[1], 0)
+                    cv.create_oval(sx - 6, sy - 6, sx + 6, sy + 6,
+                                   outline=C['ap'], width=2)
         self.wall_handles = []
-        if sel_wall in self.walls and self.tool in ('select', 'wall'):
+        if sel_wall in self.walls and self.tool == 'select' and \
+                not self.walls[sel_wall].get('locked'):
             self.draw_wall_handles(self.walls[sel_wall])
 
         # local axes of the selected device
@@ -3012,7 +3424,7 @@ class Editor(object):
             col = w.get('color') or '#999999'
             dark = _mix(col, '#000000', 0.4)
             glass = w.get('material') == 'glass'
-            sel = wid == sel_wall
+            sel = wid in sel_wall
             h, z0 = float(w['height']), float(w['z'])
             cs = wall_corners(w)
             if h <= 0:                                   # flat 2D wall
@@ -3092,8 +3504,10 @@ class Editor(object):
 
     def wall_label(self, w, x, y, col):
         self.canvas.create_text(
-            x, y, text='%s · %s %s dB' % (w['name'], w['material'],
-                                          fmt_num(w['loss'])),
+            x, y, text='%s · %s %s dB%s%s' % (
+                w['name'], w['material'], fmt_num(round(wall_db(w), 1)),
+                '  [%s]' % w['group'] if w.get('group') else '',
+                '  (locked)' if w.get('locked') else ''),
             fill=col, font=('TkDefaultFont', 8, 'bold'))
 
     def draw_wall_handles(self, w):
@@ -3450,11 +3864,21 @@ class Editor(object):
                 c = len(self.associations().get(n['id'], []))
                 s += '   %d connected device%s' % (c, '' if c == 1 else 's')
             lines.append(s)
+        elif self.sel and self.sel[0] == 'walls':
+            ws = [self.walls[i] for i in self.sel_wall_ids()]
+            groups = sorted(set(w['group'] for w in ws if w.get('group')))
+            lines.append('%d walls selected%s: %s   (drag to move them '
+                         'together; Ctrl+G group, Ctrl+Shift+G ungroup)' % (
+                             len(ws), ' (%s)' % ', '.join(groups)
+                             if groups else '',
+                             ', '.join(w['name'] for w in ws)))
         elif self.sel_wall():
             w = self.sel_wall()
-            lines.append('%s   %s, -%s dB   %s x %s m%s   at %s, %s   '
+            lines.append('%s%s   %s, -%s dB   %s x %s m%s   at %s, %s   '
                          'rotation %s deg   crossed by %d connection(s)' % (
-                             w['name'], w['material'], fmt_num(w['loss']),
+                             w['name'], '  (locked)' if w.get('locked')
+                             else '', w['material'],
+                             fmt_num(round(wall_db(w), 2)),
                              fmt_num(w['length']), fmt_num(w['thickness']),
                              (' x %s m high' % fmt_num(w['height']))
                              if float(w['height']) > 0 else ' (flat 2D)',
@@ -3794,6 +4218,13 @@ class WallDialog(object):
         self.e_loss = entry('loss')
         row('Attenuation (dB)', self.e_loss,
             'subtracted from the RSSI of every path crossing it')
+        self.e_mult = entry('thick_mult')
+        row('Thickness multiplier', self.e_mult,
+            'presets: 0 = thickness ignored, 1 = loss proportional to it')
+        self.eff = tk.Label(body, text='', bg=C['bg'], fg=C['ap'],
+                            font=('TkDefaultFont', 9, 'bold'), anchor='w')
+        self.eff.grid(row=r[0], column=1, sticky='w')
+        r[0] += 1
         cf = tk.Frame(body, bg=C['bg'])
         self.swatch = tk.Label(cf, width=4, bg=w['color'], relief='solid',
                                bd=1)
@@ -3819,6 +4250,8 @@ class WallDialog(object):
             ' > 0 = 3D wall')
         row('Base height Z (m)', entry('z'), 'e.g. 3 for a wall on floor 2')
         row('Thickness (m)', entry('thickness'))
+        for k in ('loss', 'thick_mult', 'thickness'):
+            self.v[k].trace_add('write', lambda *a: self.preview())
         self.v_ask = tk.BooleanVar(value=ed.wall_ask)
         tk.Checkbutton(body, text='Ask for properties every time I draw a '
                        'wall', variable=self.v_ask, bg=C['bg'],
@@ -3846,14 +4279,25 @@ class WallDialog(object):
     def on_material(self, init=False):
         m = self.v['material'].get()
         custom = m == 'custom'
-        if not custom or not init:
-            if not custom:
-                loss, col = WALL_MATERIALS[m]
-                self.v['loss'].set(fmt_num(loss))
-                self.w['color'] = col
-                self.swatch.config(bg=col)
+        set_material(self.w, m)
+        if not custom:
+            self.v['loss'].set(fmt_num(self.w['loss']))
+            self.swatch.config(bg=self.w['color'])
         self.e_loss.config(state='normal' if custom else 'disabled')
+        self.e_mult.config(state='disabled' if custom else 'normal')
         self.b_color.config(state='normal' if custom else 'disabled')
+        self.preview()
+
+    def preview(self):
+        try:
+            t = dict(self.w, loss=float(self.v['loss'].get()),
+                     thick_mult=float(self.v['thick_mult'].get() or 0),
+                     thickness=float(self.v['thickness'].get()),
+                     material=self.v['material'].get())
+            self.eff.config(text='effective loss: %s dB' % fmt_num(
+                round(wall_db(t), 2)))
+        except (ValueError, AttributeError, KeyError):
+            pass
 
     def pick_color(self):
         from tkinter import colorchooser
@@ -3873,12 +4317,15 @@ class WallDialog(object):
             w['name'] = name
             w['material'] = self.v['material'].get()
             for k, lo in (('loss', 0.0), ('height', 0.0),
-                          ('thickness', 0.01)):
+                          ('thickness', 0.001), ('thick_mult', -100.0)):
                 v = float(self.v[k].get())
                 if v < lo:
                     raise ValueError('%s must be >= %g' % (k, lo))
                 w[k] = round(v, 2)
             w['z'] = round(float(self.v['z'].get()), 2)
+            problem = self.ed.check_wall(w)
+            if problem:
+                raise ValueError(problem)
         except ValueError as e:
             self.err.config(text='!  %s' % e)
             return
@@ -3975,6 +4422,8 @@ class Inspector(object):
             return ed.sel
         if ed.sel and ed.sel[0] == 'wall' and ed.sel[1] in ed.walls:
             return ed.sel
+        if ed.sel and ed.sel[0] == 'walls' and len(ed.sel_wall_ids()) > 1:
+            return ed.sel
         return ('net', None)
 
     def refresh(self):
@@ -4013,10 +4462,28 @@ class Inspector(object):
         self.body.columnconfigure(1, weight=1)
         self.target = self.current()
         kind, oid = self.target
-        if kind == 'wall':
+        if kind == 'walls':
+            self.section('general')
+            self.dyn_row(lambda: self.walls_info())
+            bf = tk.Frame(self.body, bg=C['bg'])
+            bf.grid(row=self.row, column=0, columnspan=2, sticky='w', pady=6)
+            self.row += 1
+            for text, cmd in (('Group', self.ed.group_walls),
+                              ('Ungroup', self.ed.ungroup_walls),
+                              ('Lock / unlock all', self.ed.toggle_lock)):
+                tk.Button(bf, text=text, relief='flat', bg='white', padx=8,
+                          command=cmd).pack(side='left', padx=(0, 6))
+            self.note('Grouping only affects selection and moving: each wall '
+                      'keeps its own material, loss and geometry. '
+                      'Double-click one wall to edit it on its own.')
+            self.b_del.config(state='normal')
+            self.b_net.pack(side='left', padx=3, before=self.b_del)
+        elif kind == 'wall':
             self.section('general')
             self.add_field(WALL_SCHEMA[0])
-            self.add_groups(WALL_SCHEMA[1:])
+            fm = field_map(WALL_SCHEMA)
+            self.add_field(fm['locked'])
+            self.add_groups(WALL_SCHEMA[1:], skip=('general',))
             self.section('clients')
             self.dyn_row(lambda: self.wall_info())
             self.note('On the canvas: drag the wall to move it. Handles: '
@@ -4094,9 +4561,33 @@ class Inspector(object):
         cr = self.ed.walls_crossing(w)
         kind = ('3D wall, %s m high' % fmt_num(w['height'])
                 if float(w['height']) > 0 else 'flat 2D wall (any height)')
-        return '%s\nCrossed by %d connection%s%s' % (
-            kind, len(cr), '' if len(cr) == 1 else 's',
+        if w.get('material') == 'custom':
+            eff = 'Effective loss: %s dB (custom, thickness ignored)' % \
+                fmt_num(round(wall_db(w), 2))
+        else:
+            eff = ('Effective loss: %s dB  = %s dB x (1 + %s x (%s / %s m '
+                   '- 1))' % (fmt_num(round(wall_db(w), 2)),
+                              fmt_num(w['loss']),
+                              fmt_num(w.get('thick_mult') or 0),
+                              fmt_num(w['thickness']),
+                              fmt_num(w.get('ref_thickness') or 0.2)))
+        grp = ''
+        if w.get('group'):
+            n = len(self.ed.group_members(w['id']))
+            grp = '\nGroup: %s (%d walls)' % (w['group'], n)
+        return '%s\n%s%s\nCrossed by %d connection%s%s' % (
+            eff, kind, grp, len(cr), '' if len(cr) == 1 else 's',
             (':\n  ' + '\n  '.join(cr)) if cr else '')
+
+    def walls_info(self):
+        ws = [self.ed.walls[i] for i in self.ed.sel_wall_ids()]
+        groups = sorted(set(w['group'] for w in ws if w.get('group')))
+        return '%d walls selected%s\n%s' % (
+            len(ws), ('  -  group: ' + ', '.join(groups)) if groups else
+            '  -  not grouped',
+            '\n'.join('  %s  (%s, %s dB%s)' % (
+                w['name'], w['material'], fmt_num(round(wall_db(w), 2)),
+                ', locked' if w.get('locked') else '') for w in ws))
 
     def pic_info(self):
         pic = self.obj()
@@ -4146,9 +4637,20 @@ class Inspector(object):
             self.ed._icon(cv, 'wall')
             cv.move('all', 6, 7)
             w = self.ed.walls[oid]
-            self.title.config(text=w['name'])
-            self.sub.config(text='wall  ·  %s  ·  %s dB' % (
-                w['material'], fmt_num(w['loss'])))
+            self.title.config(text=w['name'] + ('  (locked)' if w.get('locked')
+                                                else ''))
+            self.sub.config(text='wall  ·  %s  ·  %s dB%s' % (
+                w['material'], fmt_num(round(wall_db(w), 2)),
+                ('  ·  ' + w['group']) if w.get('group') else ''))
+        elif kind == 'walls':
+            self.ed._icon(cv, 'wall')
+            cv.move('all', 6, 7)
+            ids = self.ed.sel_wall_ids()
+            groups = sorted(set(self.ed.walls[i]['group'] for i in ids
+                                if self.ed.walls[i].get('group')))
+            self.title.config(text='%d walls' % len(ids))
+            self.sub.config(text=', '.join(groups) if groups
+                            else 'multi-selection (not grouped)')
         elif kind == 'pic':
             self.ed._icon(cv, 'picture')
             cv.move('all', 6, 7)
@@ -4336,9 +4838,10 @@ class Inspector(object):
             o[key] = val
             return
         if kind == 'wall':
-            o[key] = val
-            if key == 'material' and val != 'custom':
-                o['loss'], o['color'] = WALL_MATERIALS[val]
+            if key == 'material':
+                set_material(o, val)
+            else:
+                o[key] = val
             return
         if kind == 'node':
             if key == '__name':
@@ -4365,7 +4868,7 @@ class Inspector(object):
             self.fields['channel']['w'].config(values=CHANNELS.get(band, []))
 
     def load_values(self):
-        if self.obj() is None and self.target[0] != 'net':
+        if self.obj() is None and self.target[0] not in ('net', 'walls'):
             return self.build()
         self.loading = True
         try:
@@ -4395,15 +4898,22 @@ class Inspector(object):
                         rec['scale'].set(float(v or 0))
             if self.target[0] == 'wall':
                 custom = self.get_model('material') == 'custom'
-                if 'loss' in self.fields:
-                    self.fields['loss']['entry'].config(
-                        state='normal' if custom else 'disabled')
+                locked = bool(self.get_model('locked'))
+                for key, rec in self.fields.items():
+                    if key == 'locked':
+                        continue
+                    on = not locked and not (
+                        (key in ('loss', 'color') and not custom) or
+                        (key == 'thick_mult' and custom))
+                    st = 'normal' if on else 'disabled'
+                    for part in ('entry', 'scale', 'button'):
+                        if rec.get(part) is not None:
+                            rec[part].config(state=st)
+                    if rec['f']['type'] in ('choice', 'mode', 'channel'):
+                        rec['w'].config(state='readonly' if on
+                                        else 'disabled')
                 rec = self.fields.get('color')
                 if rec:
-                    rec['entry'].config(state='normal' if custom
-                                        else 'disabled')
-                    rec['button'].config(state='normal' if custom
-                                         else 'disabled')
                     try:
                         rec['swatch'].config(bg=self.get_model('color'))
                     except Exception:
@@ -4513,7 +5023,8 @@ class Inspector(object):
         self.fields[key]['var'].set(fmt_num(float(v)))   # -> on_edit
 
     def on_edit(self, key):
-        if self.loading or self.obj() is None and self.target[0] != 'net':
+        if self.loading or self.obj() is None and \
+                self.target[0] not in ('net', 'walls'):
             return
         rec = self.fields[key]
         f = rec['f']
@@ -4526,6 +5037,18 @@ class Inspector(object):
             rec['entry'].config(bg='white' if ok else C['bad_entry'])
         if not ok or val == self.get_model(key):
             return
+        if self.target[0] == 'wall' and key in ('x', 'y', 'z', 'length',
+                                                 'thickness', 'rotation',
+                                                 'height'):
+            test = dict(self.obj())
+            test[key] = val
+            o = self.ed.overlapping_wall(test)
+            if o is not None:
+                if rec['entry'] is not None:
+                    rec['entry'].config(bg=C['bad_entry'])
+                self.ed.msg = '!  That would overlap %s.' % o['name']
+                self.ed.redraw()
+                return
         self.ed.push_undo((self.target, key))
         self.set_model(key, val)
         if rec['scale'] is not None:
@@ -4544,8 +5067,8 @@ class Inspector(object):
                         self.get_model(k) not in opts:
                     self.fields[k]['var'].set(opts[0])     # -> on_edit
         self.ed.changed('inspector')
-        if key in ('__name', 'material'):
-            self.load_values()       # ssid followed / loss + color presets
+        if key in ('__name', 'material', 'locked'):
+            self.load_values()   # ssid followed / presets / lock state
         self.update_header()
 
 
