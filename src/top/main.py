@@ -27,5 +27,5 @@ def topology():
 
     net.stop()
 
-if name == 'main':
+if __name__ == '__main__':
     topology()
