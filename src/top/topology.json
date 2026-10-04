@@ -1,0 +1,393 @@
+{
+  "format": "mininet-wifi-topology",
+  "schema": "normalized",
+  "version": 1,
+  "generator": "custom_edit.py",
+  "created": "2026-10-04T21:32:22",
+  "network": {
+    "mininet_wifi": {
+      "ipBase": "10.0.0.0/8",
+      "autoAssociation": true,
+      "noise_th": -91,
+      "fading_cof": 0
+    },
+    "wmediumd": true,
+    "interference": true,
+    "propagation": {
+      "model": "logDistance",
+      "exp": 4
+    }
+  },
+  "accessPoints": [
+    {
+      "name": "ap1",
+      "params": {
+        "ssid": "ap1-ssid",
+        "mode": "g",
+        "channel": "1",
+        "range": 30,
+        "antennaGain": 5,
+        "antennaHeight": 1,
+        "wlans": 1,
+        "cls": "OVSKernelAP",
+        "position": "40.57,37.22,0"
+      },
+      "band": "2.4"
+    },
+    {
+      "name": "ap2",
+      "params": {
+        "ssid": "ap2-ssid",
+        "mode": "g",
+        "channel": "1",
+        "range": 30,
+        "antennaGain": 5,
+        "antennaHeight": 1,
+        "wlans": 1,
+        "cls": "OVSKernelAP",
+        "position": "22.24,69.39,0"
+      },
+      "band": "2.4"
+    },
+    {
+      "name": "ap3",
+      "params": {
+        "ssid": "ap3-ssid",
+        "mode": "g",
+        "channel": "1",
+        "range": 20,
+        "antennaGain": 5,
+        "antennaHeight": 1,
+        "wlans": 1,
+        "cls": "OVSKernelAP",
+        "position": "64.38,45.99,0"
+      },
+      "band": "2.4"
+    },
+    {
+      "name": "ap4",
+      "params": {
+        "ssid": "ap4-ssid",
+        "mode": "g",
+        "channel": "1",
+        "range": 30,
+        "antennaGain": 5,
+        "antennaHeight": 1,
+        "wlans": 1,
+        "cls": "OVSKernelAP",
+        "position": "85.72,51.54,0"
+      },
+      "band": "2.4"
+    },
+    {
+      "name": "ap5",
+      "params": {
+        "ssid": "ap5-ssid",
+        "mode": "g",
+        "channel": "2",
+        "range": 40,
+        "antennaGain": 5,
+        "antennaHeight": 1,
+        "wlans": 1,
+        "cls": "OVSKernelAP",
+        "position": "27.34,42.96,0"
+      },
+      "band": "2.4"
+    }
+  ],
+  "stations": [
+    {
+      "name": "sta1",
+      "params": {
+        "range": 5,
+        "antennaGain": 5,
+        "antennaHeight": 1,
+        "wlans": 1,
+        "ip": "10.0.0.1/8",
+        "position": "38.53,66.78,0"
+      }
+    },
+    {
+      "name": "sta2",
+      "params": {
+        "range": 5,
+        "antennaGain": 5,
+        "antennaHeight": 1,
+        "wlans": 1,
+        "ip": "10.0.0.2/8",
+        "position": "24.55,56.09,0"
+      }
+    },
+    {
+      "name": "sta3",
+      "params": {
+        "range": 5,
+        "antennaGain": 5,
+        "antennaHeight": 1,
+        "wlans": 1,
+        "ip": "10.0.0.3/8",
+        "position": "38.06,54.96,0"
+      }
+    },
+    {
+      "name": "sta4",
+      "params": {
+        "range": 5,
+        "antennaGain": 5,
+        "antennaHeight": 1,
+        "wlans": 1,
+        "ip": "10.0.0.4/8",
+        "position": "48.53,69.58,0"
+      }
+    },
+    {
+      "name": "sta5",
+      "params": {
+        "range": 5,
+        "antennaGain": 5,
+        "antennaHeight": 1,
+        "wlans": 1,
+        "ip": "10.0.0.5/8",
+        "position": "53.57,42.86,0"
+      }
+    },
+    {
+      "name": "sta6",
+      "params": {
+        "range": 5,
+        "antennaGain": 5,
+        "antennaHeight": 1,
+        "wlans": 1,
+        "ip": "10.0.0.6/8",
+        "position": "71.44,61.51,0"
+      }
+    }
+  ],
+  "cars": [],
+  "hosts": [],
+  "switches": [],
+  "controllers": [
+    {
+      "name": "c0",
+      "params": {
+        "ip": "127.0.0.1",
+        "port": 6653,
+        "protocol": "tcp",
+        "position": "89.83,44.41,0",
+        "controller": "Controller"
+      }
+    }
+  ],
+  "links": [
+    {
+      "type": "wifi",
+      "node1": "sta2",
+      "node2": "ap2",
+      "params": {}
+    },
+    {
+      "type": "wifi",
+      "node1": "sta1",
+      "node2": "ap2",
+      "params": {}
+    },
+    {
+      "type": "wifi",
+      "node1": "sta4",
+      "node2": "ap3",
+      "params": {}
+    },
+    {
+      "type": "wifi",
+      "node1": "sta5",
+      "node2": "ap3",
+      "params": {}
+    },
+    {
+      "type": "wifi",
+      "node1": "sta6",
+      "node2": "ap4",
+      "params": {}
+    },
+    {
+      "type": "wifi",
+      "node1": "sta3",
+      "node2": "ap1",
+      "params": {}
+    }
+  ],
+  "start": {
+    "ap1": [
+      "c0"
+    ],
+    "ap2": [
+      "c0"
+    ],
+    "ap3": [
+      "c0"
+    ],
+    "ap4": [
+      "c0"
+    ],
+    "ap5": [
+      "c0"
+    ]
+  },
+  "walls": [
+    {
+      "name": "wall1",
+      "material": "concrete",
+      "loss": 12.0,
+      "thick_mult": 0.0,
+      "color": "#9c9a94",
+      "height": 4.0,
+      "z": 0.0,
+      "length": 30.645,
+      "thickness": 1.95,
+      "rotation": 0.0,
+      "x": 55.779,
+      "y": 72.438,
+      "locked": true,
+      "group": "group1",
+      "ref_thickness": 0.2,
+      "effective_loss": 12.0
+    },
+    {
+      "name": "wall2",
+      "material": "concrete",
+      "loss": 12.0,
+      "thick_mult": 0.0,
+      "color": "#9c9a94",
+      "height": 4.0,
+      "z": 0.0,
+      "length": 15.652,
+      "thickness": 1.16,
+      "rotation": 90.0,
+      "x": 61.02,
+      "y": 63.637,
+      "locked": true,
+      "group": "group1",
+      "ref_thickness": 0.2,
+      "effective_loss": 12.0
+    },
+    {
+      "name": "wall3",
+      "material": "concrete",
+      "loss": 12.0,
+      "thick_mult": 0.0,
+      "color": "#9c9a94",
+      "height": 4.0,
+      "z": 0.0,
+      "length": 10.328,
+      "thickness": 0.98,
+      "rotation": 0.0,
+      "x": 56.436,
+      "y": 55.32,
+      "locked": true,
+      "group": "group1",
+      "ref_thickness": 0.2,
+      "effective_loss": 12.0
+    },
+    {
+      "name": "wall4",
+      "material": "concrete",
+      "loss": 12.0,
+      "thick_mult": 0.0,
+      "color": "#9c9a94",
+      "height": 4.0,
+      "z": 0.0,
+      "length": 20.327,
+      "thickness": 0.84,
+      "rotation": 90.0,
+      "x": 43.993,
+      "y": 61.299,
+      "locked": true,
+      "group": "group1",
+      "ref_thickness": 0.2,
+      "effective_loss": 12.0
+    },
+    {
+      "name": "wall5",
+      "material": "concrete",
+      "loss": 12.0,
+      "thick_mult": 0.0,
+      "color": "#9c9a94",
+      "height": 4.0,
+      "z": 0.0,
+      "length": 3.422,
+      "thickness": 0.83,
+      "rotation": 0.0,
+      "x": 46.124,
+      "y": 55.206,
+      "locked": true,
+      "group": "group1",
+      "ref_thickness": 0.2,
+      "effective_loss": 12.0
+    },
+    {
+      "name": "wall6",
+      "material": "glass",
+      "loss": 3.0,
+      "thick_mult": 0.0,
+      "color": "#86c5de",
+      "height": 3.0,
+      "z": 0.0,
+      "length": 8.697,
+      "thickness": 1.88,
+      "rotation": 0.0,
+      "x": 36.108,
+      "y": 72.401,
+      "locked": false,
+      "group": "",
+      "ref_thickness": 0.01,
+      "effective_loss": 3.0
+    }
+  ],
+  "editor": {
+    "pictures": [
+      {
+        "path": "../resources/top_img.png",
+        "x": 50.0,
+        "y": 50.0,
+        "z": 0.0,
+        "width": 100.0,
+        "rotation": 0.0,
+        "opacity": 100.0,
+        "visible": true,
+        "locked": true,
+        "rot90": "0",
+        "flip_h": false,
+        "flip_v": false,
+        "crop_l": 0.0,
+        "crop_r": 0.0,
+        "crop_t": 0.0,
+        "crop_b": 0.0,
+        "brightness": 100.0,
+        "contrast": 100.0,
+        "saturation": 100.0,
+        "grayscale": false,
+        "invert": false,
+        "key_white": false,
+        "key_level": 235.0
+      }
+    ]
+  },
+  "view": {
+    "last": {
+      "yaw": -0.2736,
+      "pitch": 1.06353,
+      "target": [
+        53.98,
+        53.305,
+        0.0
+      ],
+      "span": 18.7357,
+      "pan": [
+        11.7189,
+        3.3185
+      ],
+      "by": "editor",
+      "time": "2026-10-04T21:32:22"
+    }
+  }
+}
