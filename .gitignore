@@ -1,4 +1,4 @@
-src/top/launcher.py
+launcher.py
 src/top/libs/mininet-wifi
 src/top/libs/__pycache__/
 src/top/data/*
