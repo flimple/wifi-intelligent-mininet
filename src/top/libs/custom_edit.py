@@ -13,9 +13,19 @@ What you get
     File > Recent files), recovery copy. Auto-save (Home tab): saves the
     open file every couple of minutes, or a recovery copy when untitled
   - profile/editor.ini next to this file keeps your options (toggles,
-    theme, window, ribbon, recent files...); the topology file keeps the
-    camera ('view': last position + a saved view, View > Save view), which
-    custom_gui.py reads too
+    theme, window, ribbon, recent files, navigation, quality...); the
+    topology file keeps the camera ('view.last'), saved by itself when the
+    camera stops moving and when you close - custom_gui.py reads it too
+  - Network tab: Auto-configure (unique IPs, non-overlapping channels,
+    one SSID, controller or standalone APs, cables between APs, hosts
+    wired, AP ranges), Random topology (APs, stations, cars, hosts, a
+    building with rooms), Check network (what would stop the simulation)
+  - Navigation for mouse, touchpad (two-finger scroll pans, Ctrl+scroll
+    zooms, Shift+scroll rotates) and keyboard (arrows, Shift+arrows, + / -,
+    Home), on-screen camera buttons, right-click / two-finger-tap menus,
+    Ctrl+arrows move the selection, Ctrl+K command palette, F1 controls
+  - Settings tab: input (mouse / touchpad), quality (auto / high /
+    balanced / low, for slow computers), frame time, UI size, dark mode
   - Device presets (data/presets/<type>/*.json next to this file): save a
     device's configuration (Inspector > Save config as preset), choose it
     when placing a new device, apply it to one or all devices of a type,
@@ -1131,6 +1141,115 @@ def _kwargs(params):
     return parts
 
 
+# Source of wall_db / wall_crossed / wall_loss / apply_walls, copied into
+# exported scripts. Used when the editor is compiled (no source to read);
+# keep it in sync if you change those functions.
+WALL_FUNCS_SRC = r'''def wall_db(w):
+    """Attenuation of one wall (dB), thickness multiplier included."""
+    loss = float(w.get('loss') or 0)
+    if w.get('material', 'custom') == 'custom':
+        return loss
+    k = float(w.get('thick_mult') or 0)
+    ref = float(w.get('ref_thickness') or 0)
+    if not k or ref <= 0:
+        return loss
+    return max(0.0, loss * (1 + k * (float(w['thickness']) / ref - 1)))
+
+
+def wall_crossed(w, a, b):
+    """(t0, t1) part of the segment a -> b (x, y, z) inside the wall, or
+    None. Height 0 = 2D wall (any height). Pure math, also used at run
+    time."""
+    ang = math.radians(float(w['rotation']))
+    ca, sa = math.cos(ang), math.sin(ang)
+
+    def local(p):
+        dx, dy = p[0] - w['x'], p[1] - w['y']
+        return dx * ca + dy * sa, -dx * sa + dy * ca
+    (ax, ay), (bx, by) = local(a), local(b)
+    dx, dy = bx - ax, by - ay
+    t0, t1 = 0.0, 1.0
+    L, T = float(w['length']) / 2, float(w['thickness']) / 2
+    for p, q in ((-dx, ax + L), (dx, L - ax), (-dy, ay + T), (dy, T - ay)):
+        if abs(p) < 1e-12:
+            if q < 0:
+                return None
+            continue
+        r = q / p
+        if p < 0:
+            t0 = max(t0, r)
+        else:
+            t1 = min(t1, r)
+        if t0 > t1:
+            return None
+    h = float(w.get('height') or 0)
+    if h <= 0:
+        return (t0, t1)
+    za = a[2] + (b[2] - a[2]) * t0
+    zb = a[2] + (b[2] - a[2]) * t1
+    base = float(w.get('z') or 0)
+    if max(za, zb) >= base and min(za, zb) <= base + h:
+        return (t0, t1)
+    return None
+
+
+def wall_loss(walls, a, b):
+    """(total dB, walls counted) between two points. Walls that overlap
+    along the path (same stretch of the path inside both) are counted once,
+    with the highest loss, so overlapping walls never double the loss."""
+    segs = []
+    for w in walls or []:
+        iv = wall_crossed(w, a, b)
+        if iv:
+            segs.append((iv[0], iv[1], wall_db(w), w))
+    segs.sort(key=lambda s: s[0])
+    total, hit, cur = 0.0, [], None
+    for s in segs:
+        if cur is not None and s[0] < cur[1] - 1e-6:
+            cur[1] = max(cur[1], s[1])
+            if s[2] > cur[2]:
+                cur[2], cur[3] = s[2], s[3]
+            continue
+        if cur is not None:
+            total += cur[2]
+            hit.append(cur[3])
+        cur = [s[0], s[1], s[2], s[3]]
+    if cur is not None:
+        total += cur[2]
+        hit.append(cur[3])
+    return total, hit
+
+
+def apply_walls(walls):
+    """Make Mininet-WiFi subtract wall losses from its RSSI.
+
+    Mininet-WiFi computes RSSI in PropagationModel.__init__. This wraps it.
+    Effective without wmediumd (tc mode) and with wmediumd in its default
+    SNR mode. In interference mode wmediumd computes signals itself (C
+    code), so walls cannot be applied there."""
+    if not walls:
+        return
+    from mn_wifi.propagationModels import PropagationModel
+    orig = getattr(PropagationModel.__init__, '_orig', PropagationModel.__init__)
+
+    def pos(node):
+        try:
+            return [float(v) for v in node.getxyz()]
+        except Exception:
+            return [float(v) for v in node.position]
+
+    def __init__(self, intf, apintf, dist=0):
+        orig(self, intf, apintf, dist)
+        try:
+            loss = wall_loss(walls, pos(intf.node), pos(apintf.node))[0]
+            if loss:
+                self.rssi = self.rssi - loss
+        except Exception:
+            pass
+    __init__._orig = orig
+    PropagationModel.__init__ = __init__'''
+
+
 def script_from_normalized(nd):
     nw = nd.get('network') or {}
     L = []
@@ -1164,10 +1283,15 @@ def script_from_normalized(nd):
         w('# SNR mode; not in wmediumd interference mode).')
         w('WALLS = %s' % json.dumps(walls, indent=4).replace(
             'true', 'True').replace('false', 'False').replace('null', 'None'))
-        for fn in (wall_db, wall_crossed, wall_loss, apply_walls):
+        try:
+            parts = [inspect.getsource(fn).rstrip() for fn in (
+                wall_db, wall_crossed, wall_loss, apply_walls)]
+        except (OSError, TypeError):      # compiled program: no source
+            parts = [WALL_FUNCS_SRC]
+        for part in parts:
             w('')
             w('')
-            L.extend(inspect.getsource(fn).rstrip().split('\n'))
+            L.extend(part.split('\n'))
     pics = (nd.get('editor') or {}).get('pictures') or []
     if pics:
         w('')
@@ -1482,7 +1606,25 @@ def apply_theme(root, name):
     style_ttk(root)
 
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+def _app_dir():
+    """Folder for profile/ and data/. Next to this file when it runs as
+    a script; for a compiled program (Nuitka / PyInstaller), which may run
+    from a temporary or read-only place, a per-user folder."""
+    compiled = '__compiled__' in globals() or getattr(sys, 'frozen', False)
+    if not compiled:
+        return os.path.dirname(os.path.abspath(__file__))
+    if sys.platform.startswith('win'):
+        base = os.environ.get('APPDATA') or os.path.expanduser('~')
+        return os.path.join(base, 'MiniEdit-WiFi')
+    if sys.platform == 'darwin':
+        return os.path.expanduser('~/Library/Application Support/'
+                                  'MiniEdit-WiFi')
+    base = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser(
+        '~/.config')
+    return os.path.join(base, 'miniedit-wifi')
+
+
+APP_DIR = _app_dir()
 
 
 class Properties(object):
@@ -1578,6 +1720,672 @@ def apply_camera(win, cam):
         return True
     except (TypeError, ValueError, IndexError, AttributeError):
         return False
+
+
+# ==========================================================================
+# Shared: navigation (mouse, touchpad, keyboard, on-screen buttons),
+# camera auto-save, performance levels, UI size, hints, command palette,
+# help window. Same code in custom_edit.py and custom_gui.py.
+# ==========================================================================
+
+QUALITY = {
+    'high': {'circle': 56, 'rings': (-60, -30, 0, 30, 60), 'ring_seg': 40,
+             'meridians': 3, 'stipple': True, 'fps': 30, 'dots': 900,
+             'waves': 3},
+    'balanced': {'circle': 40, 'rings': (-45, 0, 45), 'ring_seg': 28,
+                 'meridians': 2, 'stipple': True, 'fps': 20, 'dots': 400,
+                 'waves': 2},
+    'low': {'circle': 28, 'rings': (0,), 'ring_seg': 20, 'meridians': 0,
+            'stipple': False, 'fps': 12, 'dots': 150, 'waves': 1},
+}
+QUALITY_ORDER = ('high', 'balanced', 'low')
+QUALITY_LABELS = [('auto', 'Auto (adapts)'), ('high', 'High'),
+                  ('balanced', 'Balanced'), ('low', 'Low (slow PCs)')]
+UI_SCALES = ['100%', '115%', '125%', '150%', '175%', '200%']
+NAV_MODES = [('mouse', 'Mouse'), ('touchpad', 'Touchpad')]
+PITCH_MAX = math.radians(85)
+
+
+def label_of(pairs, key):
+    return dict(pairs).get(key, pairs[0][1])
+
+
+def key_of(pairs, label):
+    for k, l in pairs:
+        if l == label:
+            return k
+    return pairs[0][0]
+
+
+class Perf(object):
+    """Drawing-time meter and quality level. 'auto' lowers the quality
+    when frames get slow and raises it again when there is room."""
+
+    def __init__(self, mode='auto'):
+        self.avg, self.fps = 0.0, 0.0
+        self._frames, self._t = 0, time.time()
+        self.set_mode(mode)
+
+    def set_mode(self, mode):
+        self.mode = mode if mode in ('auto',) + QUALITY_ORDER else 'auto'
+        self.level = 'high' if self.mode == 'auto' else self.mode
+
+    def record(self, dt):
+        self.avg = dt if not self.avg else self.avg * 0.85 + dt * 0.15
+        self._frames += 1
+        now = time.time()
+        if now - self._t >= 1.0:
+            self.fps = self._frames / (now - self._t)
+            self._frames, self._t = 0, now
+        if self.mode != 'auto':
+            self.level = self.mode
+            return
+        i = QUALITY_ORDER.index(self.level)
+        if self.avg > 0.045 and i < 2:
+            self.level = QUALITY_ORDER[i + 1]
+            self.avg *= 0.6
+        elif self.avg < 0.010 and i > 0:
+            self.level = QUALITY_ORDER[i - 1]
+            self.avg = 0.02
+
+    def q(self, key):
+        return QUALITY[self.level][key]
+
+    def text(self):
+        return '%.0f ms / frame   %.0f fps   quality: %s%s' % (
+            self.avg * 1000, self.fps, self.level,
+            ' (auto)' if self.mode == 'auto' else '')
+
+
+def apply_ui_scale(root, label):
+    """Bigger fonts and widgets (accessibility). Call before building the
+    window; a change needs a restart."""
+    try:
+        f = float(str(label).rstrip('%')) / 100.0
+    except ValueError:
+        return
+    if abs(f - 1.0) < 1e-3 or not 0.5 <= f <= 3.0:
+        return
+    try:
+        import tkinter.font as tkfont
+        root.tk.call('tk', 'scaling', float(root.tk.call('tk', 'scaling')) * f)
+        for name in tkfont.names(root):
+            fnt = tkfont.nametofont(name)
+            size = int(fnt.cget('size'))
+            fnt.configure(size=int(round(size * f)) if size < 0 else size)
+    except Exception:
+        pass
+
+
+def write_view(path, cam, by):
+    """Store the camera as view.last in a topology file. Only that key
+    changes; owner and permissions of the file are kept."""
+    try:
+        st = os.stat(path)
+        with open(path) as fh:
+            d = json.load(fh)
+        if not isinstance(d, dict):
+            return False
+        v = d.get('view') if isinstance(d.get('view'), dict) else {}
+        v['last'] = dict(cam, by=by, time=time.strftime('%Y-%m-%dT%H:%M:%S'))
+        d['view'] = v
+        tmp = path + '.view.tmp'
+        with open(tmp, 'w') as fh:
+            json.dump(d, fh, indent=2)
+        try:
+            os.chmod(tmp, st.st_mode & 0o7777)
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except (OSError, AttributeError):
+            pass
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+class _CamSaver(object):
+    """Saves the camera by itself: shortly after it stops moving, and when
+    the program closes (flush). win.persist_camera() does the writing."""
+
+    def __init__(self, win, delay=700):
+        self.win, self.delay = win, delay
+        self.last, self.job, self.ready = None, None, False
+
+    def key(self):
+        w = self.win
+        return (round(w.yaw, 4), round(w.pitch, 4), round(w.scale, 5),
+                round(w.pan[0], 1), round(w.pan[1], 1),
+                tuple(round(float(t), 3) for t in w.target))
+
+    def arm(self):
+        """From now on camera changes are saved (call once the initial
+        camera of a file was applied)."""
+        self.last, self.ready = self.key(), True
+
+    def check(self):
+        if not self.ready:
+            return
+        k = self.key()
+        if k == self.last:
+            return
+        self.last = k
+        if self.job is not None:
+            self.win.root.after_cancel(self.job)
+        self.job = self.win.root.after(self.delay, self.save)
+
+    def save(self):
+        self.job = None
+        try:
+            self.win.persist_camera()
+        except Exception:
+            pass
+
+    def flush(self):
+        """Write now if a save is pending (or the camera moved)."""
+        if not self.ready:
+            return
+        pending = self.job is not None or self.key() != self.last
+        if self.job is not None:
+            try:
+                self.win.root.after_cancel(self.job)
+            except Exception:
+                pass
+            self.job = None
+        if pending:
+            self.last = self.key()
+            self.save()
+
+
+# ------------------------------------------------------------ navigation ----
+def cam_pan(win, dx, dy):
+    win.user_view = True
+    win.pan[0] += dx
+    win.pan[1] += dy
+    win.redraw()
+
+
+def cam_zoom(win, k, x=None, y=None):
+    win.user_view = True
+    w, h = win.size()
+    x = w / 2 if x is None else x
+    y = h / 2 if y is None else y
+    k = max(min(k, 4.0), 0.25)
+    if not 1e-4 < win.scale * k < 1e5:
+        return
+    mx, my = x - w / 2, y - h / 2
+    win.pan[0] = mx - (mx - win.pan[0]) * k        # zoom toward the point
+    win.pan[1] = my - (my - win.pan[1]) * k
+    win.scale *= k
+    win.redraw()
+
+
+def cam_rotate(win, dyaw=0.0, dpitch=0.0):
+    win.user_view = True
+    win.yaw += dyaw
+    win.pitch = min(max(win.pitch + dpitch, 0.0), PITCH_MAX)
+    win.redraw()
+
+
+NAV_ACTIONS = {
+    'pan_left': lambda w: cam_pan(w, 60, 0),
+    'pan_right': lambda w: cam_pan(w, -60, 0),
+    'pan_up': lambda w: cam_pan(w, 0, 60),
+    'pan_down': lambda w: cam_pan(w, 0, -60),
+    'zoom_in': lambda w: cam_zoom(w, 1.2),
+    'zoom_out': lambda w: cam_zoom(w, 1 / 1.2),
+    'rot_l': lambda w: cam_rotate(w, -0.12),
+    'rot_r': lambda w: cam_rotate(w, 0.12),
+    'tilt_up': lambda w: cam_rotate(w, 0, 0.08),
+    'tilt_down': lambda w: cam_rotate(w, 0, -0.08),
+    'fit': lambda w: w.fit(),
+}
+NAV_TIPS = {'pan_left': 'Pan left (Left)', 'pan_right': 'Pan right (Right)',
+            'pan_up': 'Pan up (Up)', 'pan_down': 'Pan down (Down)',
+            'zoom_in': 'Zoom in (+)', 'zoom_out': 'Zoom out (-)',
+            'rot_l': 'Rotate left (Shift+Left)',
+            'rot_r': 'Rotate right (Shift+Right)',
+            'tilt_up': 'Tilt up (Shift+Up)', 'tilt_down': 'Tilt down (Shift+Down)',
+            'fit': 'Fit everything (Home)'}
+
+
+def scroll_event(win, e, dx, dy):
+    """Mouse wheel and touchpad scrolling.
+    mouse mode:    wheel zoom, horizontal scroll pan
+    touchpad mode: two-finger scroll pans
+    both:          Ctrl zoom (pinch on many touchpads), Shift rotate,
+                   Alt tilt"""
+    st = getattr(e, 'state', 0) or 0
+    ctrl, shift = st & 0x0004, st & 0x0001
+    alt = st & 0x0008 or st & 0x20000
+    touch = win.nav_mode.get() == 'touchpad'
+    if ctrl:
+        v = dy or dx
+        if v:
+            cam_zoom(win, 1.12 if v > 0 else 1 / 1.12, e.x, e.y)
+    elif shift and dy:
+        cam_rotate(win, dy * 0.08)
+    elif alt and dy:
+        cam_rotate(win, 0, dy * 0.05)
+    elif touch:
+        cam_pan(win, dx * 35, dy * 35)
+    elif dy:
+        cam_zoom(win, 1.15 if dy > 0 else 1 / 1.15, e.x, e.y)
+    elif dx:
+        cam_pan(win, dx * 35, 0)
+    return 'break'
+
+
+def _wheel_steps(delta):
+    if not delta:
+        return 0
+    n = delta / 120.0 if abs(delta) >= 30 else delta / 4.0
+    return max(min(n, 3.0), -3.0)
+
+
+def bind_navigation(win, cv):
+    """Wheel / touchpad bindings for a canvas (X11, Windows, macOS, Tk 9
+    touchpad events)."""
+    cv.bind('<MouseWheel>', lambda e: scroll_event(
+        win, e, 0, _wheel_steps(e.delta)))
+    cv.bind('<Shift-MouseWheel>', lambda e: scroll_event(   # horizontal
+        win, _NoShift(e), _wheel_steps(e.delta), 0))
+    for seq, dx, dy in (('<Button-4>', 0, 1), ('<Button-5>', 0, -1),
+                        ('<Button-6>', 1, 0), ('<Button-7>', -1, 0)):
+        try:
+            cv.bind(seq, lambda e, a=dx, b=dy: scroll_event(win, e, a, b))
+        except Exception:
+            pass
+    try:                                       # Tk 9: precise touchpad
+        cv.bind('<TouchpadScroll>', lambda e: _touchpad(win, e))
+    except Exception:
+        pass
+
+
+class _NoShift(object):
+    """Event copy without the Shift bit (Shift+wheel = horizontal scroll
+    on Windows and macOS)."""
+
+    def __init__(self, e):
+        self.x, self.y = e.x, e.y
+        self.state = (getattr(e, 'state', 0) or 0) & ~0x0001
+
+
+def _touchpad(win, e):
+    d = int(e.delta)
+    dx, dy = (d >> 16) & 0xFFFF, d & 0xFFFF
+    dx = dx - 0x10000 if dx & 0x8000 else dx
+    dy = dy - 0x10000 if dy & 0x8000 else dy
+    st = getattr(e, 'state', 0) or 0
+    if st & 0x0004:
+        if dy:
+            cam_zoom(win, 1.0 + max(min(dy, 30), -30) * 0.01, e.x, e.y)
+    elif st & 0x0001:
+        cam_rotate(win, dy * 0.01)
+    else:
+        cam_pan(win, -dx, -dy)
+    return 'break'
+
+
+def nav_key(win, e):
+    """Keyboard camera: arrows pan, Shift+arrows rotate / tilt, + / -
+    (or Page Up / Down) zoom, Home fit. True when the key was used."""
+    k = e.keysym
+    shift = (getattr(e, 'state', 0) or 0) & 0x0001
+    if k in ('Left', 'Right', 'Up', 'Down'):
+        if shift:
+            NAV_ACTIONS[{'Left': 'rot_l', 'Right': 'rot_r', 'Up': 'tilt_up',
+                         'Down': 'tilt_down'}[k]](win)
+        else:
+            NAV_ACTIONS[{'Left': 'pan_left', 'Right': 'pan_right',
+                         'Up': 'pan_up', 'Down': 'pan_down'}[k]](win)
+    elif k in ('plus', 'equal', 'KP_Add', 'Prior'):
+        NAV_ACTIONS['zoom_in'](win)
+    elif k in ('minus', 'underscore', 'KP_Subtract', 'Next'):
+        NAV_ACTIONS['zoom_out'](win)
+    elif k in ('Home', 'KP_Home'):
+        NAV_ACTIONS['fit'](win)
+    else:
+        return False
+    return True
+
+
+def typing_in(widget):
+    try:
+        return widget.winfo_class() in ('Entry', 'TEntry', 'TCombobox', 'Text',
+                                        'Spinbox', 'TSpinbox', 'Listbox')
+    except Exception:
+        return False
+
+
+class _NavPad(object):
+    """On-screen camera buttons (bottom right of the canvas): pan pad,
+    zoom, rotate, tilt, fit. Hold a button to repeat. For touchpads,
+    touch screens and anyone without a mouse wheel / right button."""
+    R = 13
+
+    def __init__(self, win):
+        self.win, self.hits, self.hover, self.job = win, [], None, None
+
+    def layout(self, w, h):
+        g = 31
+        ox, oy = w - 128, h - 118
+        zx = ox + 78
+        by = oy + 64
+        return [('pan_up', ox, oy - g), ('pan_down', ox, oy + g),
+                ('pan_left', ox - g, oy), ('pan_right', ox + g, oy),
+                ('fit', ox, oy), ('zoom_in', zx, oy - 16),
+                ('zoom_out', zx, oy + 16),
+                ('rot_l', ox - 47, by), ('rot_r', ox - 16, by),
+                ('tilt_up', ox + 16, by), ('tilt_down', ox + 47, by)]
+
+    def draw(self, cv, w, h):
+        self.hits = []
+        if w < 420 or h < 300:
+            return
+        R = self.R
+        lay = self.layout(w, h)
+        xs = [x for _, x, _ in lay]
+        ys = [y for _, _, y in lay]
+        cv.create_rectangle(min(xs) - R - 8, min(ys) - R - 8, max(xs) + R + 8,
+                            max(ys) + R + 8, fill=C['bar'],
+                            outline=C['grid_major'])
+        for act, x, y in lay:
+            hov = act == self.hover
+            cv.create_oval(x - R, y - R, x + R, y + R,
+                           fill=C['ap_fill'] if hov else C['bg'],
+                           outline=C['ap'] if hov else C['grid_major'])
+            col = C['ap'] if hov else C['text']
+            self.glyph(cv, act, x, y, col)
+            self.hits.append((act, x, y))
+
+    @staticmethod
+    def glyph(cv, act, x, y, col):
+        a = 5
+        if act.startswith('pan_'):
+            pts = {'pan_up': (x, y - a, x - a, y + 3, x + a, y + 3),
+                   'pan_down': (x, y + a, x - a, y - 3, x + a, y - 3),
+                   'pan_left': (x - a, y, x + 3, y - a, x + 3, y + a),
+                   'pan_right': (x + a, y, x - 3, y - a, x - 3, y + a)}[act]
+            cv.create_polygon(*pts, fill=col, outline='')
+        elif act == 'fit':
+            for sx in (-1, 1):
+                for sy in (-1, 1):
+                    cv.create_line(x + sx * 5, y + sy * 2, x + sx * 5,
+                                   y + sy * 5, x + sx * 2, y + sy * 5,
+                                   fill=col, width=2)
+        elif act in ('zoom_in', 'zoom_out'):
+            cv.create_line(x - 5, y, x + 6, y, fill=col, width=2)
+            if act == 'zoom_in':
+                cv.create_line(x, y - 5, x, y + 6, fill=col, width=2)
+        elif act in ('rot_l', 'rot_r'):
+            s = 1 if act == 'rot_r' else -1
+            pts = []
+            for i in range(9):
+                t = math.radians(200 - i * 25) if s > 0 else \
+                    math.radians(-20 + i * 25)
+                pts += [x + 6 * math.cos(t), y - 6 * math.sin(t) + 1]
+            cv.create_line(*pts, fill=col, width=2, arrow='last',
+                           arrowshape=(5, 6, 3), smooth=True)
+        else:                                            # tilt
+            up = act == 'tilt_up'
+            cv.create_line(x - 6, y + 4, x + 6, y + 4, fill=col, width=2)
+            yy = y - 6 if up else y + 1
+            cv.create_line(x, y + 1 if up else y - 6, x, yy, fill=col,
+                           width=2, arrow='last', arrowshape=(5, 6, 3))
+
+    def at(self, x, y):
+        for act, hx, hy in self.hits:
+            if math.hypot(x - hx, y - hy) <= self.R + 2:
+                return act
+        return None
+
+    def press(self, act):
+        self.release()
+        NAV_ACTIONS[act](self.win)
+        if act != 'fit':
+            self.job = self.win.root.after(380, self.repeat, act)
+
+    def repeat(self, act):
+        NAV_ACTIONS[act](self.win)
+        self.job = self.win.root.after(70, self.repeat, act)
+
+    def release(self):
+        if self.job is not None:
+            try:
+                self.win.root.after_cancel(self.job)
+            except Exception:
+                pass
+            self.job = None
+
+
+class _LongPress(object):
+    """Press and hold (left button / one-finger touchpad press) opens the
+    context menu, like a right click."""
+
+    def __init__(self, win, delay=800):
+        self.win, self.delay, self.job, self.start = win, delay, None, None
+
+    def begin(self, e):
+        self.cancel()
+        if self.win.nav_mode.get() != 'touchpad':
+            return                  # mouse users have the right button
+        self.start = (e.x, e.y, getattr(e, 'x_root', e.x),
+                      getattr(e, 'y_root', e.y))
+        self.job = self.win.root.after(self.delay, self.fire)
+
+    def moved(self, e):
+        if self.job is not None and self.start and math.hypot(
+                e.x - self.start[0], e.y - self.start[1]) > 6:
+            self.cancel()
+
+    def cancel(self):
+        if self.job is not None:
+            try:
+                self.win.root.after_cancel(self.job)
+            except Exception:
+                pass
+        self.job = None
+
+    def fire(self):
+        self.job = None
+        x, y, xr, yr = self.start
+        self.win.drag = None
+        self.win.context_menu(x, y, xr, yr)
+
+
+class _Hint(object):
+    """Hover help for a widget (shows after a short delay)."""
+
+    def __init__(self, widget, text, delay=550):
+        self.w, self.text, self.delay = widget, text, delay
+        self.tip, self.job = None, None
+        widget.bind('<Enter>', self.enter, add='+')
+        widget.bind('<Leave>', self.leave, add='+')
+        widget.bind('<ButtonPress>', self.leave, add='+')
+
+    def enter(self, e=None):
+        self.leave()
+        self.job = self.w.after(self.delay, self.show)
+
+    def leave(self, e=None):
+        if self.job is not None:
+            try:
+                self.w.after_cancel(self.job)
+            except Exception:
+                pass
+            self.job = None
+        if self.tip is not None:
+            try:
+                self.tip.destroy()
+            except Exception:
+                pass
+            self.tip = None
+
+    def show(self):
+        self.job = None
+        try:
+            import tkinter
+            top = self.tip = tkinter.Toplevel(self.w)
+            top.wm_overrideredirect(True)
+            tkinter.Label(top, text=self.text, bg=C['tip_bg'], fg=C['tip_fg'],
+                          padx=8, pady=4, justify='left', wraplength=340,
+                          font=('TkDefaultFont', 9)).pack()
+            x = self.w.winfo_rootx() + 4
+            y = self.w.winfo_rooty() + self.w.winfo_height() + 4
+            top.wm_geometry('+%d+%d' % (x, y))
+        except Exception:
+            self.tip = None
+
+
+class _Palette(object):
+    """Command palette (Ctrl+K): type a few letters, Enter runs the action.
+    Every ribbon button and option is in it, so the whole program can be
+    used from the keyboard."""
+
+    def __init__(self, root, actions, title='Command palette'):
+        import tkinter as tk
+        self.actions = actions
+        top = self.top = tk.Toplevel(root)
+        top.title(title)
+        top.configure(bg=C['bar'])
+        top.transient(root)
+        w = 560
+        x = root.winfo_rootx() + max((root.winfo_width() - w) // 2, 0)
+        y = root.winfo_rooty() + 70
+        top.geometry('%dx380+%d+%d' % (w, x, y))
+        self.v = tk.StringVar()
+        ent = self.ent = tk.Entry(top, textvariable=self.v, relief='flat',
+                                  bg=C['bg'], fg=C['text'],
+                                  insertbackground=C['text'],
+                                  highlightthickness=2,
+                                  highlightbackground=C['grid_major'],
+                                  highlightcolor=C['ap'],
+                                  font=('TkDefaultFont', 12))
+        ent.pack(fill='x', padx=10, pady=(10, 6), ipady=4)
+        self.lb = tk.Listbox(top, relief='flat', bg=C['bg'], fg=C['text'],
+                             selectbackground=C['ap'], selectforeground='white',
+                             highlightthickness=0, activestyle='none',
+                             font=('TkDefaultFont', 10))
+        self.lb.pack(fill='both', expand=True, padx=10)
+        tk.Label(top, text='Type to search    Up / Down: choose    Enter: run'
+                 '    Esc: close', bg=C['bar'], fg=C['muted'],
+                 font=('TkDefaultFont', 8)).pack(pady=4)
+        self.v.trace_add('write', lambda *a: self.fill())
+        for w_ in (ent, self.lb):
+            w_.bind('<Return>', self.run)
+            w_.bind('<KP_Enter>', self.run)
+            w_.bind('<Escape>', lambda e: top.destroy())
+        ent.bind('<Down>', lambda e: self.move(1))
+        ent.bind('<Up>', lambda e: self.move(-1))
+        self.lb.bind('<Double-Button-1>', self.run)
+        self.fill()
+        ent.focus_set()
+
+    def fill(self):
+        words = self.v.get().lower().split()
+        res = []
+        for label, fn in self.actions:
+            low = label.lower()
+            if all(wd in low for wd in words):
+                name = low.split(': ', 1)[-1]
+                res.append((0 if words and name.startswith(words[0]) else 1,
+                            label, fn))
+        res.sort(key=lambda r: (r[0], r[1].lower()))
+        self.shown = [(l, f) for _, l, f in res]
+        self.lb.delete(0, 'end')
+        for l, _ in self.shown:
+            self.lb.insert('end', '  ' + l)
+        if self.shown:
+            self.lb.selection_set(0)
+
+    def move(self, d):
+        if not self.shown:
+            return 'break'
+        cur = self.lb.curselection()
+        i = (cur[0] if cur else 0) + d
+        i = max(0, min(len(self.shown) - 1, i))
+        self.lb.selection_clear(0, 'end')
+        self.lb.selection_set(i)
+        self.lb.see(i)
+        return 'break'
+
+    def run(self, e=None):
+        cur = self.lb.curselection()
+        if not self.shown:
+            return
+        fn = self.shown[cur[0] if cur else 0][1]
+        root = self.top.master
+        self.top.destroy()
+        root.after(20, fn)
+
+
+def show_help(root, title, sections):
+    """Readable controls / shortcuts window. sections: [(heading,
+    [(keys, what)])]."""
+    import tkinter as tk
+    top = tk.Toplevel(root)
+    top.title(title)
+    top.configure(bg=C['bar'])
+    top.transient(root)
+    top.geometry('720x560')
+    txt = tk.Text(top, bg=C['bg'], fg=C['text'], relief='flat', wrap='word',
+                  padx=18, pady=12, highlightthickness=0,
+                  font=('TkDefaultFont', 10), spacing1=2, spacing3=2)
+    sb = tk.Scrollbar(top, command=txt.yview)
+    txt.configure(yscrollcommand=sb.set)
+    bar = tk.Frame(top, bg=C['bar'])
+    bar.pack(side='bottom', fill='x')
+    tk.Button(bar, text='Close', relief='flat', bg=C['ap'], fg='white',
+              activebackground=C['ap_ring'], command=top.destroy, padx=14
+              ).pack(side='right', padx=10, pady=8)
+    sb.pack(side='right', fill='y')
+    txt.pack(fill='both', expand=True)
+    txt.tag_configure('h', font=('TkDefaultFont', 12, 'bold'),
+                      foreground=C['ap'], spacing1=12, spacing3=4)
+    txt.tag_configure('k', font=('TkFixedFont', 10, 'bold'), lmargin1=8)
+    txt.tag_configure('d', lmargin1=8, lmargin2=230)
+    for head, rows in sections:
+        txt.insert('end', head + '\n', 'h')
+        for keys, what in rows:
+            txt.insert('end', '%-30s' % keys, 'k')
+            txt.insert('end', what + '\n', 'd')
+    txt.config(state='disabled')
+    top.bind('<Escape>', lambda e: top.destroy())
+    return top
+
+
+NAV_HELP = [
+    ('Mouse', [
+        ('drag empty space', 'rotate the view'),
+        ('right-drag / middle-drag', 'pan'),
+        ('Shift + drag empty space', 'pan (no right button needed)'),
+        ('wheel', 'zoom toward the pointer'),
+        ('right-click', 'context menu (device or empty space)'),
+        ('double-click empty space', 'fit everything')]),
+    ('Touchpad  (Settings tab > Navigation: Touchpad)', [
+        ('two-finger scroll', 'pan (both directions)'),
+        ('Ctrl + scroll / pinch', 'zoom'),
+        ('Shift + scroll', 'rotate'),
+        ('Alt + scroll', 'tilt'),
+        ('one-finger drag', 'rotate'),
+        ('two-finger tap', 'context menu'),
+        ('hold (touchpad mode)', 'context menu too')]),
+    ('Keyboard (camera)', [
+        ('arrow keys', 'pan'),
+        ('Shift + arrows', 'rotate (left / right), tilt (up / down)'),
+        ('+ / -   Page Up / Down', 'zoom'),
+        ('Home', 'fit everything'),
+        ('T / 3 / F', 'top view / 3D view / fit'),
+        ('Menu key / Shift+F10', 'context menu of the selection'),
+        ('Ctrl+K', 'command palette: search and run any action'),
+        ('F1', 'this help')]),
+    ('On-screen buttons (bottom right)', [
+        ('arrows / square', 'pan / fit'),
+        ('+ / -', 'zoom'),
+        ('curved arrows', 'rotate'),
+        ('up / down on a line', 'tilt'),
+        ('hold a button', 'repeat')]),
+]
 
 
 PRESET_SKIP = ('ip', 'mac', 'dpid')        # identity, never copied
@@ -2028,6 +2836,38 @@ AP badges show how many devices are connected to each AP:
 explicit Wi-Fi links + stations auto-associating by range
 (nearest AP whose range contains them, when auto association is on).'''
 
+EDITOR_HELP = [
+    ('Editing', [
+        ('click a device', 'select it (local X / Y / Z axes appear)'),
+        ('drag a device', 'move it   (Shift: change its height)'),
+        ('drag an axis arrow', 'move along X, Y or Z only'),
+        ('Ctrl + arrows', 'move the selection 1 m   (Ctrl+Shift: 0.1 m)'),
+        ('double-click', 'Inspector for the device / link / wall / picture'),
+        ('range diamond', 'drag it to change the range (or type it, Home tab)'),
+        ('Link tool  (L)', 'drag from one device to another'),
+        ('Wall tool  (W)', 'drag a zone on the ground, then set properties'),
+        ('wall handles', 'squares: length   dot: thickness   round: rotate'),
+        ('picture handles', 'corners: scale   round: rotate')]),
+    ('Keys', [
+        ('Del', 'delete the selection'),
+        ('Esc', 'back to the Select tool'),
+        ('I / D / P', 'Inspector / devices list / insert picture'),
+        ('Ctrl+D', 'duplicate (device / wall / picture)'),
+        ('Ctrl+G / Ctrl+Shift+G', 'group / ungroup walls'),
+        ('Ctrl+L', 'lock / unlock the selection'),
+        ('Ctrl+Z / Ctrl+Y', 'undo / redo'),
+        ('Ctrl+S / Ctrl+O / Ctrl+N', 'save / open / new'),
+        ('Ctrl+E', 'export a Python script'),
+        ('Ctrl+F1', 'collapse / expand the ribbon')]),
+    ('Network tab', [
+        ('Auto-configure', 'IPs, channels, SSID, controller, cables'),
+        ('Random topology', 'a random network to test with'),
+        ('Check network', 'what would stop the simulation from working')]),
+    ('Saved automatically', [
+        ('camera', 'where you left it, in the topology file (view.last)'),
+        ('options', 'profile/editor.ini next to the editor')]),
+]
+
 for _k in KINDS:
     TOOL_HINT[_k] = ('Click on the grid to place %s %s. Esc: back to select.'
                      % ('an' if KIND_LABEL[_k][0] in 'aeiou' else 'a',
@@ -2182,10 +3022,30 @@ class Editor(object):
 
         self.props = Properties('editor')
         root = self.root = tk.Tk()
+        apply_ui_scale(root, self.props.get('ui', 'scale', '100%'))
         root.geometry(self.props.get('window', 'geometry', '1300x840'))
         root.minsize(640, 480)
         root.configure(bg=C['bar'])
         style_ttk(root)
+        # navigation, accessibility, performance (profile/editor.ini)
+        self.nav_mode = tk.StringVar(value='mouse')
+        self.v_navpad = tk.BooleanVar(value=True)
+        self.ui_scale = tk.StringVar(value='100%')
+        self.quality = tk.StringVar(value='auto')
+        self.v_fps = tk.BooleanVar(value=False)
+        self.props.bind('input', [('mode', self.nav_mode),
+                                  ('nav_buttons', self.v_navpad)])
+        self.props.bind('ui', [('scale', self.ui_scale)])
+        self.props.bind('performance', [('quality', self.quality),
+                                        ('show_fps', self.v_fps)])
+        self.perf = Perf(self.quality.get())
+        self.quality.trace_add('write', lambda *a: (
+            self.perf.set_mode(self.quality.get()), self.redraw()))
+        self.navpad = _NavPad(self)
+        self.longpress = _LongPress(self)
+        self.cam_saver = _CamSaver(self)
+        self.actions, self._ptab = [], ''
+        self._rd_pending = False
         self.v_ranges = tk.BooleanVar(value=True)
         self.v_sphere = tk.BooleanVar(value=True)
         self.v_labels = tk.BooleanVar(value=True)
@@ -2241,13 +3101,16 @@ class Editor(object):
         for b in ('2', '3'):
             cv.bind('<ButtonPress-%s>' % b, self.on_pan_start)
             cv.bind('<B%s-Motion>' % b, self.on_pan)
+            cv.bind('<ButtonRelease-%s>' % b, self.on_pan_end)
         cv.bind('<Motion>', self.on_motion)
-        cv.bind('<Leave>', lambda e: self.set_hover(None, None))
-        cv.bind('<MouseWheel>', lambda e: self.zoom(e, 1 if e.delta > 0
-                                                    else -1))
-        cv.bind('<Button-4>', lambda e: self.zoom(e, 1))
-        cv.bind('<Button-5>', lambda e: self.zoom(e, -1))
+        cv.bind('<Leave>', lambda e: (self.set_hover(None, None),
+                                      self._nav_hover(None)))
+        bind_navigation(self, cv)
         root.bind('<Key>', self.on_key)
+        for seq in ('<Control-k>', '<Control-K>', '<Control-space>'):
+            root.bind(seq, lambda e: (self.open_palette(), 'break')[1])
+        root.bind('<F1>', lambda e: self.show_controls())
+        root.bind('<Shift-F10>', lambda e: self.menu_for_selection())
         for seq, fn in (('<Control-s>', self.save), ('<Control-S>', self.save_as),
                         ('<Control-o>', self.open), ('<Control-n>', self.new),
                         ('<Control-e>', self.export_py),
@@ -2270,20 +3133,58 @@ class Editor(object):
             root.after(250, self.show_start)
         self.update_title()
         root.after(80, self.fit if not path else (lambda: None))
+        root.after(700, self.cam_saver.arm)
         root.after(int(self.autosave_min * 60000), self.autosave_tick)
 
     # --------------------------------------------------------- toolbar ----
-    def _btn(self, parent, text, cmd, accent=False, side='left', width=None):
+    def _btn(self, parent, text, cmd, accent=False, side='left', width=None,
+             hint=None):
         b = self.tk.Button(parent, text=text, command=cmd, relief='flat',
                            bg=C['ap'] if accent else C['btn'],
                            fg='white' if accent else C['text'],
                            activebackground=C['ap_ring'] if accent
                            else C['grid'], activeforeground=C['text'],
-                           highlightthickness=0, padx=6, pady=1)
+                           highlightthickness=0, padx=6, pady=1,
+                           cursor='hand2')
         if width:
             b.config(width=width)
         b.pack(side=side, padx=2, pady=1)
+        self.register(text, cmd)
+        if hint:
+            _Hint(b, hint)
         return b
+
+    def register(self, text, cmd):
+        """Make an action searchable in the command palette (Ctrl+K)."""
+        label = ('%s: %s' % (self._ptab, text)) if self._ptab else text
+        if all(l != label for l, _ in self.actions):
+            self.actions.append((label, cmd))
+
+    def open_palette(self):
+        _Palette(self.root, self.actions + self.extra_actions())
+
+    def extra_actions(self):
+        acts = [('Camera: zoom in', lambda: NAV_ACTIONS['zoom_in'](self)),
+                ('Camera: zoom out', lambda: NAV_ACTIONS['zoom_out'](self)),
+                ('Camera: rotate left', lambda: NAV_ACTIONS['rot_l'](self)),
+                ('Camera: rotate right', lambda: NAV_ACTIONS['rot_r'](self)),
+                ('Camera: tilt up', lambda: NAV_ACTIONS['tilt_up'](self)),
+                ('Camera: tilt down', lambda: NAV_ACTIONS['tilt_down'](self)),
+                ('Help: controls & shortcuts (F1)', self.show_controls)]
+        for kind in KINDS:
+            acts.append(('Insert: %s (click to place)' % KIND_LABEL[kind],
+                         lambda k=kind: self.set_tool(k)))
+        for k, l in NAV_MODES:
+            acts.append(('Settings: navigation for %s' % l.lower(),
+                         lambda k=k: self.nav_mode.set(k)))
+        for k, l in QUALITY_LABELS:
+            acts.append(('Settings: quality %s' % l,
+                         lambda k=k: self.quality.set(k)))
+        return acts
+
+    def _tab(self, rb, name):
+        self._ptab = name
+        return rb.tab(name)
 
     def _icon(self, cv, what):
         if what in KINDS:
@@ -2327,6 +3228,7 @@ class Editor(object):
                       font=('TkDefaultFont', 8), width=8)
         lb.pack(side='top')
         cb = command or (lambda t=tool: self.set_tool(t))
+        self.register(text if command else 'Tool: %s' % text, cb)
         for w in (f, cv, lb):
             w.bind('<Button-1>', lambda e: cb())
             w.bind('<Enter>', lambda e, ww=(f, cv, lb): self._hl(ww, True))
@@ -2409,9 +3311,28 @@ class Editor(object):
         vm.add_command(label='Top view', command=self.view_top,
                        accelerator='T')
         vm.add_command(label='Fit', command=self.fit, accelerator='F')
-        vm.add_command(label='Save view (in the topology)',
-                       command=self.save_view)
-        vm.add_command(label='Restore saved view', command=self.restore_view)
+        vm.add_separator()
+        nav = self._menu(vm)
+        for k, l in NAV_MODES:
+            nav.add_radiobutton(label=l, value=k, variable=self.nav_mode)
+        nav.add_separator()
+        nav.add_checkbutton(label='On-screen camera buttons',
+                            variable=self.v_navpad, command=self.redraw)
+        vm.add_cascade(label='Navigation', menu=nav)
+        qm = self._menu(vm)
+        for k, l in QUALITY_LABELS:
+            qm.add_radiobutton(label=l, value=k, variable=self.quality)
+        qm.add_separator()
+        qm.add_checkbutton(label='Show frame time', variable=self.v_fps,
+                           command=self.redraw)
+        vm.add_cascade(label='Performance', menu=qm)
+        um = self._menu(vm)
+        for v in UI_SCALES:
+            um.add_radiobutton(label=v, value=v, variable=self.ui_scale,
+                               command=lambda: self.say(
+                                   'UI size %s: restart the editor to apply.'
+                                   % self.ui_scale.get()))
+        vm.add_cascade(label='UI size', menu=um)
         vm.add_separator()
         for label, var in self.toggles:
             vm.add_checkbutton(label=label, variable=var,
@@ -2428,9 +3349,21 @@ class Editor(object):
                        command=lambda: self.ribbon.toggle(),
                        accelerator='Ctrl+F1')
         m.add_cascade(label='View', menu=vm)
+        nm = self._menu(m)
+        nm.add_command(label='Auto-configure...',
+                       command=self.auto_configure_dialog)
+        nm.add_command(label='Generate random topology...',
+                       command=self.random_dialog)
+        nm.add_command(label='Check network', command=self.check_network)
+        nm.add_separator()
+        nm.add_command(label='Network options (Inspector)',
+                       command=self.open_net_options)
+        m.add_cascade(label='Network', menu=nm)
         hm = self._menu(m)
-        hm.add_command(label='Mouse & keys', command=lambda: self.mb.showinfo(
-            'Mouse & keys', HELP_TEXT, parent=self.root))
+        hm.add_command(label='Controls & shortcuts', command=self.show_controls,
+                       accelerator='F1')
+        hm.add_command(label='Command palette', command=self.open_palette,
+                       accelerator='Ctrl+K')
         hm.add_command(label='Wall materials', command=lambda: self.mb.showinfo(
             'Wall materials', '\n'.join(
                 '%-9s %5s dB' % (m_, fmt_num(WALL_MATERIALS[m_][0]))
@@ -2514,18 +3447,41 @@ class Editor(object):
             r2.pack(anchor='w')
             return r1, r2
 
-        def check(parent, text, var, cmd=None):
+        def check(parent, text, var, cmd=None, hint=None):
             c = tk.Checkbutton(parent, text=text, variable=var, bg=C['bar'],
                                fg=C['text'], selectcolor=C['btn'],
                                activebackground=C['bar'],
                                activeforeground=C['text'],
                                highlightthickness=0, font=('TkDefaultFont', 9),
-                               command=cmd or self.on_toggle)
+                               command=cmd or self.on_toggle, cursor='hand2')
             c.pack(side='left', padx=2)
+            fn = cmd or self.on_toggle
+            self.register('Toggle %s' % text,
+                          lambda v=var, f=fn: (v.set(not v.get()), f()))
+            if hint:
+                _Hint(c, hint)
             return c
 
+        def combo(parent, var, pairs, width, cmd=None):
+            """Read-only choice; the tk var holds the key, the box shows
+            the label."""
+            show = tk.StringVar(value=label_of(pairs, var.get()))
+            cb = ttk.Combobox(parent, textvariable=show, state='readonly',
+                              values=[l for _, l in pairs], width=width)
+            cb.pack(side='left', padx=2)
+
+            def picked(e=None):
+                var.set(key_of(pairs, show.get()))
+                if cmd:
+                    cmd()
+                self.canvas.focus_set() if hasattr(self, 'canvas') else None
+            cb.bind('<<ComboboxSelected>>', picked)
+            var.trace_add('write', lambda *a: show.set(
+                label_of(pairs, var.get())))
+            return cb
+
         # ---- Home
-        home = rb.tab('Home')
+        home = self._tab(rb, 'Home')
         g = rb.group(home, 'FILE')
         r1, r2 = rows(g)
         self._btn(r1, 'New', self.new, width=5)
@@ -2578,7 +3534,7 @@ class Editor(object):
         tk.Label(bot, text='m', bg=C['bar'], fg=C['muted']).pack(side='left')
 
         # ---- Insert
-        ins = rb.tab('Insert')
+        ins = self._tab(rb, 'Insert')
         g = rb.group(ins, 'DEVICES  (click the grid to place)')
         for kind, text in (('ap', 'AP'), ('sta', 'Station'), ('car', 'Car'),
                            ('host', 'Host'), ('switch', 'Switch'),
@@ -2609,7 +3565,7 @@ class Editor(object):
         self._tool(g, 'picture', 'Picture', command=self.insert_picture)
 
         # ---- Walls
-        wt = rb.tab('Walls')
+        wt = self._tab(rb, 'Walls')
         g = rb.group(wt, 'WALLS  (Shift+click: multi-select)')
         self._tool(g, 'wall', 'Draw wall', command=lambda: self.set_tool('wall'))
         r1, r2 = rows(g)
@@ -2630,7 +3586,7 @@ class Editor(object):
             self.redraw(), self.canvas.focus_set()))
 
         # ---- Picture
-        pt = rb.tab('Picture')
+        pt = self._tab(rb, 'Picture')
         g = rb.group(pt, 'PICTURE')
         self._tool(g, 'picture', 'Insert', command=self.insert_picture)
         g = rb.group(pt, 'TRANSFORM  (selected picture)')
@@ -2652,14 +3608,15 @@ class Editor(object):
         self._btn(r2, 'Lock / unlock', self.toggle_lock, width=12)
 
         # ---- View
-        vt = rb.tab('View')
+        vt = self._tab(rb, 'View')
         g = rb.group(vt, 'CAMERA')
         r1, r2 = rows(g)
         self._btn(r1, '3D', self.view_3d, width=4)
         self._btn(r1, 'Top', self.view_top, width=4)
         self._btn(r1, 'Fit', self.fit, width=4)
-        self._btn(r2, 'Save view', self.save_view, width=9)
-        self._btn(r2, 'Saved view', self.restore_view, width=9)
+        check(r2, 'Navigation buttons', self.v_navpad, self.redraw,
+              hint='Camera buttons in the bottom-right corner: pan, zoom, '
+              'rotate, tilt, fit. The camera is saved automatically.')
         g = rb.group(vt, 'SHOW')
         r1, r2 = rows(g)
         self.cb_ranges = check(r1, 'Ranges', self.v_ranges)
@@ -2671,6 +3628,66 @@ class Editor(object):
         check(r2, 'Snap %g m' % self.SNAP, self.v_snap)
         g = rb.group(vt, 'THEME')
         check(g, 'Dark mode', self.v_dark, self.toggle_theme)
+
+        # ---- Network
+        nt = self._tab(rb, 'Network')
+        g = rb.group(nt, 'AUTOMATIC')
+        r1, r2 = rows(g)
+        self._btn(r1, 'Auto-configure...', self.auto_configure_dialog,
+                  accent=True, width=17,
+                  hint='Fix the usual problems in one go: unique IPs, '
+                  'non-overlapping channels, a controller (or standalone '
+                  'APs), cables between the APs, same SSID for roaming.')
+        self._btn(r2, 'Random topology...', self.random_dialog, width=17,
+                  hint='Generate a random network (APs, stations, cars, '
+                  'hosts, rooms with walls) to test the simulation.')
+        g = rb.group(nt, 'CHECK')
+        self._btn(g, 'Check network', self.check_network, width=13,
+                  accent=True,
+                  hint='Lists what would stop the simulation from working: '
+                  'stations out of range, APs without a controller, APs '
+                  'not connected to each other, duplicate IPs...')
+        g = rb.group(nt, 'RUN')
+        r1, r2 = rows(g)
+        self._btn(r1, 'Export .py', self.export_py, width=15)
+        self._btn(r2, 'Network options', self.open_net_options, width=15,
+                  hint='Propagation model, wmediumd, auto association, IP '
+                  'base... (Inspector with nothing selected)')
+
+        # ---- Settings
+        stt = self._tab(rb, 'Settings')
+        g = rb.group(stt, 'NAVIGATION')
+        r1, r2 = rows(g)
+        tk.Label(r1, text='input:', bg=C['bar'], fg=C['muted'],
+                 font=('TkDefaultFont', 8)).pack(side='left')
+        combo(r1, self.nav_mode, NAV_MODES, 10)
+        check(r2, 'On-screen buttons', self.v_navpad, self.redraw)
+        g = rb.group(stt, 'PERFORMANCE')
+        r1, r2 = rows(g)
+        tk.Label(r1, text='quality:', bg=C['bar'], fg=C['muted'],
+                 font=('TkDefaultFont', 8)).pack(side='left')
+        combo(r1, self.quality, QUALITY_LABELS, 15)
+        check(r2, 'Show frame time', self.v_fps, self.redraw)
+        g = rb.group(stt, 'ACCESSIBILITY')
+        r1, r2 = rows(g)
+        tk.Label(r1, text='UI size:', bg=C['bar'], fg=C['muted'],
+                 font=('TkDefaultFont', 8)).pack(side='left')
+        combo(r1, self.ui_scale, [(v, v) for v in UI_SCALES], 6,
+              cmd=lambda: self.say('UI size %s: restart the editor to apply.'
+                                   % self.ui_scale.get()))
+        check(r2, 'Dark mode', self.v_dark, self.toggle_theme)
+        g = rb.group(stt, 'HELP')
+        r1, r2 = rows(g)
+        self._btn(r1, 'Controls (F1)', self.show_controls, width=13)
+        self._btn(r2, 'Search (Ctrl+K)', self.open_palette, width=13)
+        self._ptab = ''
+        for text, fn in (('Help  F1', self.show_controls),
+                         ('Search  Ctrl+K', self.open_palette)):
+            lb = tk.Label(rb.extra, text=text, bg=C['tabs'], fg=C['ap'],
+                          cursor='hand2', font=('TkDefaultFont', 8, 'bold'),
+                          padx=8)
+            lb.pack(side='right')
+            lb.bind('<Button-1>', lambda e, f=fn: f())
         self.root.bind('<Control-F1>', lambda e: rb.toggle())
 
     # -------------------------------------------------- range entry ----
@@ -3074,6 +4091,28 @@ class Editor(object):
 
     # ---------------------------------------------------- associations ----
     def associations(self):
+        """Cached: recomputed only when devices, links, walls or network
+        options change (camera moves and hovers reuse it)."""
+        key = self._assoc_key()
+        if key != getattr(self, '_assoc_ckey', None):
+            self._assoc_cval = self._associations_calc()
+            self._assoc_ckey = key
+        return self._assoc_cval
+
+    def _assoc_key(self):
+        rk = ('range', 'txpower', 'antennaGain', 'antennaHeight', 'wlans',
+              'band', 'channel')
+        return (tuple((i, n['kind'], tuple(n['xyz'])) + tuple(
+                    n['p'].get(k) for k in rk)
+                      for i, n in sorted(self.nodes.items())
+                      if n['kind'] in WIRELESS_KINDS),
+                tuple((l['kind'], l['a'], l['b'])
+                      for _, l in sorted(self.links.items())),
+                tuple(tuple(w.get(k) for k in WALL_KEYS)
+                      for _, w in sorted(self.walls.items())),
+                repr(sorted(self.netp.items())))
+
+    def _associations_calc(self):
         """ap id -> [(device id, 'link' | 'auto')].
         'link' = explicit Wi-Fi link. 'auto' = no link but inside an AP's
         range while auto association is on (nearest AP wins, like a
@@ -3803,10 +4842,14 @@ class Editor(object):
         """world -> (screen x, screen y, depth). Bigger depth = farther."""
         tx, ty, tz = self.target
         dx, dy, dz = x - tx, y - ty, z - tz
-        cy, sy = math.cos(self.yaw), math.sin(self.yaw)
+        k = (self.yaw, self.pitch)
+        if k != getattr(self, '_trig_k', None):    # once per camera change
+            self._trig_k = k
+            self._trig = (math.cos(self.yaw), math.sin(self.yaw),
+                          math.cos(self.pitch), math.sin(self.pitch))
+        cy, sy, cp, sp = self._trig
         x1 = dx * cy - dy * sy
         y1 = dx * sy + dy * cy
-        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
         up = y1 * cp + dz * sp
         depth = y1 * sp - dz * cp
         w, h = self.size()
@@ -3826,8 +4869,15 @@ class Editor(object):
         return dx + self.target[0], dy + self.target[1]
 
     def size(self):
-        return (max(self.canvas.winfo_width(), 200),
-                max(self.canvas.winfo_height(), 200))
+        """Canvas size, cached until the canvas is resized (asking Tk for
+        it thousands of times per frame was the slowest part of drawing)."""
+        sz = getattr(self, '_sz', None)
+        if sz is None:
+            w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+            sz = (max(w, 200), max(h, 200))
+            if w > 1 and h > 1:
+                self._sz = sz
+        return sz
 
     def world_box(self):
         if not self.nodes and not self.pics and not self.walls:
@@ -3879,6 +4929,7 @@ class Editor(object):
         self.fit()
 
     def on_resize(self, e):
+        self._sz = None
         if self.user_view:
             self.redraw()
         else:
@@ -3939,6 +4990,12 @@ class Editor(object):
     def on_press(self, e):
         self.canvas.focus_set()
         self.press = (e.x, e.y)
+        act = self.navpad.at(e.x, e.y) if self.v_navpad.get() else None
+        if act:                                  # on-screen camera button
+            self.drag = None
+            self.navpad.press(act)
+            return
+        self.longpress.begin(e)
         w = self.sel_wall()
         if w and self.tool == 'select' and not w.get('locked'):
             h = self.wall_handle_at(e.x, e.y)
@@ -4038,17 +5095,24 @@ class Editor(object):
             self.drag = {'mode': 'pic_move', 'id': pid, 'moved': False,
                          'off': (pic['x'] - mx, pic['y'] - my)}
             return
-        # empty space or an unselected picture: rotate the view;
-        # a click without dragging selects the picture
-        self.drag = {'mode': 'rotate', 'last': (e.x, e.y), 'moved': False,
-                     'pick': pid}
+        # empty space or an unselected picture: rotate the view (Shift:
+        # pan); a click without dragging selects the picture
+        self.drag = {'mode': 'pan' if e.state & 0x0001 else 'rotate',
+                     'last': (e.x, e.y), 'moved': False, 'pick': pid}
 
     def on_drag(self, e):
         d = self.drag
         if not d:
             return
         self.mouse = (e.x, e.y)
+        self.longpress.moved(e)
         far = math.hypot(e.x - self.press[0], e.y - self.press[1]) > 3
+        if d['mode'] == 'pan':
+            if far:
+                d['moved'] = True
+            lx, ly = d['last']
+            d['last'] = (e.x, e.y)
+            return cam_pan(self, e.x - lx, e.y - ly)
         if d['mode'] == 'rotate':
             if far:
                 d['moved'] = True
@@ -4238,10 +5302,13 @@ class Editor(object):
         self.redraw()
 
     def on_release(self, e):
+        self.longpress.cancel()
+        self.navpad.release()
         d, self.drag = self.drag, None
         if not d:
             return
-        if d['mode'] == 'rotate' and not d['moved'] and self.tool == 'select':
+        if d['mode'] in ('rotate', 'pan') and not d['moved'] and \
+                self.tool == 'select':
             self.select(('pic', d['pick']) if d.get('pick') is not None
                         else None)
             return
@@ -4288,24 +5355,113 @@ class Editor(object):
 
     def on_pan_start(self, e):
         self.pan_last = (e.x, e.y)
+        self.pan_from, self.pan_moved = (e.x, e.y), False
 
     def on_pan(self, e):
-        self.user_view = True
+        if math.hypot(e.x - self.pan_from[0], e.y - self.pan_from[1]) > 4:
+            self.pan_moved = True
         lx, ly = self.pan_last
-        self.pan[0] += e.x - lx
-        self.pan[1] += e.y - ly
         self.pan_last = (e.x, e.y)
-        self.redraw()
+        cam_pan(self, e.x - lx, e.y - ly)
+
+    def on_pan_end(self, e):
+        """Right click (or two-finger tap) without dragging: menu."""
+        right = 2 if self.root.tk.call('tk', 'windowingsystem') == 'aqua' \
+            else 3                      # macOS numbers the right button 2
+        if not getattr(self, 'pan_moved', True) and e.num == right:
+            self.context_menu(e.x, e.y, e.x_root, e.y_root)
 
     def zoom(self, e, direction):
-        self.user_view = True
-        k = 1.15 if direction > 0 else 1 / 1.15
-        w, h = self.size()
-        mx, my = e.x - w / 2, e.y - h / 2
-        self.pan[0] = mx - (mx - self.pan[0]) * k        # zoom toward mouse
-        self.pan[1] = my - (my - self.pan[1]) * k
-        self.scale *= k
-        self.redraw()
+        cam_zoom(self, 1.15 if direction > 0 else 1 / 1.15, e.x, e.y)
+
+    def _nav_hover(self, act):
+        if act != self.navpad.hover:
+            self.navpad.hover = act
+            self.redraw()
+
+    # ---------------------------------------------------- context menu ----
+    def context_menu(self, x, y, xr, yr):
+        """Right click / two-finger tap / press and hold / Menu key."""
+        m = self._menu(self.root)
+        nid = self.node_at(x, y, include_locked=True)
+        wid = None if nid else self.wall_at(x, y, include_locked=True)
+        pid = None if nid or wid is not None else self.pic_at(x, y)
+        lid = None if nid or wid is not None or pid is not None else \
+            self.link_at(x, y)
+        if nid:
+            n = self.nodes[nid]
+            self.select(('node', nid))
+            m.add_command(label='%s  (%s)' % (n['name'], KIND_LABEL[n['kind']]),
+                          state='disabled')
+            m.add_command(label='Inspector', command=self.open_inspector)
+            m.add_command(label='Duplicate', command=self.duplicate_selection)
+            m.add_command(label='Unlock' if n.get('locked') else 'Lock',
+                          command=self.toggle_lock)
+            m.add_command(label='Center the view here',
+                          command=lambda: self.center_on(nid))
+            m.add_command(label='Save config as preset...',
+                          command=lambda: self.save_node_preset(n))
+            m.add_separator()
+            m.add_command(label='Delete', command=self.delete_selection)
+        elif wid is not None:
+            self.select(('wall', wid))
+            w = self.walls[wid]
+            m.add_command(label='%s  (%s, %s dB)' % (
+                w['name'], w['material'], fmt_num(round(wall_db(w), 1))),
+                state='disabled')
+            m.add_command(label='Inspector', command=self.open_inspector)
+            m.add_command(label='Duplicate', command=self.duplicate_wall)
+            m.add_command(label='Unlock' if w.get('locked') else 'Lock',
+                          command=self.toggle_lock)
+            m.add_separator()
+            m.add_command(label='Delete', command=self.delete_selection)
+        elif pid is not None:
+            self.select(('pic', pid))
+            m.add_command(label='Picture', state='disabled')
+            m.add_command(label='Inspector (crop, adjust...)',
+                          command=self.open_inspector)
+            m.add_command(label='Rotate 90', command=self.pic_rotate)
+            m.add_command(label='Lock / unlock', command=self.toggle_lock)
+            m.add_separator()
+            m.add_command(label='Delete', command=self.delete_selection)
+        elif lid is not None:
+            self.select(('link', lid))
+            m.add_command(label='Link inspector', command=self.open_inspector)
+            m.add_separator()
+            m.add_command(label='Delete link', command=self.delete_selection)
+        else:
+            add = self._menu(m)
+            for kind in KINDS:
+                add.add_command(label=KIND_LABEL[kind].capitalize(),
+                                command=lambda k=kind: self.add_node(k, x, y))
+            m.add_cascade(label='Add here', menu=add)
+            m.add_command(label='Draw a wall', command=lambda: self.set_tool(
+                'wall'))
+            m.add_command(label='Insert picture...',
+                          command=self.insert_picture)
+            m.add_separator()
+            m.add_command(label='Fit everything', command=self.fit)
+            m.add_command(label='Top view', command=self.view_top)
+            m.add_command(label='3D view', command=self.view_3d)
+            m.add_separator()
+            m.add_command(label='Check network', command=self.check_network)
+            m.add_command(label='Search actions...  (Ctrl+K)',
+                          command=self.open_palette)
+        try:
+            m.tk_popup(int(xr), int(yr))
+        finally:
+            m.grab_release()
+
+    def menu_for_selection(self):
+        cv = self.canvas
+        n = self.sel_node()
+        if n:
+            x, y, _ = self.project(*n['xyz'])
+        else:
+            w, h = self.size()
+            x, y = w / 2, h / 2
+        self.context_menu(x, y, cv.winfo_rootx() + int(x),
+                          cv.winfo_rooty() + int(y))
 
     def set_hover(self, node, axis):
         if (node, axis) != (self.hover, self.hover_axis):
@@ -4314,6 +5470,11 @@ class Editor(object):
 
     def on_motion(self, e):
         self.mouse = (e.x, e.y)
+        act = self.navpad.at(e.x, e.y) if self.v_navpad.get() else None
+        self._nav_hover(act)
+        if act:
+            self.canvas.config(cursor='hand2')
+            return
         h = self.axis_at(e.x, e.y) if self.tool != 'link' else None
         axis = h[0] if h else None
         node = None if h else self.node_at(e.x, e.y, include_locked=True)
@@ -4344,9 +5505,15 @@ class Editor(object):
             else ''
         if cls in ('Entry', 'TEntry', 'TCombobox', 'Text', 'Spinbox'):
             return
-        if e.state & 0x0004:                           # Ctrl combos
-            return
         k = e.keysym
+        if e.state & 0x0004:                           # Ctrl combos
+            if k in ('Left', 'Right', 'Up', 'Down'):
+                self.nudge(k, fine=bool(e.state & 0x0001))
+            return
+        if k in ('Menu', 'App'):
+            return self.menu_for_selection()
+        if nav_key(self, e):
+            return
         if k in ('Delete', 'BackSpace'):
             self.delete_selection()
         elif k == 'Escape':
@@ -4369,8 +5536,56 @@ class Editor(object):
         elif k in ('f', 'F'):
             self.fit()
 
+    def nudge(self, key, fine=False):
+        """Ctrl+arrows: move the selected device / wall / picture by the
+        snap step (Ctrl+Shift: 0.1 m) - no mouse needed."""
+        step = 0.1 if fine else max(float(self.SNAP), 0.5)
+        dx, dy = {'Left': (-step, 0), 'Right': (step, 0), 'Up': (0, step),
+                  'Down': (0, -step)}[key]
+        n = self.sel_node()
+        if n is not None:
+            if n.get('locked'):
+                return self.say('!  %s is locked.' % n['name'])
+            new = [round(n['xyz'][0] + dx, 2), round(n['xyz'][1] + dy, 2),
+                   n['xyz'][2]]
+            if self.point_in_wall(new):
+                return self.say('!  Devices cannot go inside walls.')
+            self.push_undo(key=('nudge', n['id']))
+            n['xyz'] = new
+            return self.changed()
+        w = self.sel_wall()
+        if w is not None and not w.get('locked'):
+            self.push_undo(key=('nudge', 'w%d' % w['id']))
+            w['x'], w['y'] = round(w['x'] + dx, 3), round(w['y'] + dy, 3)
+            return self.changed()
+        pic = self.sel_pic()
+        if pic is not None and not pic.get('locked'):
+            self.push_undo(key=('nudge', 'p%d' % pic['id']))
+            pic['x'], pic['y'] = round(pic['x'] + dx, 3), round(pic['y'] + dy, 3)
+            return self.changed()
+
+    def say(self, text):
+        self.msg = text
+        self.redraw()
+
+    def persist_camera(self):
+        """Called by the camera saver: view.last goes into the topology
+        file (only that key), so custom_gui.py opens where you left."""
+        cam = camera_state(self)
+        self._view_last = cam
+        if self.path and os.path.isfile(self.path):
+            write_view(self.path, cam, 'editor')
+
+    def open_net_options(self):
+        self.select(None)
+        self.open_inspector()
+
+    def show_controls(self):
+        show_help(self.root, 'Controls & shortcuts', NAV_HELP + EDITOR_HELP)
+
     # --------------------------------------------------------- drawing ----
-    def circle_pts(self, x, y, z, r, n=56):
+    def circle_pts(self, x, y, z, r, n=None):
+        n = n or self.perf.q('circle')
         pts = []
         for i in range(n):
             a = 2 * math.pi * i / n
@@ -4379,27 +5594,32 @@ class Editor(object):
         return pts
 
     def sphere(self, p, r, color, width=1.5, dash=None, fill=None,
-               rings=(-60, -30, 0, 30, 60), meridians=3, soft=0.55):
-        """Wireframe sphere of radius r (world units) centred on p."""
+               rings=None, meridians=3, soft=0.55):
+        """Wireframe sphere of radius r (world units) centred on p.
+        Detail follows the quality level (Settings > Performance)."""
         cv = self.canvas
         x, y, z = p
         cx, cy, _ = self.project(x, y, z)
         R = r * self.scale
-        if fill:
+        if rings is None:
+            rings = self.perf.q('rings')
+        meridians = min(meridians, self.perf.q('meridians'))
+        seg = self.perf.q('ring_seg')
+        if fill and self.perf.q('stipple'):
             cv.create_oval(cx - R, cy - R, cx + R, cy + R,
                            fill=fill, stipple='gray12', outline='')
         inner = _mix(color, C['bg'], soft)
         for lat in rings:
             a = math.radians(lat)
             pts = self.circle_pts(x, y, z + r * math.sin(a),
-                                  r * math.cos(a), 40)
+                                  r * math.cos(a), seg)
             cv.create_polygon(pts, fill='', outline=inner,
                               width=1.5 if lat == 0 else 1, dash=dash)
         for k in range(meridians):
             az = math.pi * k / meridians
             pts = []
-            for i in range(41):
-                t = 2 * math.pi * i / 40
+            for i in range(seg + 1):
+                t = 2 * math.pi * i / seg
                 sx, sy, _ = self.project(x + r * math.cos(t) * math.cos(az),
                                          y + r * math.cos(t) * math.sin(az),
                                          z + r * math.sin(t))
@@ -4409,6 +5629,38 @@ class Editor(object):
                        outline=color, width=width, dash=dash)
 
     def redraw(self):
+        """Ask for a redraw. Many requests in a row (mouse moves, drags,
+        touchpad scrolls) become one frame, drawn when Tk is idle."""
+        if self._rd_pending or not hasattr(self, 'root'):
+            return
+        self._rd_pending = True
+        try:
+            self.root.after_idle(self._redraw_flush)
+        except Exception:
+            self._rd_pending = False
+
+    def _redraw_flush(self):
+        self._rd_pending = False
+        if not hasattr(self, 'canvas'):
+            return
+        t0 = time.perf_counter()
+        try:
+            self.redraw_now()
+            w, h = self.size()
+            if self.v_navpad.get():
+                self.navpad.draw(self.canvas, w, h)
+            else:
+                self.navpad.hits = []
+            if self.v_fps.get():
+                self.canvas.create_text(w - 12, 34, anchor='ne',
+                                        text=self.perf.text(),
+                                        fill=C['muted'],
+                                        font=('TkFixedFont', 8))
+        finally:
+            self.perf.record(time.perf_counter() - t0)
+        self.cam_saver.check()
+
+    def redraw_now(self):
         if not hasattr(self, 'canvas'):
             return
         cv = self.canvas
@@ -5038,12 +6290,17 @@ class Editor(object):
             cv.create_text(x + 30, y, text=text, anchor='w', fill=C['text'],
                            font=('TkDefaultFont', 9))
             x += 40 + 7 * len(text)
+        if self.nav_mode.get() == 'touchpad':
+            hint = ('drag: rotate   two-finger scroll: pan   Ctrl+scroll: '
+                    'zoom   Shift+scroll: rotate   press and hold: menu   '
+                    'drag device: move   F1: all controls   Ctrl+K: search')
+        else:
+            hint = ('drag: rotate   right-drag or Shift+drag: pan   wheel: '
+                    'zoom   right-click: menu   drag device: move   '
+                    'double-click: inspector   F1: all controls   Ctrl+K: '
+                    'search')
         cv.create_text(12, h - 12, anchor='sw', fill=C['muted'],
-                       font=('TkDefaultFont', 8),
-                       text='drag: rotate   right-drag: pan   wheel: zoom   '
-                            'drag device: move   Shift+drag: height   '
-                            'drag arrow: move on axis   double-click: '
-                            'inspector   Del: delete   Ctrl+Z: undo')
+                       font=('TkDefaultFont', 8), text=hint)
         if self.hover and not self.drag and self.hover in self.nodes:
             self.draw_tip()
 
@@ -5192,6 +6449,633 @@ class Editor(object):
         else:
             self.inspector = Inspector(self)
 
+    # ------------------------------------------------- network tools ----
+    CH_PLAN = {'2.4': ['1', '6', '11'],
+               '5': ['36', '40', '44', '48', '149', '153', '157', '161'],
+               '6': ['1', '5', '9', '13', '17', '21']}
+    AUTOCONF = (('ips', 'Unique IP for every host, station and car', True),
+                ('channels', 'Non-overlapping channels for neighbouring APs '
+                 '(1 / 6 / 11; 5 GHz: 36 / 40 / 44 / 48...)', True),
+                ('ssid', 'Same SSID on every AP (stations can roam)', True),
+                ('backbone', 'Connect the APs and switches with cables when '
+                 'they are not connected (shortest tree, no loops)', True),
+                ('hosts', 'Wire hosts that have no cable to the nearest AP '
+                 '/ switch', True),
+                ('coverage', 'Grow AP ranges so every station is inside one',
+                 False))
+    CTRL_CHOICES = (('standalone', 'No controller: make APs / switches '
+                     'standalone (works without any controller program)'),
+                    ('add', 'Add a controller c0 if there is none'),
+                    ('keep', 'Leave controllers and fail modes as they are'))
+
+    def infra(self):
+        return [n for n in self.nodes.values() if n['kind'] in ('ap', 'switch')]
+
+    def wired_components(self, members):
+        """Groups of node ids joined by cables (only through members)."""
+        ids = set(n['id'] for n in members)
+        parent = dict((i, i) for i in ids)
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        for l in self.links.values():
+            if l['kind'] == 'wired' and l['a'] in ids and l['b'] in ids:
+                parent[find(l['a'])] = find(l['b'])
+        comps = {}
+        for i in ids:
+            comps.setdefault(find(i), set()).add(i)
+        return list(comps.values()), find
+
+    def _new_link(self, a, b, kind='wired'):
+        lid = self.next_id
+        self.next_id += 1
+        self.links[lid] = {'id': lid, 'kind': kind, 'a': a, 'b': b,
+                           'p': default_link_params(kind)}
+        return lid
+
+    def auto_configure(self, opts, ctrl='standalone'):
+        """Fix the usual problems. Returns the list of changes (text)."""
+        done = []
+        nodes = sorted(self.nodes.values(), key=lambda n: n['id'])
+        aps = [n for n in nodes if n['kind'] == 'ap']
+        if opts.get('ips'):
+            seen = set()
+            for n in nodes:
+                if n['kind'] not in ('sta', 'car', 'host'):
+                    continue
+                ip = str(n['p'].get('ip') or '').strip()
+                try:
+                    addr = str(ipaddress.ip_interface(ip).ip) if ip else ''
+                except ValueError:
+                    addr = ''
+                if addr and addr not in seen:
+                    seen.add(addr)
+                    continue
+                n['p']['ip'] = ''
+                new = self.next_ip()
+                n['p']['ip'] = new
+                seen.add(new.split('/')[0])
+                done.append('%s: IP %s -> %s' % (n['name'], ip or '(none)',
+                                                  new))
+        if opts.get('channels') and aps:
+            by_band = {}
+            for a in aps:
+                by_band.setdefault(a['p'].get('band') or '2.4', []).append(a)
+            for band, lst in by_band.items():
+                plan = self.CH_PLAN.get(band, self.CH_PLAN['2.4'])
+
+                def near(a, b):
+                    return math.dist(a['xyz'], b['xyz']) < \
+                        self.rng(a) + self.rng(b)
+                order = sorted(lst, key=lambda a: -sum(near(a, b) for b in lst
+                                                       if b is not a))
+                got = {}
+                for a in order:
+                    used = [got[b['id']] for b in lst
+                            if b['id'] in got and b is not a and near(a, b)]
+                    free = [c for c in plan if c not in used]
+                    cur = str(a['p'].get('channel'))
+                    ch = cur if cur in free else (free[0] if free else min(
+                        plan, key=used.count))
+                    got[a['id']] = ch
+                    if ch != cur:
+                        a['p']['channel'] = ch
+                        done.append('%s: channel %s -> %s' % (a['name'], cur,
+                                                             ch))
+        if opts.get('ssid') and len(aps) > 1:
+            names = [a['p'].get('ssid') or '' for a in aps]
+            common = max(set(names), key=names.count) if names else 'lab'
+            if names.count(common) == 1:
+                common = 'mininet-wifi'
+            for a in aps:
+                if a['p'].get('ssid') != common:
+                    done.append('%s: SSID %s -> %s' % (
+                        a['name'], a['p'].get('ssid'), common))
+                    a['p']['ssid'] = common
+        ctrls = [n for n in nodes if n['kind'] == 'ctrl']
+        infra = self.infra()
+        if ctrl == 'add' and infra and not ctrls:
+            lo_x, lo_y, hi_x, hi_y = self.world_box()
+            nid = self.next_id
+            self.next_id += 1
+            name = self.unique_name('ctrl')
+            spot = [round((lo_x + hi_x) / 2, 2), round(hi_y + 10, 2), 0.0]
+            self.nodes[nid] = {'id': nid, 'kind': 'ctrl', 'name': name,
+                               'xyz': spot,
+                               'p': default_params('ctrl', name, '')}
+            done.append('added controller %s' % name)
+            for n in infra:
+                if n['p'].get('failMode') == 'standalone':
+                    n['p']['failMode'] = ''
+                    done.append('%s: fail mode -> secure (uses %s)' % (
+                        n['name'], name))
+        elif ctrl == 'standalone' and not ctrls:
+            for n in infra:
+                if n['p'].get('failMode') != 'standalone':
+                    n['p']['failMode'] = 'standalone'
+                    done.append('%s: fail mode -> standalone' % n['name'])
+        if opts.get('backbone') and len(infra) > 1:
+            comps, find = self.wired_components(infra)
+            if len(comps) > 1:
+                pairs = sorted((math.dist(a['xyz'], b['xyz']), a['id'], b['id'])
+                               for i, a in enumerate(infra)
+                               for b in infra[i + 1:])
+                parent = {}
+
+                def root(c):
+                    c = find(c)
+                    while parent.get(c, c) != c:
+                        c = parent[c]
+                    return c
+                for d, a, b in pairs:
+                    ra, rb = root(a), root(b)
+                    if ra != rb:
+                        parent[ra] = rb
+                        self._new_link(a, b)
+                        done.append('cable %s - %s (%.0f m)' % (
+                            self.nodes[a]['name'], self.nodes[b]['name'], d))
+        if opts.get('hosts'):
+            infra = self.infra()
+            for h in [n for n in nodes if n['kind'] == 'host']:
+                wired = any(l['kind'] == 'wired' and h['id'] in (l['a'], l['b'])
+                            for l in self.links.values())
+                if wired or not infra:
+                    continue
+                t = min(infra, key=lambda n: math.dist(n['xyz'], h['xyz']))
+                self._new_link(h['id'], t['id'])
+                done.append('cable %s - %s' % (h['name'], t['name']))
+        if opts.get('coverage') and aps:
+            for n in nodes:
+                if n['kind'] not in ('sta', 'car'):
+                    continue
+                if any(math.dist(n['xyz'], a['xyz']) <= self.rng(a)
+                       for a in aps):
+                    continue
+                a = min(aps, key=lambda a: math.dist(n['xyz'], a['xyz']))
+                need = round(math.dist(n['xyz'], a['xyz']) * 1.1 + 1, 1)
+                if need <= 150:
+                    done.append('%s: range %s -> %s m (covers %s)' % (
+                        a['name'], fmt_num(self.rng(a)), fmt_num(need),
+                        n['name']))
+                    a['p']['range'] = need
+        return done
+
+    def auto_configure_dialog(self):
+        tk = self.tk
+        top = tk.Toplevel(self.root)
+        top.title('Auto-configure')
+        top.configure(bg=C['bg'])
+        top.transient(self.root)
+        top.resizable(False, False)
+        tk.Label(top, text='Auto-configure the network', bg=C['bg'],
+                 fg=C['text'], font=('TkDefaultFont', 13, 'bold')).pack(
+            anchor='w', padx=16, pady=(14, 2))
+        tk.Label(top, text='Everything can be undone with Ctrl+Z.',
+                 bg=C['bg'], fg=C['muted']).pack(anchor='w', padx=16)
+        vs = {}
+        box = tk.Frame(top, bg=C['bg'])
+        box.pack(fill='x', padx=12, pady=8)
+        for key, text, dflt in self.AUTOCONF:
+            v = vs[key] = tk.BooleanVar(
+                value=self.props.get('autoconf', key, dflt))
+            tk.Checkbutton(box, text=text, variable=v, bg=C['bg'],
+                           fg=C['text'], selectcolor=C['btn'],
+                           activebackground=C['bg'], anchor='w',
+                           activeforeground=C['text'], highlightthickness=0,
+                           wraplength=520, justify='left').pack(fill='x',
+                                                                pady=1)
+        tk.Label(top, text='Controller', bg=C['bg'], fg=C['text'],
+                 font=('TkDefaultFont', 10, 'bold')).pack(anchor='w', padx=16)
+        cv = tk.StringVar(value=self.props.get('autoconf', 'controller',
+                                               'standalone'))
+        for key, text in self.CTRL_CHOICES:
+            tk.Radiobutton(top, text=text, value=key, variable=cv,
+                           bg=C['bg'], fg=C['text'], selectcolor=C['btn'],
+                           activebackground=C['bg'], anchor='w',
+                           activeforeground=C['text'], highlightthickness=0,
+                           wraplength=520, justify='left').pack(
+                fill='x', padx=12)
+
+        def ok(e=None):
+            opts = dict((k, v.get()) for k, v in vs.items())
+            for k, v in opts.items():
+                self.props.set('autoconf', k, v)
+            self.props.set('autoconf', 'controller', cv.get())
+            self.props.save()
+            top.destroy()
+            self.run_auto_configure(opts, cv.get())
+        bar = tk.Frame(top, bg=C['bg'])
+        bar.pack(fill='x', padx=12, pady=12)
+        tk.Button(bar, text='Apply', command=ok, relief='flat', bg=C['ap'],
+                  fg='white', padx=16, activebackground=C['ap_ring']).pack(
+            side='right')
+        tk.Button(bar, text='Cancel', command=top.destroy, relief='flat',
+                  bg=C['btn'], fg=C['text'], padx=10).pack(side='right',
+                                                          padx=6)
+        top.bind('<Return>', ok)
+        top.bind('<Escape>', lambda e: top.destroy())
+
+    def run_auto_configure(self, opts, ctrl='standalone', quiet=False):
+        if not self.nodes:
+            return self.say('!  Nothing to configure: add devices first '
+                            '(or Network > Random topology).')
+        self.push_undo()
+        done = self.auto_configure(opts, ctrl)
+        if not done:
+            self.undo_stack.pop()
+            return self.say('Auto-configure: everything was already fine.')
+        self.changed()
+        self.say('Auto-configure: %d change%s (Ctrl+Z to undo).' % (
+            len(done), '' if len(done) == 1 else 's'))
+        if not quiet:
+            self.report('Auto-configure: %d change%s' % (
+                len(done), '' if len(done) == 1 else 's'),
+                [('ok', t, None) for t in done])
+
+    # ---------------------------------------------------------- check ----
+    def check_network(self):
+        """Things that would stop the simulation from working."""
+        issues = []                      # (level, text, node id or None)
+        nodes = sorted(self.nodes.values(), key=lambda n: n['id'])
+        aps = [n for n in nodes if n['kind'] == 'ap']
+        ctrls = [n for n in nodes if n['kind'] == 'ctrl']
+        if not nodes:
+            return self.report('Check network', [
+                ('info', 'The network is empty. Insert devices, or use '
+                 'Network > Random topology.', None)])
+        assoc = self.associations()
+        served = set()
+        for lst in assoc.values():
+            served.update(i for i, _ in lst)
+        peers = set()
+        for l in self.links.values():
+            if l['kind'] in ('adhoc', 'mesh'):
+                peers.update((l['a'], l['b']))
+        for n in nodes:
+            if n['kind'] in ('sta', 'car') and n['id'] not in served and \
+                    n['id'] not in peers:
+                why = 'no AP in range' if not aps else (
+                    'outside every AP range (or walls make the signal too '
+                    'weak)')
+                issues.append(('bad', '%s will not connect: %s.' % (
+                    n['name'], why), n['id']))
+        for l in self.links.values():
+            if l['kind'] == 'wifi':
+                s, a = self.nodes[l['a']], self.nodes[l['b']]
+                if math.dist(s['xyz'], a['xyz']) > self.rng(a):
+                    issues.append(('warn', '%s has a Wi-Fi link to %s but is '
+                                   'out of its range (%.0f m > %s m).' % (
+                                       s['name'], a['name'],
+                                       math.dist(s['xyz'], a['xyz']),
+                                       fmt_num(self.rng(a))), s['id']))
+        infra = self.infra()
+        for n in infra:
+            fm = n['p'].get('failMode') or ''
+            if not ctrls and fm == 'secure':
+                issues.append(('bad', '%s: fail mode "secure" and no '
+                               'controller: it will drop every packet.'
+                               % n['name'], n['id']))
+        if ctrls:
+            for c in ctrls:
+                if (c['p'].get('cls') or 'Controller') == 'Controller':
+                    issues.append(('info', '%s uses the reference controller '
+                                   '(program "controller"). If it is not '
+                                   'installed, choose OVSController or make '
+                                   'the APs standalone.' % c['name'], c['id']))
+        if len(infra) > 1:
+            comps, _ = self.wired_components(infra)
+            if len(comps) > 1:
+                names = [', '.join(sorted(self.nodes[i]['name'] for i in c))
+                         for c in comps]
+                issues.append(('bad', 'APs / switches are not connected to '
+                               'each other: %s. Devices on different groups '
+                               'cannot reach each other (add cables, or '
+                               'Auto-configure).' % ' | '.join(
+                                   '[%s]' % n for n in names), None))
+            edges = sum(1 for l in self.links.values() if l['kind'] == 'wired'
+                        and l['a'] in self.nodes and l['b'] in self.nodes and
+                        self.nodes[l['a']]['kind'] in ('ap', 'switch') and
+                        self.nodes[l['b']]['kind'] in ('ap', 'switch'))
+            if edges >= len(infra) - len(comps) + 1:
+                issues.append(('warn', 'The cables between APs / switches '
+                               'form a loop: without STP broadcasts circle '
+                               'forever. Remove a cable or add stp=True '
+                               '(Inspector > extra).', None))
+        if len(aps) > 1:
+            ssids = set(a['p'].get('ssid') or '' for a in aps)
+            if len(ssids) > 1:
+                issues.append(('info', 'The APs have different SSIDs: '
+                               'stations will not roam between them '
+                               '(Auto-configure can give them one SSID).',
+                               None))
+        for i, a in enumerate(aps):
+            for b in aps[i + 1:]:
+                if (a['p'].get('band') or '2.4') != (b['p'].get('band') or
+                                                     '2.4'):
+                    continue
+                if math.dist(a['xyz'], b['xyz']) >= self.rng(a) + self.rng(b):
+                    continue
+                try:
+                    ca, cb = int(a['p'].get('channel')), int(
+                        b['p'].get('channel'))
+                except (TypeError, ValueError):
+                    continue
+                band = a['p'].get('band') or '2.4'
+                gap = 5 if band == '2.4' else 1
+                if abs(ca - cb) < gap:
+                    crowd = sum(1 for o in aps if o is not a and (
+                        o['p'].get('band') or '2.4') == band and math.dist(
+                        a['xyz'], o['xyz']) < self.rng(a) + self.rng(o))
+                    if crowd >= len(self.CH_PLAN.get(band, '123')):
+                        issues.append(('info', '%s and %s share channel %d: '
+                                       'too many APs overlap for the %d '
+                                       'free channels (smaller ranges or '
+                                       '5 GHz would avoid it).' % (
+                                           a['name'], b['name'], ca,
+                                           len(self.CH_PLAN.get(band, '123'))),
+                                       a['id']))
+                    else:
+                        issues.append(('warn', '%s (ch %d) and %s (ch %d) '
+                                       'overlap and interfere.' % (
+                                           a['name'], ca, b['name'], cb),
+                                       a['id']))
+        seen = {}
+        for n in nodes:
+            ip = str(n['p'].get('ip') or '').strip()
+            if n['kind'] not in ('sta', 'car', 'host'):
+                continue
+            if not ip:
+                issues.append(('warn', '%s has no IP address.' % n['name'],
+                               n['id']))
+                continue
+            try:
+                addr = str(ipaddress.ip_interface(ip).ip)
+            except ValueError:
+                issues.append(('bad', '%s: "%s" is not a valid IP.' % (
+                    n['name'], ip), n['id']))
+                continue
+            if addr in seen:
+                issues.append(('bad', '%s and %s have the same IP %s.' % (
+                    seen[addr], n['name'], addr), n['id']))
+            seen.setdefault(addr, n['name'])
+        for h in nodes:
+            if h['kind'] == 'host' and not any(
+                    l['kind'] == 'wired' and h['id'] in (l['a'], l['b'])
+                    for l in self.links.values()):
+                issues.append(('warn', '%s has no cable: it cannot reach '
+                               'anything.' % h['name'], h['id']))
+        if not issues:
+            issues.append(('ok', 'No problems found. The network should '
+                           'work as drawn.', None))
+        bad = sum(1 for i in issues if i[0] == 'bad')
+        self.report('Check network: %d problem%s, %d warning%s' % (
+            bad, '' if bad == 1 else 's',
+            sum(1 for i in issues if i[0] == 'warn'),
+            '' if sum(1 for i in issues if i[0] == 'warn') == 1 else 's'),
+            issues, fix=bad > 0 or any(i[0] == 'warn' for i in issues))
+        return issues
+
+    def report(self, title, items, fix=False):
+        """Results window: one line per item, 'show' selects the device."""
+        tk = self.tk
+        top = tk.Toplevel(self.root)
+        top.title(title)
+        top.configure(bg=C['bg'])
+        top.transient(self.root)
+        top.geometry('640x420')
+        tk.Label(top, text=title, bg=C['bg'], fg=C['text'],
+                 font=('TkDefaultFont', 12, 'bold')).pack(anchor='w', padx=14,
+                                                         pady=(12, 4))
+        bar = tk.Frame(top, bg=C['bg'])
+        bar.pack(side='bottom', fill='x', padx=10, pady=10)
+        tk.Button(bar, text='Close', command=top.destroy, relief='flat',
+                  bg=C['btn'], fg=C['text'], padx=12).pack(side='right')
+        if fix:
+            tk.Button(bar, text='Auto-configure...', relief='flat',
+                      bg=C['ap'], fg='white', padx=12,
+                      command=lambda: (top.destroy(),
+                                       self.auto_configure_dialog())).pack(
+                side='right', padx=6)
+            tk.Button(bar, text='Check again', relief='flat', bg=C['btn'],
+                      fg=C['text'], padx=10,
+                      command=lambda: (top.destroy(), self.check_network())
+                      ).pack(side='left')
+        txt = tk.Text(top, bg=C['bg'], fg=C['text'], relief='flat',
+                      wrap='word', padx=12, highlightthickness=0,
+                      font=('TkDefaultFont', 10), spacing1=3, spacing3=3,
+                      cursor='arrow')
+        txt.pack(fill='both', expand=True)
+        cols = {'bad': C['warn'], 'warn': '#d08a17', 'info': C['ap'],
+                'ok': C['rf']}
+        marks = {'bad': 'PROBLEM', 'warn': 'WARNING', 'info': 'NOTE',
+                 'ok': 'OK'}
+        for lvl, col in cols.items():
+            txt.tag_configure(lvl, foreground=col,
+                              font=('TkDefaultFont', 9, 'bold'))
+        txt.tag_configure('body', lmargin1=4, lmargin2=80)
+        txt.tag_configure('link', foreground=C['ap'], underline=True)
+        for i, (lvl, text, nid) in enumerate(items):
+            txt.insert('end', '%-9s' % marks[lvl], lvl)
+            txt.insert('end', text, 'body')
+            if nid is not None and nid in self.nodes:
+                tag = 'go%d' % i
+                txt.insert('end', '   show', ('link', tag))
+                txt.tag_bind(tag, '<Button-1>', lambda e, n=nid: (
+                    self.select(('node', n)), self.center_on(n)))
+                txt.tag_bind(tag, '<Enter>', lambda e: txt.config(
+                    cursor='hand2'))
+                txt.tag_bind(tag, '<Leave>', lambda e: txt.config(
+                    cursor='arrow'))
+            txt.insert('end', '\n')
+        txt.config(state='disabled')
+        top.bind('<Escape>', lambda e: top.destroy())
+        return top
+
+    # --------------------------------------------------------- random ----
+    RANDOM_FIELDS = (('aps', 'Access points', 3, 1, 30),
+                     ('stas', 'Stations', 8, 0, 80),
+                     ('cars', 'Cars', 0, 0, 30),
+                     ('hosts', 'Hosts (wired)', 1, 0, 20),
+                     ('width', 'Area width (m)', 0, 0, 2000),
+                     ('depth', 'Area depth (m)', 0, 0, 2000))
+
+    def random_dialog(self):
+        tk = self.tk
+        top = tk.Toplevel(self.root)
+        top.title('Random topology')
+        top.configure(bg=C['bg'])
+        top.transient(self.root)
+        top.resizable(False, False)
+        tk.Label(top, text='Generate a random topology', bg=C['bg'],
+                 fg=C['text'], font=('TkDefaultFont', 13, 'bold')).grid(
+            row=0, column=0, columnspan=2, sticky='w', padx=16, pady=(14, 8))
+        vs = {}
+        r = 1
+        for key, label, dflt, lo, hi in self.RANDOM_FIELDS:
+            tk.Label(top, text=label, bg=C['bg'], fg=C['text']).grid(
+                row=r, column=0, sticky='w', padx=16, pady=2)
+            v = vs[key] = tk.StringVar(value=str(self.props.get(
+                'random', key, dflt)))
+            sp = tk.Spinbox(top, from_=lo, to=hi, textvariable=v, width=7,
+                            relief='flat', bg=C['btn'], fg=C['text'],
+                            buttonbackground=C['btn'],
+                            insertbackground=C['text'])
+            sp.grid(row=r, column=1, sticky='w', padx=8)
+            r += 1
+        tk.Label(top, text='(area 0 = sized from the number of APs)',
+                 bg=C['bg'], fg=C['muted'], font=('TkDefaultFont', 8)).grid(
+            row=r, column=0, columnspan=2, sticky='w', padx=16)
+        r += 1
+        v_walls = tk.BooleanVar(value=self.props.get('random', 'walls', True))
+        v_auto = tk.BooleanVar(value=self.props.get('random', 'autoconf',
+                                                    True))
+        for var, text in ((v_walls, 'Building with rooms (walls of several '
+                           'materials)'),
+                          (v_auto, 'Auto-configure afterwards (channels, '
+                           'cables, IPs, controller)')):
+            tk.Checkbutton(top, text=text, variable=var, bg=C['bg'],
+                           fg=C['text'], selectcolor=C['btn'],
+                           activebackground=C['bg'],
+                           activeforeground=C['text'],
+                           highlightthickness=0).grid(
+                row=r, column=0, columnspan=2, sticky='w', padx=12)
+            r += 1
+        tk.Label(top, text='Seed (blank = new every time)', bg=C['bg'],
+                 fg=C['text']).grid(row=r, column=0, sticky='w', padx=16,
+                                    pady=(6, 0))
+        v_seed = tk.StringVar(value='')
+        tk.Entry(top, textvariable=v_seed, width=9, relief='flat',
+                 bg=C['btn'], fg=C['text'], insertbackground=C['text']).grid(
+            row=r, column=1, sticky='w', padx=8, pady=(6, 0))
+        r += 1
+
+        def ok(e=None):
+            try:
+                vals = dict((k, max(lo, min(hi, int(float(vs[k].get() or 0)))))
+                            for k, _, _, lo, hi in self.RANDOM_FIELDS)
+            except ValueError:
+                return self.mb.showerror('Random topology',
+                                         'Numbers only, please.', parent=top)
+            for k, v in vals.items():
+                self.props.set('random', k, v)
+            self.props.set('random', 'walls', v_walls.get())
+            self.props.set('random', 'autoconf', v_auto.get())
+            self.props.save()
+            top.destroy()
+            self.generate_random(vals, walls=v_walls.get(),
+                                 autoconf=v_auto.get(),
+                                 seed=v_seed.get().strip() or None)
+        bar = tk.Frame(top, bg=C['bg'])
+        bar.grid(row=r, column=0, columnspan=2, sticky='ew', padx=12,
+                 pady=12)
+        tk.Button(bar, text='Generate', command=ok, relief='flat',
+                  bg=C['ap'], fg='white', padx=16,
+                  activebackground=C['ap_ring']).pack(side='right')
+        tk.Button(bar, text='Cancel', command=top.destroy, relief='flat',
+                  bg=C['btn'], fg=C['text'], padx=10).pack(side='right',
+                                                          padx=6)
+        top.bind('<Return>', ok)
+        top.bind('<Escape>', lambda e: top.destroy())
+
+    def generate_random(self, vals, walls=True, autoconf=True, seed=None,
+                        ask=True):
+        """A new random network. vals: aps, stas, cars, hosts, width,
+        depth (0 = automatic)."""
+        import random
+        if ask and not self.confirm_discard():
+            return
+        self.cam_saver.flush()
+        rnd = random.Random(seed)
+        n_ap = max(1, int(vals.get('aps', 3)))
+        cols = max(1, int(round(math.sqrt(n_ap * 1.5))))
+        rows = int(math.ceil(n_ap / float(cols)))
+        W = float(vals.get('width') or 0) or cols * 45.0
+        D = float(vals.get('depth') or 0) or rows * 40.0
+        self.from_doc({'net': default_net(), 'nodes': [], 'links': []})
+        self.path, self.fmt = None, 'normalized'
+        t = 0.25
+        if walls:
+            def wall(x, y, length, rot, material, thick):
+                w = default_wall(material)
+                wid = self.next_id
+                self.next_id += 1
+                w.update(id=wid, name=self.unique_wall_name(), x=round(x, 2),
+                         y=round(y, 2), length=round(length, 2),
+                         thickness=thick, rotation=rot, height=3.0, z=0.0)
+                self.walls[wid] = w
+            wall(W / 2, 0, W + t, 0, 'concrete', t)
+            wall(W / 2, D, W + t, 0, 'concrete', t)
+            wall(0, D / 2, D - t - 0.02, 90, 'concrete', t)
+            wall(W, D / 2, D - t - 0.02, 90, 'concrete', t)
+            inner = ('brick', 'drywall', 'wood', 'glass')
+            for c in range(1, cols):
+                x = W * c / cols + rnd.uniform(-0.08, 0.08) * W / cols
+                door = rnd.uniform(D * 0.2, D * 0.8)
+                lo, hi = t / 2 + 0.03, D - t / 2 - 0.03
+                mat = rnd.choice(inner)
+                for a, b in ((lo, door - 1.0), (door + 1.0, hi)):
+                    if b - a > 0.5:
+                        wall(x, (a + b) / 2, b - a, 90, mat, 0.12)
+        def free_spot(x0, x1, y0, y1):
+            for _ in range(60):
+                p = [round(rnd.uniform(x0, x1), 2),
+                     round(rnd.uniform(y0, y1), 2), 0.0]
+                if not self.point_in_wall(p) and all(
+                        math.dist(p, n['xyz']) > 2.0
+                        for n in self.nodes.values()):
+                    return p
+            return [round(rnd.uniform(x0, x1), 2),
+                    round(rnd.uniform(y0, y1), 2), 0.0]
+
+        def add(kind, xyz, **params):
+            name = self.unique_name(kind)
+            nid = self.next_id
+            self.next_id += 1
+            ip = self.next_ip() if kind in ('sta', 'car', 'host') else ''
+            p = default_params(kind, name, ip)
+            p.update(params)
+            self.nodes[nid] = {'id': nid, 'kind': kind, 'name': name,
+                               'xyz': xyz, 'p': p}
+            return nid
+        cw, ch = W / cols, D / rows
+        ap_ids = []
+        for i in range(n_ap):
+            cx = (i % cols + 0.5) * cw + rnd.uniform(-0.15, 0.15) * cw
+            cy = (i // cols + 0.5) * ch + rnd.uniform(-0.15, 0.15) * ch
+            p = free_spot(cx - 1, cx + 1, cy - 1, cy + 1)
+            rng_ = round(max(math.hypot(cw, ch) * 0.62, 20.0), 1)
+            ap_ids.append(add('ap', p, range=rng_))
+        m = 2.0
+        for _ in range(int(vals.get('stas', 0))):
+            add('sta', free_spot(m, W - m, m, D - m))
+        for _ in range(int(vals.get('cars', 0))):
+            add('car', free_spot(m, W - m, m, D - m))
+        for _ in range(int(vals.get('hosts', 0))):
+            a = self.nodes[rnd.choice(ap_ids)]
+            hid = add('host', free_spot(a['xyz'][0] - 6, a['xyz'][0] + 6,
+                                        a['xyz'][1] - 6, a['xyz'][1] + 6))
+            self._new_link(hid, a['id'])
+        self.dirty = True
+        self.msg = 'Random topology: %d APs, %d stations, %d cars, %d hosts%s.' \
+            % (n_ap, vals.get('stas', 0), vals.get('cars', 0),
+               vals.get('hosts', 0), ', %d walls' % len(self.walls)
+               if self.walls else '')
+        if autoconf:
+            opts = dict((k, self.props.get('autoconf', k, d))
+                        for k, _, d in self.AUTOCONF)
+            done = self.auto_configure(opts, self.props.get(
+                'autoconf', 'controller', 'standalone'))
+            self.msg += '  Auto-configured (%d changes).' % len(done)
+        self.user_view = False
+        self.changed()
+        self.update_title()
+        self.root.update_idletasks()
+        self.fit()
+        self.cam_saver.arm()
+
     # ----------------------------------------------------------- files ----
     def update_title(self):
         name = os.path.basename(self.path) if self.path else 'untitled'
@@ -5278,6 +7162,7 @@ class Editor(object):
     def new(self):
         if not self.confirm_discard():
             return
+        self.cam_saver.flush()
         self.from_doc({'net': default_net(), 'nodes': [], 'links': []})
         self.path, self.fmt, self.dirty = None, 'normalized', False
         self.msg = 'New network.'
@@ -5286,6 +7171,7 @@ class Editor(object):
         self.dirty = False
         self.update_title()
         self.fit()
+        self.cam_saver.arm()
 
     def open(self):
         if not self.confirm_discard():
@@ -5303,6 +7189,7 @@ class Editor(object):
             self.mb.showerror('Open', 'Could not read %s\n\n%s' % (path, e),
                               parent=self.root)
             return
+        self.cam_saver.flush()                  # old file keeps its camera
         self.from_doc(doc)
         self.path, self.fmt = path, fmt
         self.add_recent(path)
@@ -5312,11 +7199,13 @@ class Editor(object):
         self.dirty = False
         self.update_title()
         self.root.update_idletasks()
-        if self._view_last and apply_camera(self, self._view_last):
-            self.msg += '  Camera restored from the file.'
+        cam = self._view_last or self.view_saved
+        if cam and apply_camera(self, cam):
+            self.msg += '  Camera restored where you left it.'
             self.redraw()
         else:
             self.fit()
+        self.cam_saver.arm()
 
     def save(self):
         if not self.path:
@@ -5435,23 +7324,6 @@ class Editor(object):
         self.root.after(int(self.autosave_min * 60000), self.autosave_tick)
 
     # ----------------------------------------------------- camera view ----
-    def save_view(self):
-        self.view_saved = dict(camera_state(self), by='editor',
-                               time=datetime.datetime.now().isoformat(
-                                   timespec='seconds'))
-        self.dirty = True
-        self.update_title()
-        self.msg = ('View saved in the topology (written on the next save). '
-                    'custom_gui.py can restore it too.')
-        self.redraw()
-
-    def restore_view(self):
-        if self.view_saved and apply_camera(self, self.view_saved):
-            self.msg = 'Saved view restored.'
-        else:
-            self.msg = 'No saved view in this topology yet (View > Save view).'
-        self.redraw()
-
     def ask_format(self):
         tk = self.tk
         top = tk.Toplevel(self.root)
@@ -5514,6 +7386,7 @@ class Editor(object):
             pass
 
     def on_close(self):
+        self.cam_saver.flush()
         self.save_window_props()
         if not self.dirty and self.path:
             self.root.destroy()

@@ -21,7 +21,10 @@ Simulate
 Open editor
   - opens directly (or in a terminal when sudo needs a password).
 
-Options (dark mode, hidden terminal) are kept in profile/launcher.ini.
+Options (dark mode, hidden terminal, NetworkManager pause, clean-up before
+each run) are kept in profile/launcher.ini. Options > System check (F1)
+tells you whether this computer is ready and fixes the usual problems.
+Keys: S = simulate, E = editor, F1 = system check, Esc = close.
 """
 
 import configparser
@@ -34,11 +37,27 @@ import time
 
 # ---------------------------------------------------------------- paths ----
 SIMULATION_SCRIPT = 'main.py'          # your Mininet-WiFi script
-EDITOR_SCRIPT = 'libs/custom_edit.py'       # the topology editor
+EDITOR_SCRIPT = 'libs/custom_edit.py'       # the editor: a .py, or a compiled
+#                                        editor program (e.g. 'miniedit')
 PREFERRED_TERMINAL = ''                # e.g. 'xterm'; '' = pick automatically
+PYTHON = ''                            # interpreter for the .py files;
+#                     '' = this Python, or python3 when the launcher is compiled
 # ---------------------------------------------------------------------------
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# Compiled with Nuitka (or PyInstaller)? Then __file__ is inside a temporary
+# folder and sys.executable is the launcher itself: use the program's own
+# folder and the system python3 instead.
+COMPILED = '__compiled__' in globals() or getattr(sys, 'frozen', False)
+HERE = os.path.dirname(os.path.realpath(sys.argv[0] if COMPILED
+                                        else __file__))
+
+
+def python_exe():
+    if PYTHON:
+        return PYTHON
+    if COMPILED:
+        return shutil.which('python3') or '/usr/bin/python3'
+    return sys.executable
 PROFILE = os.path.join(HERE, 'profile')
 INI = os.path.join(PROFILE, 'launcher.ini')
 LOG = os.path.join(PROFILE, 'simulation.log')
@@ -95,6 +114,12 @@ class Settings(object):
     def hide_terminal(self):
         return self.cp.getboolean('ui', 'hide_terminal', fallback=True)
 
+    def flag(self, key, default=False):
+        try:
+            return self.cp.getboolean('ui', key, fallback=default)
+        except ValueError:
+            return default
+
     def set(self, key, value):
         self.cp.set('ui', key, str(value))
         try:
@@ -112,7 +137,10 @@ def is_root():
 
 def command(path, sudo):
     """python <file>, prefixed with sudo when asked."""
-    cmd = [sys.executable, path]
+    if not path.endswith('.py') and os.access(path, os.X_OK):
+        cmd = [path]                     # a compiled program
+    else:
+        cmd = [python_exe(), path]
     return ['sudo', '-E'] + cmd if sudo else cmd
 
 
@@ -217,8 +245,15 @@ class Launcher(object):
         root.resizable(False, False)
         self.v_dark = tk.BooleanVar(value=self.settings.theme() == 'dark')
         self.v_hide = tk.BooleanVar(value=self.settings.hide_terminal())
+        self.v_pause_nm = tk.BooleanVar(value=self.settings.flag('pause_nm'))
+        self.v_clean = tk.BooleanVar(value=self.settings.flag('clean_first'))
+        self.nm_paused = False
+        self.busy = False
         root.protocol('WM_DELETE_WINDOW', self.quit)
         root.bind('<Escape>', lambda e: self.quit())
+        root.bind('<Key-s>', lambda e: self.simulate())
+        root.bind('<Key-e>', lambda e: self.editor())
+        root.bind('<F1>', lambda e: self.system_check())
         self.build()
 
     # ------------------------------------------------------------ build ----
@@ -251,16 +286,30 @@ class Launcher(object):
                           command=self.toggle_dark)
         m.add_checkbutton(label='Hide the simulation terminal',
                           variable=self.v_hide, command=self.toggle_hide)
+        m.add_checkbutton(label='Stop NetworkManager during simulations',
+                          variable=self.v_pause_nm,
+                          command=lambda: self.settings.set(
+                              'pause_nm', self.v_pause_nm.get()))
+        m.add_checkbutton(label='Clean up before each simulation (mn -c)',
+                          variable=self.v_clean,
+                          command=lambda: self.settings.set(
+                              'clean_first', self.v_clean.get()))
         m.add_separator()
         m.add_command(label='Simulation output...', command=self.show_output)
         m.add_command(label='Stop the simulation', command=self.stop_sim)
+        m.add_separator()
+        m.add_command(label='System check...  (F1)',
+                      command=self.system_check)
+        m.add_command(label='Clean up now (mn -c)', command=self.clean_now)
+        m.add_command(label='Start NetworkManager again',
+                      command=lambda: self.restore_nm(force=True))
         mb.config(menu=m)
         body = tk.Frame(root, bg=c['bg'], padx=18, pady=18)
         body.pack()
         self.tile(body, 'Simulate', SIMULATION_SCRIPT, self.draw_simulate,
-                  self.simulate).pack(side='left', padx=8)
+                  self.simulate, 'S').pack(side='left', padx=8)
         self.tile(body, 'Open editor', EDITOR_SCRIPT, self.draw_editor,
-                  self.editor).pack(side='left', padx=8)
+                  self.editor, 'E').pack(side='left', padx=8)
         self.status = tk.Label(root, text=status, bg=c['bar'], fg=c['muted'],
                                anchor='w', padx=12, pady=6, justify='left',
                                wraplength=520)
@@ -279,7 +328,7 @@ class Launcher(object):
             if self.v_hide.get() else 'in a terminal window'))
 
     # ------------------------------------------------------------ tiles ----
-    def tile(self, parent, title, path, draw, action):
+    def tile(self, parent, title, path, draw, action, key=''):
         tk, c = self.tk, self.c
         f = tk.Frame(parent, bg=c['tile'], highlightthickness=1,
                      highlightbackground=c['line'], cursor='hand2')
@@ -287,7 +336,8 @@ class Launcher(object):
                        highlightthickness=0)
         cv.pack(padx=10, pady=(12, 4))
         draw(cv)
-        t = tk.Label(f, text=title, bg=c['tile'], fg=c['text'],
+        t = tk.Label(f, text=title + ('   (%s)' % key if key else ''),
+                     bg=c['tile'], fg=c['text'],
                      font=('TkDefaultFont', 12, 'bold'))
         t.pack()
         ok = os.path.isfile(resolve(path))
@@ -386,6 +436,8 @@ class Launcher(object):
                                  stdin=subprocess.DEVNULL)
         except Exception as e:
             return self.say('Could not start %s: %s' % (full, e), warn=True)
+        if how == 'root-term':
+            self.root.after(1000, self.watch_term, p)
         note = ''
         if hidden and how != 'hidden':
             note = '  (in a terminal: start the launcher with sudo to hide it)'
@@ -424,6 +476,7 @@ class Launcher(object):
             self.root.after(500, self.watch_sim)
             return
         self.sim = None
+        self.restore_nm()
         if self.closing:
             return self.root.destroy()
         if code == 0:
@@ -482,6 +535,7 @@ class Launcher(object):
                 return
             self.closing = True
             return self.stop_sim()
+        self.restore_nm()
         self.root.destroy()
 
     # ------------------------------------------- launcher's own terminal ----
@@ -506,18 +560,280 @@ class Launcher(object):
             self.root.after(400, self.wait_child, name)
             return
         self.child = None
+        self.restore_nm()
         self.root.deiconify()
         self.say('%s finished (exit code %d)' % (name, code),
                  warn=code != 0)
 
     def simulate(self):
+        if self.busy:
+            return
+        if is_root() and (self.v_pause_nm.get() or self.v_clean.get()) and \
+                not (self.sim_running() or self.child is not None):
+            steps = []
+            if self.v_pause_nm.get():
+                steps.append('systemctl stop NetworkManager wpa_supplicant')
+            if self.v_clean.get():
+                steps.append('mn -c')
+            self.say('Preparing: %s...' % ' ; '.join(steps))
+            self.busy = True
+
+            def done(out):
+                self.busy = False
+                if self.v_pause_nm.get():
+                    self.nm_paused = True
+                self.start(SIMULATION_SCRIPT, 'Mininet-WiFi simulation', True)
+            return self.run_bg(' ; '.join(s_ + ' >/dev/null 2>&1'
+                                          for s_ in steps), done)
         self.start(SIMULATION_SCRIPT, 'Mininet-WiFi simulation', True)
+
+    # -------------------------------------------------- system helpers ----
+    def run_bg(self, shell_cmd, then=None, timeout=120):
+        """Run a shell command without freezing the window."""
+        import threading
+        box = {}
+
+        def work():
+            try:
+                box['out'] = subprocess.run(
+                    shell_cmd, shell=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                    timeout=timeout).stdout.decode('utf-8', 'replace')
+            except Exception as e:
+                box['out'] = str(e)
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+
+        def wait():
+            if th.is_alive():
+                return self.root.after(200, wait)
+            if then:
+                then(box.get('out', ''))
+        self.root.after(200, wait)
+
+    def clean_now(self):
+        if not is_root():
+            return self.say('Start the launcher with sudo to clean up.',
+                            warn=True)
+        if self.sim_running():
+            return self.say('Stop the simulation first.', warn=True)
+        self.say('Cleaning up Mininet (mn -c)...')
+        self.run_bg('mn -c', lambda out: self.say(
+            'Mininet cleaned up (leftover interfaces, switches and '
+            'processes removed).'))
+
+    def restore_nm(self, force=False):
+        if not (self.nm_paused or force) or not is_root():
+            if force and not is_root():
+                self.say('Start the launcher with sudo for this.', warn=True)
+            return
+        self.nm_paused = False
+        subprocess.Popen('systemctl start NetworkManager >/dev/null 2>&1',
+                         shell=True)
+        self.say('NetworkManager started again.')
+
+    def watch_term(self, p):
+        """A root terminal (xterm...) with the simulation: when it closes,
+        NetworkManager can come back."""
+        if p.poll() is None:
+            return self.root.after(1000, self.watch_term, p)
+        self.restore_nm()
+
+    def system_check(self):
+        SystemCheck(self)
 
     def editor(self):
         self.start(EDITOR_SCRIPT, 'Mininet-WiFi editor', False)
 
     def run(self):
         self.root.mainloop()
+
+
+NM_CONF = '/etc/NetworkManager/conf.d/99-mininet-wifi.conf'
+NM_TEXT = ('[keyfile]\nunmanaged-devices=driver:mac80211_hwsim;'
+           'interface-name:*-eth*;interface-name:hwsim*\n')
+
+
+def sh(cmd, timeout=15):
+    """(exit code, output) of a shell command."""
+    try:
+        r = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                           timeout=timeout)
+        return r.returncode, r.stdout.decode('utf-8', 'replace').strip()
+    except Exception as e:
+        return 1, str(e)
+
+
+def system_checks(sim_running=False):
+    """[(level, what, fix)] - level: ok / warn / bad / info."""
+    res = []
+    add = res.append
+    if is_root():
+        add(('ok', 'Running as root (sudo)', ''))
+    else:
+        add(('warn', 'Not running as root', 'start it with: sudo python3 '
+             'launcher.py (the simulation needs root)'))
+    py = python_exe()
+    code, out = sh('"%s" -c "import mn_wifi"' % py)
+    add(('ok', 'Mininet-WiFi is installed for %s' % py, '')
+        if code == 0 else
+        ('bad', 'Mininet-WiFi cannot be imported by %s' % py,
+         'install Mininet-WiFi (sudo util/install.sh -Wlnfv) or set the '
+         'right python in the launcher'))
+    code, _ = sh('"%s" -c "import PIL.ImageTk"' % py)
+    add(('ok', 'Pillow is installed (pictures)', '') if code == 0 else
+        ('info', 'Pillow is missing: pictures are not shown',
+         'sudo apt install python3-pil python3-pil.imagetk'))
+    for prog, lvl, why, fix in (
+            ('ovs-vsctl', 'bad', 'Open vSwitch (access points, switches)',
+             'sudo apt install openvswitch-switch'),
+            ('hostapd', 'bad', 'hostapd (access points)',
+             'sudo apt install hostapd'),
+            ('iw', 'bad', 'iw (Wi-Fi configuration)', 'sudo apt install iw'),
+            ('xterm', 'warn', 'xterm (device terminals, terminal windows)',
+             'sudo apt install xterm'),
+            ('iperf', 'info', 'iperf (traffic tests)',
+             'sudo apt install iperf')):
+        add(('ok', '%s found' % why, '') if shutil.which(prog) else
+            (lvl, '%s not found' % why, fix))
+    if shutil.which('controller') or shutil.which('ovs-testcontroller'):
+        add(('ok', 'An OpenFlow controller program is installed', ''))
+    else:
+        add(('info', 'No reference controller program (controller / '
+             'ovs-testcontroller)', 'use standalone APs (editor: Network > '
+             'Auto-configure) or sudo apt install openvswitch-testcontroller'))
+    code, out = sh('systemctl is-active openvswitch-switch 2>/dev/null')
+    if out == 'active':
+        add(('ok', 'Open vSwitch service is running', ''))
+    elif shutil.which('systemctl'):
+        add(('bad', 'Open vSwitch service is not running (%s)' % (
+            out or 'unknown'), 'sudo systemctl start openvswitch-switch'))
+    code, out = sh('systemctl is-active openvswitch-testcontroller 2>/dev/null')
+    if out == 'active':
+        add(('warn', 'openvswitch-testcontroller service holds port 6653',
+             'sudo systemctl disable --now openvswitch-testcontroller'))
+    code, _ = sh('modinfo mac80211_hwsim')
+    add(('ok', 'Simulated radios available (mac80211_hwsim)', '') if code == 0
+        else ('bad', 'Kernel module mac80211_hwsim not found',
+              'sudo apt install linux-modules-extra-$(uname -r)'))
+    code, out = sh('rfkill list 2>/dev/null | grep -c "Soft blocked: yes"')
+    if out.isdigit() and int(out) > 0:
+        add(('bad', '%s radio(s) blocked by rfkill' % out,
+             'sudo rfkill unblock wifi  (and turn Wi-Fi on in Ubuntu)'))
+    else:
+        add(('ok', 'No radio blocked (rfkill)', ''))
+    code, out = sh('systemctl is-active NetworkManager 2>/dev/null')
+    if out == 'active':
+        conf = os.path.isfile(NM_CONF)
+        if not conf:
+            _, grep = sh('grep -rl mac80211_hwsim /etc/NetworkManager 2>/dev/null')
+            conf = bool(grep)
+        add(('ok', 'NetworkManager ignores simulated radios', '') if conf else
+            ('warn', 'NetworkManager (and its wpa_supplicant) may take the '
+             'simulated radios: stations then never connect',
+             'button "Fix NetworkManager" below, or Options > Stop '
+             'NetworkManager during simulations'))
+    else:
+        add(('ok', 'NetworkManager is not running', ''))
+    if not sim_running:
+        _, out = sh("ip -o link show 2>/dev/null | grep -cE "
+                    "'(ap|sta|car|s|h)[0-9]+-(wlan|eth|mp)[0-9]'")
+        if out.isdigit() and int(out) > 0:
+            add(('warn', '%s leftover interface(s) of an old simulation'
+                 % out, 'button "Clean up (mn -c)" below'))
+    return res
+
+
+class SystemCheck(object):
+    """Window: is this computer ready for Mininet-WiFi? With fixes."""
+
+    def __init__(self, app):
+        tk = app.tk
+        self.app = app
+        c = app.c
+        top = self.top = tk.Toplevel(app.root)
+        top.title('System check')
+        top.configure(bg=c['bg'])
+        top.geometry('700x520')
+        tk.Label(top, text='Is this computer ready for Mininet-WiFi?',
+                 bg=c['bg'], fg=c['text'],
+                 font=('TkDefaultFont', 13, 'bold')).pack(anchor='w', padx=16,
+                                                         pady=(14, 6))
+        bar = tk.Frame(top, bg=c['bg'])
+        bar.pack(side='bottom', fill='x', padx=12, pady=10)
+        for text, fn, accent in (('Close', top.destroy, False),
+                                 ('Check again', self.fill, True),
+                                 ('Fix NetworkManager', self.fix_nm, False),
+                                 ('Clean up (mn -c)', self.clean, False)):
+            tk.Button(bar, text=text, command=fn, relief='flat',
+                      bg=c['ap'] if accent else c['btn'],
+                      fg='white' if accent else c['text'], padx=10,
+                      cursor='hand2').pack(side='right', padx=3)
+        self.txt = tk.Text(top, bg=c['tile'], fg=c['text'], relief='flat',
+                           wrap='word', padx=12, pady=8, highlightthickness=0,
+                           font=('TkDefaultFont', 10), spacing1=3)
+        self.txt.pack(fill='both', expand=True, padx=12)
+        cols = {'ok': c['rf'], 'warn': '#d08a17', 'bad': c['warn'],
+                'info': c['ap']}
+        for k, col in cols.items():
+            self.txt.tag_configure(k, foreground=col,
+                                   font=('TkDefaultFont', 9, 'bold'))
+        self.txt.tag_configure('fix', foreground=c['muted'], lmargin1=78,
+                               lmargin2=78)
+        top.bind('<Escape>', lambda e: top.destroy())
+        top.after(50, self.fill)
+
+    def fill(self):
+        t = self.txt
+        t.config(state='normal')
+        t.delete('1.0', 'end')
+        t.insert('end', 'checking...\n')
+        self.top.update_idletasks()
+        res = system_checks(self.app.sim_running())
+        t.delete('1.0', 'end')
+        marks = {'ok': '  OK   ', 'warn': ' WARN  ', 'bad': ' FAIL  ',
+                 'info': ' NOTE  '}
+        for lvl, what, fix in res:
+            t.insert('end', marks[lvl], lvl)
+            t.insert('end', ' %s\n' % what)
+            if fix:
+                t.insert('end', 'fix: %s\n' % fix, 'fix')
+        bad = sum(1 for r in res if r[0] == 'bad')
+        warn = sum(1 for r in res if r[0] == 'warn')
+        t.insert('end', '\n%s\n' % ('Ready to simulate.' if not bad and not warn
+                                    else '%d problem%s, %d warning%s.' % (
+                                        bad, '' if bad == 1 else 's', warn,
+                                        '' if warn == 1 else 's')))
+        t.config(state='disabled')
+
+    def fix_nm(self):
+        from tkinter import messagebox
+        if not is_root():
+            return messagebox.showinfo(
+                'Fix NetworkManager', 'Start the launcher with sudo, or run '
+                'in a terminal:\n\n' + "printf '%s' | sudo tee %s\nsudo "
+                'systemctl restart NetworkManager' % (
+                    NM_TEXT.replace('\n', '\\n'), NM_CONF), parent=self.top)
+        if not messagebox.askokcancel(
+                'Fix NetworkManager', 'Write %s so NetworkManager never '
+                'touches simulated radios, and restart NetworkManager?\n\n'
+                '(Your normal network reconnects in a few seconds.)'
+                % NM_CONF, parent=self.top):
+            return
+        try:
+            os.makedirs(os.path.dirname(NM_CONF), exist_ok=True)
+            with open(NM_CONF, 'w') as fh:
+                fh.write(NM_TEXT)
+        except OSError as e:
+            return messagebox.showerror('Fix NetworkManager', str(e),
+                                        parent=self.top)
+        self.app.run_bg('systemctl restart NetworkManager', lambda out:
+                        self.fill())
+
+    def clean(self):
+        self.app.clean_now()
+        self.app.root.after(4000, self.fill)
 
 
 def last_lines(path, n=2):
